@@ -1,0 +1,104 @@
+# docker-compose.kanboard.yml
+#
+# Runs Kanboard (task board) + GitLab CE (code repository) alongside Marcus.
+#
+# Usage
+# -----
+# Start Kanboard only (lightweight, recommended first):
+#   docker compose -f docker-compose.kanboard.yml up -d kanboard
+#
+# Start both Kanboard and GitLab (requires >= 8 GB RAM):
+#   docker compose -f docker-compose.kanboard.yml up -d
+#
+# Access
+# ------
+#   Kanboard:  http://localhost:8080  (admin / admin — change immediately)
+#   GitLab:    http://localhost:8929  (root — set password on first visit)
+#
+# Kanboard API token
+# ------------------
+#   1. Log in to Kanboard
+#   2. Go to Settings -> API
+#   3. Copy the token shown there
+#   4. Set it in your Marcus config or environment:
+#        export KANBOARD_API_TOKEN=<token>
+#
+# GitLab first-run (takes ~5 min to start)
+# -----------------------------------------
+#   1. Visit http://localhost:8929
+#   2. Set the root password
+#   3. Create a group + repo for your project
+#   4. Generate a Personal Access Token (Settings -> Access Tokens, scope: write_repository)
+#   5. Agents push via: git clone http://oauth2:<TOKEN>@localhost:8929/group/repo.git
+#
+# Marcus config (config_marcus.json)
+# -----------------------------------
+#   {
+#     "kanban": {
+#       "provider": "kanboard",
+#       "kanboard_url": "http://localhost:8080/jsonrpc.php",
+#       "kanboard_api_token": "<your-token>",
+#       "kanboard_project_id": 1
+#     }
+#   }
+
+services:
+  kanboard:
+    image: kanboard/kanboard:latest
+    container_name: marcus-kanboard
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    volumes:
+      - kanboard_data:/var/www/app/data
+      - kanboard_plugins:/var/www/app/plugins
+    networks:
+      - marcus-network
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost/healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  gitlab:
+    image: gitlab/gitlab-ce:latest
+    container_name: marcus-gitlab
+    hostname: gitlab.local
+    restart: unless-stopped
+    ports:
+      - "8929:80"   # HTTP web UI + git-over-HTTP
+      - "2289:22"   # SSH git push
+    volumes:
+      - gitlab_config:/etc/gitlab
+      - gitlab_logs:/var/log/gitlab
+      - gitlab_data:/var/opt/gitlab
+    shm_size: "256m"
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'http://gitlab.local:8929'
+        gitlab_rails['gitlab_shell_ssh_port'] = 2289
+        # Reduce memory footprint for local use
+        puma['worker_processes'] = 2
+        sidekiq['concurrency'] = 5
+    networks:
+      - marcus-network
+    # GitLab takes several minutes to start on first run
+    # healthcheck omitted intentionally — use `docker logs marcus-gitlab` to monitor
+
+networks:
+  marcus-network:
+    driver: bridge
+    name: marcus-network
+
+volumes:
+  kanboard_data:
+    name: marcus-kanboard-data
+  kanboard_plugins:
+    name: marcus-kanboard-plugins
+  gitlab_config:
+    name: marcus-gitlab-config
+  gitlab_logs:
+    name: marcus-gitlab-logs
+  gitlab_data:
+    name: marcus-gitlab-data
