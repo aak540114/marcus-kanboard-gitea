@@ -144,6 +144,52 @@ frameworks can't offer:
 
 ---
 
+## Human-Gated Workflow
+
+Marcus includes a **human-gated AI workflow** — a mode where humans keep final control over when AI starts and when work is accepted, without slowing down the automation.
+
+### How it works
+
+```
+Human creates ticket       →  Marcus generates acceptance criteria (AI)
+Human assigns + moves to   →  AI picks up the ticket, creates a branch,
+  "Ready"                      starts coding (fully automated)
+AI is done or stuck        →  AI moves ticket to "Waiting for Human"
+Human reviews + approves   →  Human moves to "Done"
+Marcus merges branch       →  Branch merged to main automatically
+```
+
+**Two conditions must both be true before AI starts:**
+the ticket must have an assignee **and** its kanban column must be `Ready`.
+Whichever arrives second triggers the work. This prevents accidental AI starts
+on half-configured tickets.
+
+### Ticket status model
+
+| Status | Who sets it | Meaning |
+|---|---|---|
+| `todo` | System | Ticket created, not yet ready for AI |
+| `ready` | Human | Human has assigned and greenlit the ticket |
+| `in_progress` | AI | AI has claimed the ticket and is working |
+| `waiting_for_human` | AI | AI finished or needs input — human's turn |
+| `blocked` | AI | Dependency on another unfinished ticket |
+| `done` | Human | Human accepted the work; triggers branch merge |
+
+### What AI agents can signal (MCP tools)
+
+| Tool | When to call it |
+|---|---|
+| `signal_ready_for_review` | AI finished implementation |
+| `signal_waiting_for_human` | AI needs clarification or credentials |
+| `signal_blocked` | Dependency ticket is unfinished |
+| `post_ticket_progress` | Periodic progress update (0–100%) |
+| `generate_acceptance_criteria` | Kick off AC generation for a ticket |
+| `get_ticket_lifecycle_state` | Query current state + metadata |
+| `get_pending_tickets` | List tickets in a given state |
+| `start_ticket_dev_environment` | Spin up a hot-reload preview URL |
+
+---
+
 ## Get Started
 
 **Prerequisites:**
@@ -227,6 +273,8 @@ docker compose up -d
 ./marcus start
 # Open http://localhost:3333  (login: demo@demo.demo / demo)
 ```
+
+**Kanboard + GitLab** — fully self-hosted task management and git server for local macOS testing (see [Local Kanboard + GitLab setup](#local-kanboard--gitlab-setup) below).
 
 ### Step 5: Your first project — Runner mode
 
@@ -347,6 +395,104 @@ By default Posidonius writes projects to `~/experiments/`.
 
 ---
 
+## Local Kanboard + GitLab Setup
+
+Run a fully self-hosted stack on macOS (or Linux) to test the complete human-gated workflow: Kanboard for tickets, GitLab CE for git repositories, and Marcus running locally to wire them together.
+
+> **RAM requirement:** GitLab CE needs at least 4 GB free RAM. In Docker Desktop → Settings → Resources, set memory to **6 GB or more** before starting.
+
+### Start the stack
+
+```bash
+docker compose up -d
+```
+
+Kanboard is ready in ~5 seconds. GitLab takes **3–10 minutes on first boot** — wait for:
+
+```bash
+docker compose logs -f gitlab | grep "GitLab is ready to serve"
+```
+
+| Service | URL | Default credentials |
+|---|---|---|
+| Kanboard | http://localhost:8080 | `admin` / `admin` |
+| GitLab CE | http://localhost:8929 | `root` / `Marcus123!` |
+
+### First-time Kanboard setup
+
+1. Log in at http://localhost:8080
+2. **Settings → API** — copy the API token
+3. Create a project (e.g. "My App")
+4. Add columns named exactly: `Ready`, `In Progress`, `Waiting for Human`, `Blocked`, `Done`
+   *(column names are case-insensitive in Marcus's mapping)*
+
+### First-time GitLab setup
+
+1. Log in at http://localhost:8929
+2. **Edit Profile → Access Tokens** — create a token with `api` + `write_repository` scopes
+3. Copy the token
+
+### Configure Marcus
+
+```bash
+export KANBAN_PROVIDER=kanboard
+export KANBOARD_URL=http://localhost:8080/jsonrpc.php
+export KANBOARD_API_TOKEN=<your-kanboard-token>
+export KANBOARD_PROJECT_ID=1
+export GITLAB_URL=http://localhost:8929
+export GITLAB_TOKEN=<your-gitlab-pat>
+```
+
+Or set these in `config_marcus.json`:
+
+```json
+{
+  "kanban_provider": "kanboard",
+  "kanban": {
+    "kanboard_url": "http://localhost:8080/jsonrpc.php",
+    "kanboard_api_token": "YOUR_KANBOARD_TOKEN",
+    "kanboard_project_id": 1
+  },
+  "gitlab_url": "http://localhost:8929",
+  "gitlab_token": "YOUR_GITLAB_PAT"
+}
+```
+
+### How the full flow works end-to-end
+
+**Project creation → GitLab repo (automatic):**
+1. Create a project in Kanboard
+2. Within ~60 s, Marcus's `ProjectWatcher` detects it
+3. GitLab repo auto-created (e.g. `http://localhost:8929/root/my-app`)
+4. Local clone created at `./repos/my-app/`
+5. Mapping saved to `./data/project_repos.json`
+
+**Ticket → Branch → AI work:**
+1. Create a task in Kanboard and assign it to yourself
+2. Move the task to the `Ready` column
+3. Within ~30 s, Marcus detects both conditions (assignee + ready status)
+4. Branch `ticket/kanboard/<task_id>` created and pushed to GitLab
+5. Kanboard column moves to `In Progress` automatically
+6. Marcus posts a "Started" comment on the task
+
+**Review and merge:**
+7. AI signals completion → column moves to `Waiting for Human`
+8. Human reviews the branch in GitLab
+9. Human moves Kanboard card to `Done`
+10. Within ~30 s, Marcus merges the branch to `main` and posts a "Merged" comment
+
+### Switching back to Planka
+
+The docker-compose.yml keeps the Planka + Postgres services as commented-out blocks. To switch back:
+
+```bash
+# In docker-compose.yml: uncomment planka + postgres, comment kanboard + gitlab
+docker compose up -d
+# In config_marcus.json: set kanban_provider back to "planka"
+```
+
+---
+
 ## Documentation
 
 - [Configuration Reference](docs/source/developer/configuration.md) — all options
@@ -385,7 +531,7 @@ transparency, and letting the system — not any single agent — hold the truth
 
 Marcus is open source and community-driven. Good first contributions:
 
-1. **Kanban provider integrations** — Jira, Trello, Linear support
+1. **Kanban provider integrations** — Jira, Trello support (Linear ✓, GitHub ✓, SQLite ✓, Kanboard ✓ already done)
 2. **Runners** — automated workflows for new CLI agents (Codex, Gemini CLI, Kimi, AutoGen); see [PROTOCOL.md](PROTOCOL.md)
 3. **Documentation** — tutorials, use cases, examples
 4. **Use-case definitions** — show what Marcus can build beyond software
@@ -409,6 +555,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and [Local Development Setup](docs/source
 
 | Date           | Update |
 |----------------|--------|
+| **2026-07-05** | Human-gated workflow, Kanboard provider, GitLab integration, ProjectWatcher, ProjectSyncWorkflow |
 | **2026-04-26** | v0.3.6 — parallel experiment isolation, agent auto-termination, DONE-task board integrity guards |
 | **2026-04-17** | v0.3.4 — `contract_first` default decomposer, `recommended_agents` in API response, `PROTOCOL.md` |
 | **2026-04-16** | Presented Marcus and Cato at Machine Learning Ambassador Conference, John Deere Financial (Des Moines, IA) |
@@ -424,6 +571,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and [Local Development Setup](docs/source
 
 | Version    | Date       | Commits | Highlights |
 |------------|------------|---------|------------|
+| **dev**    | 2026-07-05 | —       | Human-gated workflow; Kanboard JSON-RPC provider; GitLab CE integration; `ProjectWatcher`; `ProjectSyncWorkflow`; 6-state ticket lifecycle (`todo/ready/in_progress/waiting_for_human/blocked/done`); 9 new MCP tools for AI agents; Kanboard + GitLab docker-compose stack |
 | **v0.3.6** | 2026-04-26 | 28      | Parallel experiment isolation, agent auto-termination, DONE-task board integrity guards, Phase 4 lease tuning, spec-coverage ordering fix |
 | **v0.3.4** | 2026-04-17 | —       | `contract_first` default decomposer, `recommended_agents` in `create_project` response, `PROTOCOL.md`, pre-fork synthesis, scope annotation |
 | **v0.3.0** | 2026-04-03 | 59      | SQLite default provider, Epictetus evaluation, `/marcus` one-command experiments, resilience overhaul |
