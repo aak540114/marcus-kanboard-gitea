@@ -97,7 +97,8 @@ class KanbanSettings:
     Parameters
     ----------
     provider : str
-        Kanban provider: "planka", "github", "linear", "sqlite", or "jira"
+        Kanban provider: "planka", "github", "linear", "sqlite", "jira",
+        or "kanboard"
     board_name : Optional[str]
         Default board name to use
     planka_base_url : Optional[str]
@@ -131,6 +132,14 @@ class KanbanSettings:
         (required if provider="jira")
     jira_project_key : Optional[str]
         Jira project key, e.g. "MARC" (optional; scopes queries to one project)
+    kanboard_url : Optional[str]
+        Full URL to the Kanboard JSON-RPC endpoint, e.g.
+        ``http://localhost:8080/jsonrpc.php`` (required if provider="kanboard")
+    kanboard_api_token : Optional[str]
+        Global API token from Kanboard Settings → API
+        (required if provider="kanboard")
+    kanboard_project_id : Optional[int]
+        Kanboard project ID to scope all queries (default: 1)
     """
 
     provider: str = "sqlite"
@@ -149,6 +158,9 @@ class KanbanSettings:
     jira_email: Optional[str] = None
     jira_api_token: Optional[str] = None
     jira_project_key: Optional[str] = None
+    kanboard_url: Optional[str] = None
+    kanboard_api_token: Optional[str] = None
+    kanboard_project_id: Optional[int] = None
 
 
 @dataclass

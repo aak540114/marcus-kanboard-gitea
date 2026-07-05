@@ -2,6 +2,7 @@
 
 from .github_kanban import GitHubKanban
 from .jira_kanban import JiraKanban
+from .kanboard_kanban import KanboardKanban
 from .linear_kanban import LinearKanban
 from .planka import Planka
 from .planka_kanban import PlankaKanban
@@ -13,5 +14,6 @@ __all__ = [
     "LinearKanban",
     "GitHubKanban",
     "JiraKanban",
+    "KanboardKanban",
     "SQLiteKanban",
 ]

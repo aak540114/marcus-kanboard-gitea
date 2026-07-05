@@ -12,6 +12,7 @@ from src.integrations.kanban_interface import KanbanInterface, KanbanProvider
 from src.integrations.providers import (
     GitHubKanban,
     JiraKanban,
+    KanboardKanban,
     LinearKanban,
     Planka,
     SQLiteKanban,
@@ -130,6 +131,26 @@ class KanbanFactory:
                     ),
                 }
             return JiraKanban(config)
+
+        elif provider_lower == KanbanProvider.KANBOARD.value:
+            if not config:
+                config = {
+                    "kanboard_url": (
+                        marcus_config.kanban.kanboard_url
+                        or os.getenv(
+                            "KANBOARD_URL", "http://localhost:8080/jsonrpc.php"
+                        )
+                    ),
+                    "kanboard_api_token": (
+                        marcus_config.kanban.kanboard_api_token
+                        or os.getenv("KANBOARD_API_TOKEN", "")
+                    ),
+                    "kanboard_project_id": (
+                        marcus_config.kanban.kanboard_project_id
+                        or int(os.getenv("KANBOARD_PROJECT_ID") or "1")
+                    ),
+                }
+            return KanboardKanban(config)
 
         else:
             raise ValueError(f"Unsupported kanban provider: {provider}")
