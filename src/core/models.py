@@ -18,17 +18,25 @@ class TaskStatus(Enum):
     Attributes
     ----------
     TODO : str
-        Task is created but not started
+        Task is created but not started.
+    READY : str
+        Human has assigned the ticket and moved it to the ready column;
+        signals that the AI agent should begin work.
     IN_PROGRESS : str
-        Task is actively being worked on
+        Task is actively being worked on by an AI agent.
+    WAITING_FOR_HUMAN : str
+        AI agent needs external human input, or has finished and is waiting
+        for human acceptance.
     DONE : str
-        Task is completed
+        Human accepted the work; branch will be merged to main.
     BLOCKED : str
-        Task cannot proceed due to dependencies or issues
+        Task cannot proceed due to an unresolved dependency.
     """
 
     TODO = "todo"
+    READY = "ready"
     IN_PROGRESS = "in_progress"
+    WAITING_FOR_HUMAN = "waiting_for_human"
     DONE = "done"
     BLOCKED = "blocked"
 
