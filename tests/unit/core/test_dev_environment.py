@@ -3,6 +3,7 @@ Unit tests for src/core/dev_environment.py
 """
 
 import socket
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -12,6 +13,8 @@ from src.core.dev_environment import (
     DevEnvironmentInfo,
     DevEnvironmentManager,
     PortAllocator,
+    STACK_CONFIGS,
+    detect_project_type,
 )
 
 
@@ -179,3 +182,146 @@ class TestDevEnvironmentManager:
 
         await manager.stop_all()
         assert manager.list_running() == []
+
+
+# ---------------------------------------------------------------------------
+# detect_project_type
+# ---------------------------------------------------------------------------
+
+
+class TestDetectProjectType:
+    """Project-type sniffing from well-known files."""
+
+    def test_detect_nodejs(self, tmp_path: Path) -> None:
+        """package.json → nodejs."""
+        (tmp_path / "package.json").write_text('{"name":"app"}')
+        assert detect_project_type(str(tmp_path)) == "nodejs"
+
+    def test_detect_python_fastapi(self, tmp_path: Path) -> None:
+        """requirements.txt with fastapi → python-fastapi."""
+        (tmp_path / "requirements.txt").write_text("fastapi>=0.100\nuvicorn\n")
+        assert detect_project_type(str(tmp_path)) == "python-fastapi"
+
+    def test_detect_python_uvicorn_only(self, tmp_path: Path) -> None:
+        """requirements.txt with uvicorn only → python-fastapi."""
+        (tmp_path / "requirements.txt").write_text("uvicorn[standard]\nhttpx\n")
+        assert detect_project_type(str(tmp_path)) == "python-fastapi"
+
+    def test_detect_python_flask(self, tmp_path: Path) -> None:
+        """requirements.txt with flask → python-flask."""
+        (tmp_path / "requirements.txt").write_text("flask>=3.0\n")
+        assert detect_project_type(str(tmp_path)) == "python-flask"
+
+    def test_detect_python_django(self, tmp_path: Path) -> None:
+        """manage.py + requirements.txt → python-django."""
+        (tmp_path / "requirements.txt").write_text("Django>=4.2\n")
+        (tmp_path / "manage.py").write_text("#!/usr/bin/env python\n")
+        assert detect_project_type(str(tmp_path)) == "python-django"
+
+    def test_detect_python_generic(self, tmp_path: Path) -> None:
+        """requirements.txt with no known framework → python."""
+        (tmp_path / "requirements.txt").write_text("requests\npydantic\n")
+        assert detect_project_type(str(tmp_path)) == "python"
+
+    def test_detect_pyproject_toml(self, tmp_path: Path) -> None:
+        """pyproject.toml alone → python."""
+        (tmp_path / "pyproject.toml").write_text("[tool.poetry]\nname='app'\n")
+        assert detect_project_type(str(tmp_path)) == "python"
+
+    def test_detect_rust(self, tmp_path: Path) -> None:
+        """Cargo.toml → rust."""
+        (tmp_path / "Cargo.toml").write_text('[package]\nname="app"\n')
+        assert detect_project_type(str(tmp_path)) == "rust"
+
+    def test_detect_go(self, tmp_path: Path) -> None:
+        """go.mod → go."""
+        (tmp_path / "go.mod").write_text("module myapp\ngo 1.22\n")
+        assert detect_project_type(str(tmp_path)) == "go"
+
+    def test_detect_ruby(self, tmp_path: Path) -> None:
+        """Gemfile → ruby."""
+        (tmp_path / "Gemfile").write_text("source 'https://rubygems.org'\n")
+        assert detect_project_type(str(tmp_path)) == "ruby"
+
+    def test_detect_java_maven(self, tmp_path: Path) -> None:
+        """pom.xml → java."""
+        (tmp_path / "pom.xml").write_text("<project/>")
+        assert detect_project_type(str(tmp_path)) == "java"
+
+    def test_detect_java_gradle(self, tmp_path: Path) -> None:
+        """build.gradle → java."""
+        (tmp_path / "build.gradle").write_text("plugins { id 'java' }")
+        assert detect_project_type(str(tmp_path)) == "java"
+
+    def test_detect_java_gradle_kts(self, tmp_path: Path) -> None:
+        """build.gradle.kts → java."""
+        (tmp_path / "build.gradle.kts").write_text("plugins { java }")
+        assert detect_project_type(str(tmp_path)) == "java"
+
+    def test_detect_php(self, tmp_path: Path) -> None:
+        """composer.json → php."""
+        (tmp_path / "composer.json").write_text('{"require":{}}')
+        assert detect_project_type(str(tmp_path)) == "php"
+
+    def test_detect_static_fallback(self, tmp_path: Path) -> None:
+        """No known file → static."""
+        assert detect_project_type(str(tmp_path)) == "static"
+
+    def test_nodejs_wins_over_python(self, tmp_path: Path) -> None:
+        """package.json takes precedence even when requirements.txt exists."""
+        (tmp_path / "package.json").write_text("{}")
+        (tmp_path / "requirements.txt").write_text("flask\n")
+        assert detect_project_type(str(tmp_path)) == "nodejs"
+
+
+# ---------------------------------------------------------------------------
+# DevEnvironmentManager._build_entrypoint
+# ---------------------------------------------------------------------------
+
+
+class TestBuildEntrypoint:
+    """Shell command builder used inside Docker containers."""
+
+    def _mgr(self) -> DevEnvironmentManager:
+        return DevEnvironmentManager(DevEnvironmentConfig())
+
+    def test_nodejs_uses_npm_no_inotifywait(self) -> None:
+        cmd = self._mgr()._build_entrypoint("ticket/k/1", "nodejs")
+        assert "npm install" in cmd
+        assert "npm run dev" in cmd
+        assert "inotifywait" not in cmd
+
+    def test_python_fastapi_uses_uvicorn_reload(self) -> None:
+        cmd = self._mgr()._build_entrypoint("ticket/k/2", "python-fastapi")
+        assert "uvicorn" in cmd
+        assert "--reload" in cmd
+        assert "inotifywait" not in cmd
+
+    def test_static_uses_inotifywait_wrapper(self) -> None:
+        cmd = self._mgr()._build_entrypoint("ticket/k/3", "static")
+        assert "inotifywait" in cmd
+        assert "APP_PID" in cmd
+        assert "kill $APP_PID" in cmd
+
+    def test_php_uses_inotifywait_wrapper(self) -> None:
+        cmd = self._mgr()._build_entrypoint("ticket/k/4", "php")
+        assert "inotifywait" in cmd
+        assert "php -S" in cmd
+
+    def test_branch_name_present_in_command(self) -> None:
+        cmd = self._mgr()._build_entrypoint("feature/my-branch", "nodejs")
+        assert "git checkout feature/my-branch" in cmd
+
+    def test_all_native_stacks_have_no_inotifywait(self) -> None:
+        mgr = self._mgr()
+        for stack, cfg in STACK_CONFIGS.items():
+            if cfg["native_reload"]:
+                cmd = mgr._build_entrypoint("b", stack)
+                assert "inotifywait" not in cmd, f"{stack!r} should not use inotifywait"
+
+    def test_all_non_native_stacks_use_inotifywait(self) -> None:
+        mgr = self._mgr()
+        for stack, cfg in STACK_CONFIGS.items():
+            if not cfg["native_reload"]:
+                cmd = mgr._build_entrypoint("b", stack)
+                assert "inotifywait" in cmd, f"{stack!r} should use inotifywait"

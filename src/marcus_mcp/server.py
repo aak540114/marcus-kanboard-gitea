@@ -3316,6 +3316,62 @@ if __name__ == "__main__":
                     status_code=500,
                 )
 
+        async def dev_env_stop(request: Request) -> JSONResponse:
+            """Stop a running dev environment and tear down its Docker container.
+
+            Accepts GET or POST so the sidebar button can use a simple fetch.
+
+            Query params:
+                ticket_id  (required)
+                provider   (optional, default 'kanboard')
+
+            Response body
+            -------------
+            ``{"stopped": true}``  — environment was running and is now stopped.
+            ``{"stopped": false}`` — no environment was running for that ticket.
+            """
+            ticket_id = request.query_params.get("ticket_id", "")
+            provider = request.query_params.get("provider", server.provider)
+
+            dev_mgr = getattr(server, "_dev_env_manager", None)
+            if not ticket_id or dev_mgr is None:
+                response = JSONResponse({"stopped": False})
+                response.headers["Access-Control-Allow-Origin"] = "*"
+                return response
+
+            try:
+                stopped = await dev_mgr.stop(ticket_id, provider)
+                response = JSONResponse({"stopped": stopped})
+            except Exception as exc:  # noqa: BLE001
+                logger.error("dev_env_stop error for ticket %s: %s", ticket_id, exc)
+                response = JSONResponse({"stopped": False, "error": str(exc)}, status_code=500)
+
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            return response
+
+        async def dev_env_status(request: Request) -> JSONResponse:
+            """Return whether a dev environment is running for a ticket.
+
+            Query params:
+                ticket_id  (required)
+                provider   (optional, default 'kanboard')
+
+            Response body
+            -------------
+            ``{"running": true,  "url": "http://localhost:9234"}``
+            ``{"running": false, "url": null}``
+            """
+            ticket_id = request.query_params.get("ticket_id", "")
+            provider = request.query_params.get("provider", server.provider)
+
+            dev_mgr = getattr(server, "_dev_env_manager", None)
+            info = dev_mgr.get_info(ticket_id, provider) if dev_mgr and ticket_id else None
+            response = JSONResponse(
+                {"running": info is not None, "url": info.url if info else None}
+            )
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            return response
+
         async def active_agents(request: Request) -> JSONResponse:
             """Return all tickets currently claimed by an AI agent.
 
@@ -3492,6 +3548,8 @@ if __name__ == "__main__":
             routes=[
                 Route("/webhooks/kanboard", kanboard_webhook, methods=["POST"]),
                 Route("/dev-env/view", dev_env_view, methods=["GET"]),
+                Route("/dev-env/stop", dev_env_stop, methods=["GET", "POST"]),
+                Route("/api/dev-env/status", dev_env_status, methods=["GET"]),
                 Route("/api/active-agents", active_agents, methods=["GET"]),
                 Route("/api/ticket-links", ticket_links, methods=["GET"]),
                 Mount("/", app=mcp_app),
