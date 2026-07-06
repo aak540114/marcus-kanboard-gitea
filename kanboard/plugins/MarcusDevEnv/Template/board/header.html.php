@@ -10,8 +10,10 @@
  *   - A tooltip listing each ticket ID and the agent working on it
  *   - Green when agents are active, grey when none are working
  */
-$marcusUrl = getenv('MARCUS_URL') ?: 'http://localhost:4298';
-$apiUrl    = $marcusUrl . '/api/active-agents';
+$marcusUrl   = getenv('MARCUS_URL') ?: 'http://localhost:4298';
+$apiUrl      = $marcusUrl . '/api/active-agents';
+$projectId   = $project['id'] ?? '';
+$descUrl     = $marcusUrl . '/project-description?project_id=' . urlencode((string) $projectId);
 ?>
 <style>
 #marcus-agent-badge {
@@ -73,12 +75,20 @@ $apiUrl    = $marcusUrl . '/api/active-agents';
 }
 </style>
 
-<div style="padding: 0 16px 2px; position: relative; display: inline-block;">
-    <span id="marcus-agent-badge" class="idle" title="">
-        <span class="badge-dot"></span>
-        <span id="marcus-agent-label">&#129302; Marcus: checking&hellip;</span>
-    </span>
-    <div id="marcus-agent-tooltip"></div>
+<div style="padding: 0 16px 2px; display: flex; align-items: center; gap: 10px;">
+    <div style="position: relative; display: inline-block;">
+        <span id="marcus-agent-badge" class="idle" title="">
+            <span class="badge-dot"></span>
+            <span id="marcus-agent-label">&#129302; Marcus: checking&hellip;</span>
+        </span>
+        <div id="marcus-agent-tooltip"></div>
+    </div>
+    <a href="<?= htmlspecialchars($descUrl) ?>" target="_blank" rel="noopener noreferrer"
+       style="display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:12px;
+              font-size:12px;font-weight:600;text-decoration:none;
+              background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;">
+        &#128196; Project Description
+    </a>
 </div>
 
 <script>

@@ -3270,11 +3270,14 @@ if __name__ == "__main__":
             and redirect the browser to it.
 
             Query params:
-                ticket_id  (required)
-                provider   (optional, default 'kanboard')
+                ticket_id   (required)
+                provider    (optional, default 'kanboard')
+                project_id  (optional) — Kanboard project ID used to load
+                            the project description and derive the tech stack
             """
-            ticket_id = request.query_params.get("ticket_id", "")
-            provider = request.query_params.get("provider", server.provider)
+            ticket_id  = request.query_params.get("ticket_id", "")
+            provider   = request.query_params.get("provider", server.provider)
+            project_id = request.query_params.get("project_id", "")
 
             if not ticket_id:
                 return HTMLResponse(
@@ -3285,20 +3288,45 @@ if __name__ == "__main__":
 
             try:
                 from src.core.dev_environment import DevEnvironmentManager
+                from src.core.project_description import ProjectDescriptionManager
 
                 dev_mgr = getattr(server, "_dev_env_manager", None)
                 if dev_mgr is None:
                     dev_mgr = DevEnvironmentManager()
                     server._dev_env_manager = dev_mgr  # type: ignore[attr-defined]
 
+                # ── Resolve tech stack from project description ──────────
+                project_stack = None
+                if project_id:
+                    try:
+                        pid = int(project_id)
+                        desc_mgr = getattr(server, "_project_desc_mgr", None)
+                        if desc_mgr is None:
+                            desc_mgr = ProjectDescriptionManager()
+                            server._project_desc_mgr = desc_mgr  # type: ignore[attr-defined]
+                        project_stack = desc_mgr.get_stack(pid)
+                        if project_stack is None:
+                            # No stack info — ask human to fill in the description
+                            desc_url = f"/project-description?project_id={pid}"
+                            return HTMLResponse(
+                                f"<h1>Project description needed</h1>"
+                                f"<p>Marcus could not determine the tech stack for this project. "
+                                f"Please fill in the <strong>Tech Stack</strong> section of the "
+                                f'<a href="{desc_url}">Project Description</a> '
+                                f"and try again.</p>",
+                                status_code=202,
+                            )
+                    except ValueError:
+                        pass  # bad project_id — fall through to file detection
+
                 info = dev_mgr.get_info(ticket_id, provider)
                 if info is None:
-                    # Start the environment; branch name defaults to ticket branch convention
                     branch = f"ticket/{provider}/{ticket_id}"
                     info = await dev_mgr.start(
                         ticket_id=ticket_id,
                         provider=provider,
                         branch_name=branch,
+                        project_stack=project_stack,
                     )
 
                 if info and info.url:
@@ -3315,6 +3343,173 @@ if __name__ == "__main__":
                     f"<h1>Error starting dev environment</h1><pre>{exc}</pre>",
                     status_code=500,
                 )
+
+        async def project_description_page(request: Request) -> "Response":  # type: ignore[name-defined]
+            """Serve the project description as a human-readable HTML page.
+
+            Query params:
+                project_id  (required)
+            """
+            from src.core.project_description import ProjectDescriptionManager, _WAITING_COMMENT
+
+            project_id_str = request.query_params.get("project_id", "")
+            try:
+                pid = int(project_id_str)
+            except ValueError:
+                return HTMLResponse("<h1>Missing or invalid project_id</h1>", status_code=400)
+
+            desc_mgr = getattr(server, "_project_desc_mgr", None)
+            if desc_mgr is None:
+                desc_mgr = ProjectDescriptionManager()
+                server._project_desc_mgr = desc_mgr  # type: ignore[attr-defined]
+
+            raw = desc_mgr.get_description(pid) or ""
+            # Escape for display in textarea / pre
+            import html as _html
+            escaped = _html.escape(raw)
+
+            api_url = f"/api/project-description?project_id={pid}"
+            page = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Project {pid} — Description</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; color: #1a1a2e; }}
+  h1 {{ font-size: 1.4rem; color: #2563eb; }}
+  textarea {{ width: 100%; height: 480px; font-family: monospace; font-size: 13px; padding: 10px;
+              border: 1px solid #cbd5e1; border-radius: 6px; resize: vertical; }}
+  .btn {{ background: #2563eb; color: #fff; border: none; padding: 8px 20px;
+          border-radius: 6px; cursor: pointer; font-size: 14px; margin-top: 8px; }}
+  .btn:hover {{ background: #1d4ed8; }}
+  #saved-msg {{ color: #16a34a; margin-left: 12px; display: none; font-size: 13px; }}
+  .hint {{ font-size: 12px; color: #64748b; margin-top: 6px; }}
+</style>
+</head>
+<body>
+<h1>&#128203; Project Description — Project #{pid}</h1>
+<p class="hint">This document is the source of truth for the tech stack and project context.
+AI agents read and update it automatically. Humans can edit it here.</p>
+<textarea id="desc-text">{escaped}</textarea><br>
+<button class="btn" onclick="save()">Save</button>
+<span id="saved-msg">&#10003; Saved</span>
+<p class="hint">The <strong>Tech Stack</strong> section is read by Marcus to set up the live-preview
+Docker container. Make sure to fill in <em>Language</em> and <em>Dev server command</em>.</p>
+<script>
+function save() {{
+  var text = document.getElementById('desc-text').value;
+  fetch('{api_url}', {{
+    method: 'PUT',
+    headers: {{'Content-Type': 'text/plain'}},
+    body: text
+  }}).then(function(r) {{
+    if (r.ok) {{
+      var msg = document.getElementById('saved-msg');
+      msg.style.display = 'inline';
+      setTimeout(function() {{ msg.style.display = 'none'; }}, 2500);
+    }}
+  }});
+}}
+</script>
+</body>
+</html>"""
+            return HTMLResponse(page)
+
+        async def project_description_api(request: Request) -> "Response":  # type: ignore[name-defined]
+            """GET/PUT the raw project description text.
+
+            GET  → returns plain text markdown
+            PUT  → saves plain text body as the new description
+            """
+            from src.core.project_description import ProjectDescriptionManager
+
+            project_id_str = request.query_params.get("project_id", "")
+            try:
+                pid = int(project_id_str)
+            except ValueError:
+                response = JSONResponse({"error": "invalid project_id"}, status_code=400)
+                response.headers["Access-Control-Allow-Origin"] = "*"
+                return response
+
+            desc_mgr = getattr(server, "_project_desc_mgr", None)
+            if desc_mgr is None:
+                desc_mgr = ProjectDescriptionManager()
+                server._project_desc_mgr = desc_mgr  # type: ignore[attr-defined]
+
+            if request.method == "PUT":
+                try:
+                    body = await request.body()
+                    text = body.decode("utf-8")
+                    desc_mgr.update_description(pid, text)
+                    response = JSONResponse({"saved": True})
+                except Exception as exc:  # noqa: BLE001
+                    response = JSONResponse({"error": str(exc)}, status_code=500)
+            else:
+                raw = desc_mgr.get_description(pid)
+                if raw is None:
+                    response = JSONResponse({"description": None, "project_id": pid})
+                else:
+                    from starlette.responses import PlainTextResponse
+                    response = PlainTextResponse(raw)  # type: ignore[assignment]
+
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            return response
+
+        async def dev_env_stop(request: Request) -> JSONResponse:
+            """Stop a running dev environment and tear down its Docker container.
+
+            Accepts GET or POST so the sidebar button can use a simple fetch.
+
+            Query params:
+                ticket_id  (required)
+                provider   (optional, default 'kanboard')
+
+            Response body
+            -------------
+            ``{"stopped": true}``  — environment was running and is now stopped.
+            ``{"stopped": false}`` — no environment was running for that ticket.
+            """
+            ticket_id = request.query_params.get("ticket_id", "")
+            provider = request.query_params.get("provider", server.provider)
+
+            dev_mgr = getattr(server, "_dev_env_manager", None)
+            if not ticket_id or dev_mgr is None:
+                response = JSONResponse({"stopped": False})
+                response.headers["Access-Control-Allow-Origin"] = "*"
+                return response
+
+            try:
+                stopped = await dev_mgr.stop(ticket_id, provider)
+                response = JSONResponse({"stopped": stopped})
+            except Exception as exc:  # noqa: BLE001
+                logger.error("dev_env_stop error for ticket %s: %s", ticket_id, exc)
+                response = JSONResponse({"stopped": False, "error": str(exc)}, status_code=500)
+
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            return response
+
+        async def dev_env_status(request: Request) -> JSONResponse:
+            """Return whether a dev environment is running for a ticket.
+
+            Query params:
+                ticket_id  (required)
+                provider   (optional, default 'kanboard')
+
+            Response body
+            -------------
+            ``{"running": true,  "url": "http://localhost:9234"}``
+            ``{"running": false, "url": null}``
+            """
+            ticket_id = request.query_params.get("ticket_id", "")
+            provider = request.query_params.get("provider", server.provider)
+
+            dev_mgr = getattr(server, "_dev_env_manager", None)
+            info = dev_mgr.get_info(ticket_id, provider) if dev_mgr and ticket_id else None
+            response = JSONResponse(
+                {"running": info is not None, "url": info.url if info else None}
+            )
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            return response
 
         async def active_agents(request: Request) -> JSONResponse:
             """Return all tickets currently claimed by an AI agent.
@@ -3492,8 +3687,12 @@ if __name__ == "__main__":
             routes=[
                 Route("/webhooks/kanboard", kanboard_webhook, methods=["POST"]),
                 Route("/dev-env/view", dev_env_view, methods=["GET"]),
+                Route("/dev-env/stop", dev_env_stop, methods=["GET", "POST"]),
+                Route("/api/dev-env/status", dev_env_status, methods=["GET"]),
                 Route("/api/active-agents", active_agents, methods=["GET"]),
                 Route("/api/ticket-links", ticket_links, methods=["GET"]),
+                Route("/project-description", project_description_page, methods=["GET"]),
+                Route("/api/project-description", project_description_api, methods=["GET", "PUT"]),
                 Mount("/", app=mcp_app),
             ]
         )
@@ -3502,6 +3701,7 @@ if __name__ == "__main__":
         print(f"[I] Dev-env view:   http://{host}:{port}/dev-env/view?ticket_id=<id>")
         print(f"[I] Active agents:  http://{host}:{port}/api/active-agents")
         print(f"[I] Ticket links:   http://{host}:{port}/api/ticket-links?ticket_id=<id>")
+        print(f"[I] Project desc:   http://{host}:{port}/project-description?project_id=<id>")
         print(
             "[I] Kanboard webhook setup: Settings → Integrations → Webhook URL"
             f"\n              → http://host.docker.internal:{port}/webhooks/kanboard"

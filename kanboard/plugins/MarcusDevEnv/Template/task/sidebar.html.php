@@ -2,9 +2,11 @@
 /**
  * MarcusDevEnv sidebar template — injected into the task detail sidebar.
  *
- * Section 1 — "View Live Changes" button
- *   Links to the Marcus /dev-env/view endpoint that spins up (or looks up
- *   an already-running) hot-reload dev environment for this ticket.
+ * Section 1 — Dev Environment panel
+ *   Polls Marcus /api/dev-env/status on load to decide whether to show a
+ *   "Start Preview" or "Open / Stop Preview" UI.  The Stop button calls
+ *   /dev-env/stop and immediately tears down the Docker container without
+ *   waiting for the ticket to be closed.
  *
  * Section 2 — "Dependencies" panel
  *   Shows which tickets this one depends on ("is blocked by") and which
@@ -19,8 +21,21 @@ $marcusUrl = getenv('MARCUS_URL') ?: 'http://localhost:4298';
 $ticketId  = $task['id'] ?? '';
 $provider  = 'kanboard';
 
+$projectId = $task['project_id'] ?? '';
+
 $viewUrl   = $marcusUrl
     . '/dev-env/view'
+    . '?ticket_id='  . urlencode((string) $ticketId)
+    . '&provider='   . urlencode($provider)
+    . '&project_id=' . urlencode((string) $projectId);
+
+$stopUrl   = $marcusUrl
+    . '/dev-env/stop'
+    . '?ticket_id=' . urlencode((string) $ticketId)
+    . '&provider='  . urlencode($provider);
+
+$statusUrl = $marcusUrl
+    . '/api/dev-env/status'
     . '?ticket_id=' . urlencode((string) $ticketId)
     . '&provider='  . urlencode($provider);
 
@@ -30,19 +45,20 @@ $linksUrl  = $marcusUrl
 ?>
 
 <!-- ── Section 1: Dev environment ─────────────────────────────────── -->
+<style>
+#marcus-dev-env-panel .btn { display:block; text-align:center; padding:6px 12px; margin-top:4px; }
+#marcus-dev-env-status-msg { font-size:11px; color:#888; margin-top:4px; }
+</style>
+
 <div class="sidebar-collapse">
     <h2 class="sidebar-title"><?= t('Marcus Dev Environment') ?></h2>
     <ul>
-        <li>
-            <a href="<?= htmlspecialchars($viewUrl, ENT_QUOTES, 'UTF-8') ?>"
-               target="_blank"
-               rel="noopener noreferrer"
-               class="btn btn-info btn-block"
-               style="display:block;text-align:center;padding:6px 12px;margin-top:4px;">
-                &#128064; <?= t('View Live Changes') ?>
-            </a>
+        <li id="marcus-dev-env-panel">
+            <!-- Populated by JS below based on /api/dev-env/status -->
+            <span style="font-size:12px;color:#aaa;">Checking status&hellip;</span>
         </li>
     </ul>
+    <p id="marcus-dev-env-status-msg"></p>
 </div>
 
 <!-- ── Section 2: Dependencies ────────────────────────────────────── -->
@@ -95,7 +111,68 @@ $linksUrl  = $marcusUrl
 
 <script>
 (function () {
+    /* ── URLs injected from PHP ──────────────────────────────────── */
+    var VIEW_URL   = <?= json_encode($viewUrl) ?>;
+    var STOP_URL   = <?= json_encode($stopUrl) ?>;
+    var STATUS_URL = <?= json_encode($statusUrl) ?>;
     var LINKS_URL  = <?= json_encode($linksUrl) ?>;
+
+    /* ── Dev-environment panel ───────────────────────────────────── */
+    var devPanel  = document.getElementById('marcus-dev-env-panel');
+    var statusMsg = document.getElementById('marcus-dev-env-status-msg');
+
+    function setMsg(text) { statusMsg.textContent = text; }
+
+    function renderStopped() {
+        devPanel.innerHTML =
+            '<a href="' + VIEW_URL + '" target="_blank" rel="noopener noreferrer" '
+            + 'class="btn btn-info btn-block">'
+            + '&#128064; Start Preview'
+            + '</a>';
+        setMsg('No preview running.');
+    }
+
+    function renderRunning(previewUrl) {
+        devPanel.innerHTML =
+            '<a href="' + previewUrl + '" target="_blank" rel="noopener noreferrer" '
+            + 'class="btn btn-success btn-block">'
+            + '&#127758; Open Preview'
+            + '</a>'
+            + '<button class="btn btn-danger btn-block" id="marcus-stop-btn">'
+            + '&#9632; Stop Preview'
+            + '</button>';
+        setMsg('Preview running at ' + previewUrl);
+
+        document.getElementById('marcus-stop-btn').addEventListener('click', function () {
+            this.disabled = true;
+            this.textContent = 'Stopping…';
+            fetch(STOP_URL, { method: 'POST', cache: 'no-store' })
+                .then(function (r) { return r.json(); })
+                .then(function () { renderStopped(); setMsg('Preview stopped.'); })
+                .catch(function () {
+                    setMsg('Could not reach Marcus to stop the preview.');
+                    renderStopped();
+                });
+        });
+    }
+
+    /* Poll status once on page load */
+    fetch(STATUS_URL, { cache: 'no-store' })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            if (data.running && data.url) {
+                renderRunning(data.url);
+            } else {
+                renderStopped();
+            }
+        })
+        .catch(function () {
+            /* Marcus unreachable — show the start button anyway */
+            renderStopped();
+            setMsg('Marcus is unreachable. Start anyway to launch a new preview.');
+        });
+
+    /* ── Dependencies panel ──────────────────────────────────────── */
     var loadingEl  = document.getElementById('marcus-deps-loading');
     var contentEl  = document.getElementById('marcus-deps-content');
     var errorEl    = document.getElementById('marcus-deps-error');
@@ -103,7 +180,6 @@ $linksUrl  = $marcusUrl
     var blocksList = document.getElementById('marcus-deps-blocks');
     var relList    = document.getElementById('marcus-deps-relates');
 
-    // Colour palette for the status badges
     var BADGE_COLORS = {
         'ready':             { bg: '#dbeafe', fg: '#1e40af' },
         'in progress':       { bg: '#dcfce7', fg: '#166534' },
