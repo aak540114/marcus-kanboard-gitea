@@ -111,7 +111,7 @@ FILE_MANAGEMENT:
   - When modifying files, always overwrite the original file. Never create new versions with suffixes like _fixed, _v2, _new, _updated, _patched, or similar naming patterns.
 
   GIT_WORKFLOW:
-  - Merge PRs and commits directly into main
+  - Merge PRs directly into main
 
   COMMUNICATION_GUIDELINES:
   - Always tell me what you are going to do and why
