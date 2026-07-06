@@ -536,27 +536,6 @@ transparency, and letting the system — not any single agent — hold the truth
 
 ---
 
-## Contributing
-
-Marcus is open source and community-driven. Good first contributions:
-
-1. **Kanban provider integrations** — Trello, Jira support (SQLite ✓, Kanboard ✓ already done)
-2. **Runners** — automated workflows for new CLI agents (Codex, Gemini CLI, Kimi, AutoGen); see [PROTOCOL.md](PROTOCOL.md)
-3. **Documentation** — tutorials, use cases, examples
-4. **Use-case definitions** — show what Marcus can build beyond software
-
-```bash
-# Fork, then:
-git clone https://github.com/YOUR_USERNAME/marcus.git
-cd marcus
-pip install -r requirements-dev.txt
-pytest tests/
-```
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [Local Development Setup](docs/source/developer/local-development.md).
-
----
-
 <details>
 <summary><strong>Changelog &amp; milestones</strong></summary>
 
