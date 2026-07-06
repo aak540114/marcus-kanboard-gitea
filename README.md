@@ -526,20 +526,6 @@ The three services — Marcus, Kanboard, and GitLab — are each independently d
 
 ---
 
-## Community
-
-- [**Discord**](https://discord.gg/DZWTbXr4) — real-time help, questions, and feedback. Report errors in `#bugs`
-- [**GitHub Issues**](https://github.com/lwgray/marcus/issues) — detailed bug reports (use [bug report template](/.github/ISSUE_TEMPLATE/bug_report.md)) and feature requests
-- [**GitHub Discussions**](https://github.com/lwgray/marcus/discussions) — ideas and long-form questions
-
-**For researchers and educators:** Board-mediated coordination extends the blackboard pattern to autonomous LLM agents - a named, citable variant for multi-agent-over-MCP systems. Marcus is MIT-licensed — use it in courses,
-papers, and experiments.  The pattern is documented in the [Architecture Docs](docs/source/architecture/).
-
-Named after Marcus Aurelius. The Stoic philosophy runs deep: discipline,
-transparency, and letting the system — not any single agent — hold the truth.
-
----
-
 <details>
 <summary><strong>Changelog &amp; milestones</strong></summary>
 
