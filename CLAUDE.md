@@ -1,5 +1,3 @@
-REPO: marcus-kanboard-gitlab
-
 SESSION_START:
   - At session start, read ~/.simon/memory-bank/activeContext.md for current focus and recent state.
   - Also read ~/.simon/memory-bank/progress.md for what shipped / what's left / critical reminders.
