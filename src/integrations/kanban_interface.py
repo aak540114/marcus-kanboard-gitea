@@ -1,7 +1,7 @@
 """Common interface for all Kanban board integrations.
 
 This abstract base class defines the standard interface that all kanban
-integrations (Planka, Linear, GitHub Projects) must implement.
+integrations (Kanboard, SQLite) must implement.
 """
 
 from abc import ABC, abstractmethod
@@ -14,9 +14,6 @@ from src.core.models import Priority, Task, TaskStatus
 class KanbanProvider(Enum):
     """Supported kanban providers."""
 
-    PLANKA = "planka"
-    LINEAR = "linear"
-    GITHUB = "github"
     SQLITE = "sqlite"
     KANBOARD = "kanboard"
 

@@ -8,6 +8,10 @@ services:
     volumes:
       - kanboard_data:/var/www/app/data
       - kanboard_plugins:/var/www/app/plugins
+    environment:
+      # Optional: validate that incoming webhooks carry this token
+      # Must match KANBOARD_WEBHOOK_TOKEN in your Marcus env vars
+      KANBOARD_WEBHOOK_TOKEN: ""
     restart: unless-stopped
 
   # GitLab CE - self-hosted Git + CI/CD
@@ -30,66 +34,12 @@ services:
     shm_size: '256m'
     restart: unless-stopped
 
-  # -----------------------------------------------------------------------
-  # Planka (commented out — kept for easy switch-back)
-  # -----------------------------------------------------------------------
-  # postgres:
-  #   image: postgres:15-alpine
-  #   container_name: marcus-postgres
-  #   restart: unless-stopped
-  #   environment:
-  #     - POSTGRES_USER=postgres
-  #     - POSTGRES_PASSWORD=postgres
-  #     - POSTGRES_DB=planka
-  #     - POSTGRES_HOST_AUTH_METHOD=trust
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "pg_isready -U postgres -d planka"]
-  #     interval: 10s
-  #     timeout: 5s
-  #     retries: 5
-  #   volumes:
-  #     - postgres-data:/var/lib/postgresql/data
-  #   networks:
-  #     - marcus-network
-  #
-  # planka:
-  #   image: ghcr.io/plankanban/planka:1.26.2
-  #   container_name: marcus-planka
-  #   restart: unless-stopped
-  #   ports:
-  #     - "3333:1337"
-  #   environment:
-  #     - BASE_URL=http://localhost:3333
-  #     - TRUST_PROXY=1
-  #     - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/planka?sslmode=disable
-  #     - SECRET_KEY=secretkey
-  #     - DEFAULT_ADMIN_EMAIL=demo@demo.demo
-  #     - DEFAULT_ADMIN_PASSWORD=demo
-  #     - DEFAULT_ADMIN_NAME=Demo User
-  #     - DEFAULT_ADMIN_USERNAME=demo
-  #     - NODE_ENV=production
-  #   depends_on:
-  #     postgres:
-  #       condition: service_healthy
-  #   volumes:
-  #     - planka-files:/app/public/user-files
-  #     - planka-user-avatars:/app/public/user-avatars
-  #     - planka-project-background-images:/app/public/project-background-images
-  #     - planka-attachments:/app/private/attachments
-  #   networks:
-  #     - marcus-network
-
 volumes:
   kanboard_data:
   kanboard_plugins:
   gitlab_config:
   gitlab_logs:
   gitlab_data:
-  # postgres-data:
-  # planka-files:
-  # planka-user-avatars:
-  # planka-project-background-images:
-  # planka-attachments:
 
 # Usage:
 # ======
@@ -106,12 +56,20 @@ volumes:
 #   - GitLab:    http://localhost:8929  (root / Marcus123!)
 #
 # First-time Kanboard setup:
-#   1. Settings → API → copy API token
-#   2. Create a project and add columns:
-#      Ready, In Progress, Waiting for Human, Blocked, Done
+#   1. Log in at http://localhost:8080 (admin / admin)
+#   2. Settings → API → copy API token
+#   3. Settings → Integrations → Webhook URL:
+#         http://host.docker.internal:4298/webhooks/kanboard
+#      (Kanboard is in Docker; host.docker.internal reaches Marcus on your Mac)
+#   4. Create a project and add columns:
+#         Ready, In Progress, Waiting for Human, Blocked, Done
+#   5. (Optional) Install the MarcusDevEnv plugin:
+#         copy kanboard-plugins/MarcusDevEnv/ into the Kanboard plugins volume
+#         and restart: docker compose restart kanboard
 #
 # First-time GitLab setup:
-#   1. Edit Profile → Access Tokens → create token with api + write_repository scopes
+#   1. Visit http://localhost:8929 — log in as root / Marcus123!
+#   2. Edit Profile → Access Tokens → create token with api + write_repository scopes
 #
 # Configure Marcus env vars:
 #   export KANBOARD_URL=http://localhost:8080/jsonrpc.php
@@ -119,6 +77,7 @@ volumes:
 #   export KANBOARD_PROJECT_ID=1
 #   export GITLAB_URL=http://localhost:8929
 #   export GITLAB_TOKEN=<your-pat>
+#   export MARCUS_URL=http://localhost:4298   # used by the MarcusDevEnv plugin
 #
 # Note: Marcus and Cato run locally (not in Docker) because agents
 # write to the local filesystem. Docker is only for infrastructure.

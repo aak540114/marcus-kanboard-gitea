@@ -112,9 +112,7 @@ class MarcusServer:
             None  # Will be set by project manager
         )
         self.ai_engine = AIAnalysisEngine()
-        # ProjectMonitor uses KanbanClient (Planka-only). Skip for other providers
-        # so non-Planka startups are not blocked by kanban-mcp path detection.
-        self.monitor = ProjectMonitor() if self.provider == "planka" else None
+        self.monitor = None  # ProjectMonitor is not used in the Kanboard stack
 
         # Cached embedding model for cross-parent dependency wiring.
         # Loaded once on first refresh_project_state call — avoids reloading
@@ -487,32 +485,7 @@ class MarcusServer:
         # Initialize project management (skip auto-switch, we do it after sync)
         await self.project_manager.initialize(auto_switch=False)
 
-        # Auto-sync projects from provider
-        if self.provider == "planka":
-            logger.info("Auto-syncing projects from Planka...")
-            try:
-                from src.marcus_mcp.tools.project_management import (
-                    discover_planka_projects,
-                )
-
-                result = await discover_planka_projects(self, {"auto_sync": True})
-                if result.get("success"):
-                    sync_result = result.get("sync_result", {})
-                    summary = sync_result.get("summary", {})
-                    logger.info(
-                        f"Auto-synced Planka projects: "
-                        f"{summary.get('added', 0)} added, "
-                        f"{summary.get('updated', 0)} updated, "
-                        f"{summary.get('skipped', 0)} skipped"
-                    )
-                else:
-                    logger.warning(f"Planka auto-sync failed: {result.get('error')}")
-            except Exception as e:
-                logger.warning(f"Failed to auto-sync Planka projects: {e}")
-        else:
-            logger.info(
-                f"Using {self.provider} provider — " f"skipping Planka auto-sync"
-            )
+        logger.info(f"Using {self.provider} provider")
 
         # Switch to active project
         try:
@@ -846,33 +819,6 @@ class MarcusServer:
         try:
             # Load from centralized config
             config = get_config()
-
-            # Set Planka environment variables if not already set
-            if config.kanban.planka_base_url and "PLANKA_BASE_URL" not in os.environ:
-                os.environ["PLANKA_BASE_URL"] = config.kanban.planka_base_url
-            if config.kanban.planka_email and "PLANKA_AGENT_EMAIL" not in os.environ:
-                os.environ["PLANKA_AGENT_EMAIL"] = config.kanban.planka_email
-            if (
-                config.kanban.planka_password
-                and "PLANKA_AGENT_PASSWORD" not in os.environ
-            ):
-                os.environ["PLANKA_AGENT_PASSWORD"] = config.kanban.planka_password
-            if config.kanban.board_name and "PLANKA_PROJECT_NAME" not in os.environ:
-                os.environ["PLANKA_PROJECT_NAME"] = config.kanban.board_name
-
-            # Support GitHub
-            if config.kanban.github_token and "GITHUB_TOKEN" not in os.environ:
-                os.environ["GITHUB_TOKEN"] = config.kanban.github_token
-            if config.kanban.github_owner and "GITHUB_OWNER" not in os.environ:
-                os.environ["GITHUB_OWNER"] = config.kanban.github_owner
-            if config.kanban.github_repo and "GITHUB_REPO" not in os.environ:
-                os.environ["GITHUB_REPO"] = config.kanban.github_repo
-
-            # Support Linear
-            if config.kanban.linear_api_key and "LINEAR_API_KEY" not in os.environ:
-                os.environ["LINEAR_API_KEY"] = config.kanban.linear_api_key
-            if config.kanban.linear_team_id and "LINEAR_TEAM_ID" not in os.environ:
-                os.environ["LINEAR_TEAM_ID"] = config.kanban.linear_team_id
 
             # Configuration loaded successfully from config_marcus.json
 
@@ -1334,7 +1280,7 @@ class MarcusServer:
 
         @self._fastmcp.tool()  # type: ignore[misc]
         async def get_all_board_tasks(board_id: str, project_id: str) -> Dict[str, Any]:
-            """Get all tasks from a specific Planka board for validation/inspection."""
+            """Get all tasks from the kanban board for validation/inspection."""
             from .tools.task import get_all_board_tasks as impl
 
             return await impl(
@@ -1598,7 +1544,7 @@ class MarcusServer:
             async def get_all_board_tasks(
                 board_id: str, project_id: str
             ) -> Dict[str, Any]:
-                """Get all tasks from a specific Planka board."""
+                """Get all tasks from the kanban board."""
                 from .tools.task import get_all_board_tasks as impl
 
                 return await impl(
@@ -1644,7 +1590,7 @@ class MarcusServer:
                       - select_project: Find and select existing (no task creation)
                     - project_id: Use specific project ID (skips discovery)
                     - complexity: "prototype" | "standard" | "enterprise"
-                    - provider: "planka" | "github" | "linear"
+                    - provider: "kanboard" | "sqlite"
 
                 Returns
                 -------
@@ -1831,30 +1777,6 @@ class MarcusServer:
                 from .tools.project_management import select_project as impl
 
                 return await impl(server, {"name": name, "project_id": project_id})
-
-        if "discover_planka_projects" in allowed_tools:
-
-            @app.tool()  # type: ignore[misc]
-            async def discover_planka_projects(
-                auto_sync: bool = False,
-            ) -> Dict[str, Any]:
-                """
-                Discover all projects from Planka automatically.
-
-                Optionally auto-sync them into Marcus's registry.
-                """
-                from .tools.project_management import discover_planka_projects as impl
-
-                return await impl(server, {"auto_sync": auto_sync})
-
-        if "sync_projects" in allowed_tools:
-
-            @app.tool()  # type: ignore[misc]
-            async def sync_projects(projects: List[Dict[str, Any]]) -> Dict[str, Any]:
-                """Sync projects from Planka/provider into Marcus registry."""
-                from .tools.project_management import sync_projects as impl
-
-                return await impl(server, {"projects": projects})
 
         if "switch_project" in allowed_tools:
 
@@ -3119,8 +3041,97 @@ if __name__ == "__main__":
 
         # Run with uvicorn directly
         import uvicorn
+        from starlette.applications import Starlette
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse, RedirectResponse, HTMLResponse
+        from starlette.routing import Mount, Route
 
-        app = fastmcp.streamable_http_app()
+        from src.core.kanboard_webhook_receiver import KanboardWebhookReceiver
+
+        _webhook_receiver = KanboardWebhookReceiver(
+            events=server.events,
+            provider=server.provider,
+        )
+
+        async def kanboard_webhook(request: Request) -> JSONResponse:
+            """Receive Kanboard push-webhook and re-emit as Marcus events."""
+            token = request.query_params.get("token")
+            header_token = request.headers.get("X-Kanboard-Token")
+            body = await request.body()
+            accepted = await _webhook_receiver.handle_request(
+                body, token=token, header_token=header_token
+            )
+            if accepted:
+                return JSONResponse({"status": "ok"}, status_code=200)
+            return JSONResponse({"status": "rejected"}, status_code=403)
+
+        async def dev_env_view(request: Request) -> "Response":  # type: ignore[name-defined]
+            """
+            Start (or look up) a hot-reload dev environment for a ticket
+            and redirect the browser to it.
+
+            Query params:
+                ticket_id  (required)
+                provider   (optional, default 'kanboard')
+            """
+            ticket_id = request.query_params.get("ticket_id", "")
+            provider = request.query_params.get("provider", server.provider)
+
+            if not ticket_id:
+                return HTMLResponse(
+                    "<h1>Missing ticket_id</h1>"
+                    "<p>Add <code>?ticket_id=&lt;id&gt;</code> to the URL.</p>",
+                    status_code=400,
+                )
+
+            try:
+                from src.core.dev_environment import DevEnvironmentManager
+
+                dev_mgr = getattr(server, "_dev_env_manager", None)
+                if dev_mgr is None:
+                    dev_mgr = DevEnvironmentManager()
+                    server._dev_env_manager = dev_mgr  # type: ignore[attr-defined]
+
+                info = dev_mgr.get_info(ticket_id, provider)
+                if info is None:
+                    # Start the environment; branch name defaults to ticket branch convention
+                    branch = f"ticket/{provider}/{ticket_id}"
+                    info = await dev_mgr.start(
+                        ticket_id=ticket_id,
+                        provider=provider,
+                        branch_name=branch,
+                    )
+
+                if info and info.url:
+                    return RedirectResponse(info.url, status_code=302)
+
+                return HTMLResponse(
+                    f"<h1>Dev environment for ticket {ticket_id} is starting…</h1>"
+                    "<p>Refresh in a few seconds.</p>",
+                    status_code=202,
+                )
+            except Exception as exc:
+                logger.error("dev_env_view error for ticket %s: %s", ticket_id, exc)
+                return HTMLResponse(
+                    f"<h1>Error starting dev environment</h1><pre>{exc}</pre>",
+                    status_code=500,
+                )
+
+        mcp_app = fastmcp.streamable_http_app()
+        app = Starlette(
+            routes=[
+                Route("/webhooks/kanboard", kanboard_webhook, methods=["POST"]),
+                Route("/dev-env/view", dev_env_view, methods=["GET"]),
+                Mount("/", app=mcp_app),
+            ]
+        )
+
+        print(f"[I] Webhook URL:    http://{host}:{port}/webhooks/kanboard")
+        print(f"[I] Dev-env view:   http://{host}:{port}/dev-env/view?ticket_id=<id>")
+        print(
+            "[I] Kanboard webhook setup: Settings → Integrations → Webhook URL"
+            f"\n              → http://host.docker.internal:{port}/webhooks/kanboard"
+        )
 
         # Configure uvicorn with graceful shutdown
         uvicorn_config = uvicorn.Config(

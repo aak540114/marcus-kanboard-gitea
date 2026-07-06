@@ -688,7 +688,7 @@ def get_tool_definitions(role: str = "agent") -> List[types.Tool]:
                     },
                     "provider": {
                         "type": "string",
-                        "description": "Filter by provider (planka, linear, github)",
+                        "description": "Filter by provider (kanboard, sqlite)",
                     },
                 },
                 "required": [],
@@ -726,8 +726,8 @@ def get_tool_definitions(role: str = "agent") -> List[types.Tool]:
                     "name": {"type": "string", "description": "Project name"},
                     "provider": {
                         "type": "string",
-                        "description": "Provider type (planka, linear, github)",
-                        "enum": ["planka", "linear", "github"],
+                        "description": "Provider type (kanboard, sqlite)",
+                        "enum": ["kanboard", "sqlite"],
                     },
                     "config": {
                         "type": "object",

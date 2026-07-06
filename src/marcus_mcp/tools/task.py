@@ -4275,40 +4275,45 @@ async def get_all_board_tasks(
     board_id: str, project_id: str, state: Any
 ) -> Dict[str, Any]:
     """
-    Get all tasks from a specific Planka board.
+    Get all tasks from the kanban board.
 
-    This tool fetches all tasks directly from a Planka board,
+    Fetches all tasks via the configured kanban provider (Kanboard or SQLite),
     useful for validation and inspection purposes.
 
     Parameters
     ----------
     board_id : str
-        The Planka board ID to fetch tasks from
+        Board identifier (used for filtering/context; provider-specific).
     project_id : str
-        The Planka project ID
+        Project identifier.
     state : Any
-        Marcus server state instance
+        Marcus server state instance.
 
     Returns
     -------
     Dict[str, Any]
         Dictionary containing:
         - success: bool
-        - tasks: List of task dictionaries from Planka
+        - tasks: List of task dictionaries
         - count: Number of tasks retrieved
     """
     try:
-        from src.integrations.providers.planka_kanban import PlankaKanban
+        kanban = getattr(state, "kanban", None)
+        if kanban is None:
+            return {
+                "success": False,
+                "error": "No kanban provider configured",
+                "tasks": [],
+                "count": 0,
+            }
 
-        provider = PlankaKanban(config={})
-        await provider.connect()
-
-        tasks = await provider.get_all_tasks()
+        tasks = await kanban.get_all_tasks()
+        task_dicts = [t if isinstance(t, dict) else vars(t) for t in tasks]
 
         return {
             "success": True,
-            "tasks": tasks,
-            "count": len(tasks),
+            "tasks": task_dicts,
+            "count": len(task_dicts),
             "board_id": board_id,
             "project_id": project_id,
         }
