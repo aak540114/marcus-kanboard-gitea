@@ -1,83 +1,76 @@
+# docker-compose.yml — LOCAL DEVELOPMENT ONLY
+#
+# Runs Kanboard + GitLab on a single machine alongside a locally-running
+# Marcus instance.  Not intended for production — use the individual
+# compose files instead:
+#
+#   kanboard/docker-compose.yml  →  deploy Kanboard (e.g. Railway)
+#   gitlab/docker-compose.yml    →  deploy GitLab   (e.g. VPS / cloud VM)
+#
+# Quick start
+# -----------
+#   docker compose up -d
+#
+#   # GitLab takes 3–10 min on first boot:
+#   docker compose logs -f gitlab | grep "GitLab is ready to serve"
+#
+# The MarcusDevEnv plugin is bind-mounted from kanboard/plugins/ so any
+# edits to the PHP templates take effect after a container restart:
+#   docker compose restart kanboard
+#
+# Configure Marcus (run locally, not in Docker):
+#   export KANBOARD_URL=http://localhost:8080/jsonrpc.php
+#   export KANBOARD_API_TOKEN=<token from Kanboard → Settings → API>
+#   export KANBOARD_PROJECT_ID=1
+#   export GITLAB_URL=http://localhost:8929
+#   export GITLAB_TOKEN=<token from GitLab → Profile → Access Tokens>
+#   export MARCUS_URL=http://localhost:4298
+#   export KANBOARD_WEBHOOK_TOKEN=<shared secret, optional>
+
 services:
-  # Kanboard task management board
   kanboard:
     image: kanboard/kanboard:latest
     container_name: marcus-kanboard
+    restart: unless-stopped
     ports:
       - "8080:80"
     volumes:
       - kanboard_data:/var/www/app/data
-      - kanboard_plugins:/var/www/app/plugins
+      # Bind-mount the plugin from source so edits are immediately testable
+      - ./kanboard/plugins:/var/www/app/plugins
     environment:
-      # Optional: validate that incoming webhooks carry this token
-      # Must match KANBOARD_WEBHOOK_TOKEN in your Marcus env vars
-      KANBOARD_WEBHOOK_TOKEN: ""
-    restart: unless-stopped
+      MARCUS_URL: "${MARCUS_URL:-http://host.docker.internal:4298}"
+      KANBOARD_WEBHOOK_TOKEN: "${KANBOARD_WEBHOOK_TOKEN:-}"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost/healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
-  # GitLab CE - self-hosted Git + CI/CD
   gitlab:
     image: gitlab/gitlab-ce:latest
     container_name: marcus-gitlab
     hostname: localhost
+    restart: unless-stopped
     ports:
-      - "8929:80"   # HTTP web UI + git clone
-      - "2289:22"   # SSH git push
+      - "8929:80"
+      - "2289:22"
     volumes:
       - gitlab_config:/etc/gitlab
       - gitlab_logs:/var/log/gitlab
       - gitlab_data:/var/opt/gitlab
+    shm_size: "256m"
     environment:
       GITLAB_OMNIBUS_CONFIG: |
         external_url 'http://localhost:8929'
         gitlab_rails['gitlab_shell_ssh_port'] = 2289
         gitlab_rails['initial_root_password'] = 'Marcus123!'
-    shm_size: '256m'
-    restart: unless-stopped
+        puma['worker_processes'] = 2
+        sidekiq['concurrency'] = 5
 
 volumes:
   kanboard_data:
-  kanboard_plugins:
   gitlab_config:
   gitlab_logs:
   gitlab_data:
-
-# Usage:
-# ======
-#
-# Start the stack:
-#   docker compose up -d
-#
-# First boot: Kanboard is ready in ~5s.
-# GitLab takes 3-10 minutes on first boot — wait until:
-#   docker compose logs -f gitlab | grep "GitLab is ready to serve"
-#
-# Access:
-#   - Kanboard:  http://localhost:8080  (admin / admin)
-#   - GitLab:    http://localhost:8929  (root / Marcus123!)
-#
-# First-time Kanboard setup:
-#   1. Log in at http://localhost:8080 (admin / admin)
-#   2. Settings → API → copy API token
-#   3. Settings → Integrations → Webhook URL:
-#         http://host.docker.internal:4298/webhooks/kanboard
-#      (Kanboard is in Docker; host.docker.internal reaches Marcus on your Mac)
-#   4. Create a project and add columns:
-#         Ready, In Progress, Waiting for Human, Blocked, Done
-#   5. (Optional) Install the MarcusDevEnv plugin:
-#         copy kanboard-plugins/MarcusDevEnv/ into the Kanboard plugins volume
-#         and restart: docker compose restart kanboard
-#
-# First-time GitLab setup:
-#   1. Visit http://localhost:8929 — log in as root / Marcus123!
-#   2. Edit Profile → Access Tokens → create token with api + write_repository scopes
-#
-# Configure Marcus env vars:
-#   export KANBOARD_URL=http://localhost:8080/jsonrpc.php
-#   export KANBOARD_API_TOKEN=<your-token>
-#   export KANBOARD_PROJECT_ID=1
-#   export GITLAB_URL=http://localhost:8929
-#   export GITLAB_TOKEN=<your-pat>
-#   export MARCUS_URL=http://localhost:4298   # used by the MarcusDevEnv plugin
-#
-# Note: Marcus and Cato run locally (not in Docker) because agents
-# write to the local filesystem. Docker is only for infrastructure.

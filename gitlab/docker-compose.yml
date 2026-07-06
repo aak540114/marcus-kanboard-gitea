@@ -1,0 +1,76 @@
+# gitlab/docker-compose.yml
+#
+# Standalone GitLab CE deployment.  Use this when GitLab lives on a
+# dedicated server (VPS, bare metal, cloud VM) separate from Kanboard
+# and Marcus.
+#
+# Resource requirements
+# ---------------------
+# GitLab CE is resource-hungry.  Minimum recommended:
+#   CPU:  2 vCPUs
+#   RAM:  4 GB (8 GB for comfortable use)
+#   Disk: 20 GB
+#
+# Quick start
+# -----------
+#   cd gitlab/
+#   GITLAB_EXTERNAL_URL=http://your-server-ip:8929 \
+#     docker compose up -d
+#
+#   # GitLab takes 3–10 minutes on first boot.  Watch for readiness:
+#   docker compose logs -f gitlab | grep "GitLab is ready to serve"
+#
+# Environment variables
+# ---------------------
+# GITLAB_EXTERNAL_URL   The full URL agents and browsers use to reach
+#                       GitLab, e.g. http://203.0.113.10:8929 or
+#                       https://gitlab.example.com.  Must be reachable
+#                       from Marcus and from developer machines.
+#
+# GITLAB_ROOT_PASSWORD  Initial password for the root account.
+#                       Change it after first login.
+#
+# After starting
+# --------------
+# 1. Visit $GITLAB_EXTERNAL_URL — log in as root / $GITLAB_ROOT_PASSWORD
+# 2. Edit Profile → Access Tokens → create a token with scopes:
+#      api  write_repository
+#    Copy the token; set it on Marcus:
+#      export GITLAB_TOKEN=<token>
+#      export GITLAB_URL=<GITLAB_EXTERNAL_URL>
+# 3. Marcus will auto-create repos under the root namespace when new
+#    Kanboard projects appear.
+
+services:
+  gitlab:
+    image: gitlab/gitlab-ce:latest
+    container_name: gitlab
+    hostname: gitlab
+    restart: unless-stopped
+    ports:
+      - "${GITLAB_HTTP_PORT:-8929}:80"
+      - "${GITLAB_SSH_PORT:-2289}:22"
+    volumes:
+      - gitlab_config:/etc/gitlab
+      - gitlab_logs:/var/log/gitlab
+      - gitlab_data:/var/opt/gitlab
+    shm_size: "256m"
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url '${GITLAB_EXTERNAL_URL:-http://localhost:8929}'
+        gitlab_rails['gitlab_shell_ssh_port'] = ${GITLAB_SSH_PORT:-2289}
+        gitlab_rails['initial_root_password'] = '${GITLAB_ROOT_PASSWORD:-Marcus123!}'
+        # Reduce memory usage; raise worker_processes for busier instances
+        puma['worker_processes'] = 2
+        sidekiq['concurrency'] = 5
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost/-/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 300s   # GitLab takes several minutes to initialise
+
+volumes:
+  gitlab_config:
+  gitlab_logs:
+  gitlab_data:
