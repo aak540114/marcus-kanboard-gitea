@@ -173,6 +173,7 @@ on half-configured tickets.
 | `waiting_for_human` | AI | AI finished or needs input — human's turn |
 | `blocked` | AI | Dependency on another unfinished ticket |
 | `done` | Human | Human accepted the work; triggers branch merge |
+| `reopened` | Human | Ticket sent back for further AI work after review |
 
 ### What AI agents can signal (MCP tools)
 
@@ -195,6 +196,8 @@ on half-configured tickets.
 | `/mcp` | GET/POST | MCP protocol — all AI agent tooling |
 | `/webhooks/kanboard` | POST | Receives Kanboard push webhooks; instant event delivery |
 | `/dev-env/view?ticket_id=<id>` | GET | Starts dev environment and redirects browser to hot-reload URL |
+| `/api/active-agents` | GET | Returns all tickets currently claimed by an AI agent (used by the Kanboard badge) |
+| `/api/ticket-links?ticket_id=<id>` | GET | Proxies Kanboard task links, split into `depends_on`, `blocks`, and `relates_to` lists |
 
 ---
 
@@ -415,16 +418,18 @@ docker compose logs -f gitlab | grep "GitLab is ready to serve"
 5. Add columns named exactly: `Ready`, `In Progress`, `Waiting for Human`, `Blocked`, `Done`
    *(column names are case-insensitive in Marcus's mapping)*
 
-**Optional — "View Live Changes" button:**
-Install the MarcusDevEnv Kanboard plugin to add a sidebar button on every task that spins up a hot-reload dev environment with one click:
+**MarcusDevEnv plugin (included automatically):**
+The MarcusDevEnv Kanboard plugin ships in `kanboard/plugins/MarcusDevEnv/` and is active in all supported deployment paths. It adds three features:
 
-```bash
-# Copy the plugin into the Kanboard container and restart
-docker compose cp kanboard-plugins/MarcusDevEnv marcus-kanboard:/var/www/app/plugins/
-docker compose restart kanboard
-```
+| Feature | Where it appears | What it does |
+|---|---|---|
+| **Active AI Agents badge** | Top of every board view | Live green/grey/amber badge showing how many tickets are currently held by an AI agent. Updates every 15 s; hover to see agent IDs and ticket IDs. Calls `/api/active-agents`. |
+| **Marcus Dependencies panel** | Task sidebar | Loads the task's dependency graph on page open: *Depends on*, *Blocks*, and *Related* lists, each with a colour-coded column-status badge. Calls `/api/ticket-links`. |
+| **View Live Changes button** | Task sidebar | Spins up a hot-reload dev environment for the ticket's branch with one click. Calls `/dev-env/view`. |
 
-After restart, every task detail page shows a **View Live Changes** button. Clicking it calls Marcus's `/dev-env/view` endpoint, starts the dev environment for that ticket's branch, and redirects the browser to the hot-reload URL.
+**Local dev stack** (root `docker-compose.yml`): the plugin is bind-mounted from `./kanboard/plugins/` automatically — no extra steps needed.
+
+**Standalone Kanboard** (`kanboard/docker-compose.yml`, Railway): the plugin is baked into the Docker image at build time — no copy step needed.
 
 ### First-time GitLab setup
 
@@ -462,6 +467,21 @@ Or set these in `config_marcus.json`:
   "gitlab_token": "YOUR_GITLAB_PAT"
 }
 ```
+
+### Deploying services independently
+
+The three services — Marcus, Kanboard, and GitLab — are each independently deployable. You do not have to run them all on the same machine.
+
+| Service | Compose file | Suggested platform |
+|---|---|---|
+| **Local all-in-one** | `docker-compose.yml` (root) | macOS / Linux laptop |
+| **Kanboard only** | `kanboard/docker-compose.yml` | [Railway](https://railway.app), Fly.io, any VPS |
+| **GitLab only** | `gitlab/docker-compose.yml` | Dedicated VPS or cloud VM (needs ≥ 4 GB RAM) |
+| **Marcus** | runs locally, no Docker | Your laptop, a cloud VM, or CI |
+
+**Railway (Kanboard):** push the repo to GitHub, create a Railway service pointing at `kanboard/`, and set the environment variables below in the Railway dashboard. Railway reads `kanboard/railway.toml` automatically.
+
+**Custom MARCUS_URL:** whatever host Kanboard runs on, set `MARCUS_URL` to the public URL of your Marcus server so the plugin's JavaScript can reach the `/api/active-agents` and `/api/ticket-links` endpoints from the browser.
 
 ### How the full flow works end-to-end
 
@@ -527,6 +547,7 @@ transparency, and letting the system — not any single agent — hold the truth
 
 | Date           | Update |
 |----------------|--------|
+| **2026-07-06** | Active AI Agents live badge on Kanboard board view (`/api/active-agents`); Marcus Dependencies sidebar panel on tasks (`/api/ticket-links`); Kanboard + GitLab moved to independent deployment dirs (`kanboard/`, `gitlab/`); Railway deploy config (`kanboard/railway.toml`); `reopened` ticket state; one-ticket-per-agent claim gate |
 | **2026-07-06** | Kanboard push webhooks for instant event delivery; `/dev-env/view` HTTP endpoint; MarcusDevEnv Kanboard plugin ("View Live Changes" sidebar button); removed Planka/Linear/GitHub/Jira providers |
 | **2026-07-05** | Human-gated workflow, Kanboard provider, GitLab integration, ProjectWatcher, ProjectSyncWorkflow |
 | **2026-04-26** | v0.3.6 — parallel experiment isolation, agent auto-termination, DONE-task board integrity guards |
@@ -544,7 +565,7 @@ transparency, and letting the system — not any single agent — hold the truth
 
 | Version    | Date       | Commits | Highlights |
 |------------|------------|---------|------------|
-| **dev**    | 2026-07-06 | —       | Kanboard push webhooks (`POST /webhooks/kanboard`) for instant event delivery; `/dev-env/view` HTTP endpoint; MarcusDevEnv Kanboard PHP plugin with "View Live Changes" sidebar button; removed Planka/Linear/GitHub/Jira providers; human-gated workflow; Kanboard JSON-RPC provider; GitLab CE integration; `ProjectWatcher`; `ProjectSyncWorkflow`; 6-state ticket lifecycle; 10 new MCP tools for AI agents |
+| **dev**    | 2026-07-06 | —       | Active AI Agents live badge (board view); Marcus Dependencies sidebar panel; `/api/active-agents` + `/api/ticket-links` HTTP endpoints; independent `kanboard/` + `gitlab/` deploy dirs; Railway config; one-ticket-per-agent claim gate; 7-state ticket lifecycle (`reopened` added); Kanboard push webhooks; `/dev-env/view` endpoint; MarcusDevEnv plugin (3 features); human-gated workflow; Kanboard JSON-RPC provider; GitLab CE integration; `ProjectWatcher`; `ProjectSyncWorkflow`; 10 new MCP tools |
 | **v0.3.6** | 2026-04-26 | 28      | Parallel experiment isolation, agent auto-termination, DONE-task board integrity guards, Phase 4 lease tuning, spec-coverage ordering fix |
 | **v0.3.4** | 2026-04-17 | —       | `contract_first` default decomposer, `recommended_agents` in `create_project` response, `PROTOCOL.md`, pre-fork synthesis, scope annotation |
 | **v0.3.0** | 2026-04-03 | 59      | SQLite default provider, Epictetus evaluation, `/marcus` one-command experiments, resilience overhaul |
