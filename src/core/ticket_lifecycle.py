@@ -121,7 +121,7 @@ _AI_TRANSITIONS: Dict[TicketState, List[TicketState]] = {
         TicketState.IN_PROGRESS,
         TicketState.DONE,
     ],
-    TicketState.BLOCKED: [TicketState.IN_PROGRESS],
+    TicketState.BLOCKED: [TicketState.IN_PROGRESS, TicketState.DONE],
     TicketState.DONE: [TicketState.REOPENED],
     TicketState.REOPENED: [TicketState.IN_PROGRESS],
 }

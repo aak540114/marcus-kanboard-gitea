@@ -362,14 +362,38 @@ class HumanGatedWorkflow:
         )
 
         if merged:
-            self._lifecycle.transition(
-                ticket_id,
-                self._provider,
-                TicketState.DONE,
-                reason="Human marked done; branch merged to main",
-            )
-            self._lifecycle.set_merged(ticket_id, self._provider)
-            self._lifecycle.release_ticket(ticket_id, self._provider)
+            try:
+                self._lifecycle.transition(
+                    ticket_id,
+                    self._provider,
+                    TicketState.DONE,
+                    reason="Human marked done; branch merged to main",
+                )
+            except InvalidTransitionError as exc:
+                logger.warning(
+                    "Ticket %s: unexpected state when closing — forcing DONE: %s",
+                    ticket_id,
+                    exc,
+                )
+                # Force state to DONE via human_transition so the claim is
+                # still released below even if _AI_TRANSITIONS blocks the path.
+                try:
+                    self._lifecycle.human_transition(
+                        ticket_id,
+                        self._provider,
+                        TicketState.DONE,
+                        reason="Forced DONE after merge (state machine override)",
+                    )
+                except (InvalidTransitionError, KeyError):
+                    pass
+            try:
+                self._lifecycle.set_merged(ticket_id, self._provider)
+            except KeyError:
+                pass
+            try:
+                self._lifecycle.release_ticket(ticket_id, self._provider)
+            except KeyError:
+                pass
 
             # Stop dev env if running.
             await self._dev_env.stop(ticket_id, self._provider)
@@ -441,6 +465,9 @@ class HumanGatedWorkflow:
         logger.info(
             "Ticket %s reopened; branch %s rebased on main", ticket_id, branch_name
         )
+
+        # Agent is now free — pick up the next ticket (or re-claim this one).
+        await self._pickup_next_ticket()
 
     async def _on_comment_added(self, event: Any) -> None:
         """Handle a new human comment on a ticket."""

@@ -35,12 +35,13 @@ logger = logging.getLogger(__name__)
 _COLUMN_STATUS_MAP: Dict[str, TaskStatus] = {
     # TODO-family
     "backlog": TaskStatus.TODO,
-    "ready": TaskStatus.TODO,
     "todo": TaskStatus.TODO,
     "to do": TaskStatus.TODO,
     "open": TaskStatus.TODO,
     "new": TaskStatus.TODO,
     "queue": TaskStatus.TODO,
+    # READY-family — human-gated workflow trigger column
+    "ready": TaskStatus.READY,
     # IN_PROGRESS-family
     "in progress": TaskStatus.IN_PROGRESS,
     "in development": TaskStatus.IN_PROGRESS,
@@ -52,6 +53,10 @@ _COLUMN_STATUS_MAP: Dict[str, TaskStatus] = {
     "review": TaskStatus.IN_PROGRESS,
     "in review": TaskStatus.IN_PROGRESS,
     "testing": TaskStatus.IN_PROGRESS,
+    # WAITING_FOR_HUMAN-family
+    "waiting for human": TaskStatus.WAITING_FOR_HUMAN,
+    "waiting": TaskStatus.WAITING_FOR_HUMAN,
+    "pending review": TaskStatus.WAITING_FOR_HUMAN,
     # BLOCKED-family
     "blocked": TaskStatus.BLOCKED,
     "block": TaskStatus.BLOCKED,
@@ -177,15 +182,15 @@ class KanboardKanban(KanbanInterface):
                 exc.response.status_code,
                 exc.response.text[:200],
             )
-            assert self._client is not None
-            await self._client.aclose()
-            self._client = None
+            if self._client is not None:
+                await self._client.aclose()
+                self._client = None
             return False
         except (httpx.HTTPError, RuntimeError) as exc:
             logger.error("Kanboard connection error: %s", exc)
-            assert self._client is not None
-            await self._client.aclose()
-            self._client = None
+            if self._client is not None:
+                await self._client.aclose()
+                self._client = None
             return False
 
     async def disconnect(self) -> None:
@@ -228,16 +233,18 @@ class KanboardKanban(KanbanInterface):
 
     async def get_available_tasks(self) -> List[Task]:
         """
-        Return unassigned tasks in a TODO column.
+        Return unassigned tasks in a TODO or READY column.
 
         Returns
         -------
         List[Task]
-            Unassigned TODO tasks an agent can claim.
+            Unassigned tasks in the TODO or READY column that an agent can claim.
         """
         all_tasks = await self.get_all_tasks()
         return [
-            t for t in all_tasks if t.status == TaskStatus.TODO and not t.assigned_to
+            t
+            for t in all_tasks
+            if t.status in (TaskStatus.TODO, TaskStatus.READY) and not t.assigned_to
         ]
 
     async def get_task_by_id(self, task_id: str) -> Optional[Task]:
@@ -546,11 +553,10 @@ class KanboardKanban(KanbanInterface):
         if message:
             comment += f"\n\n{message}"
 
-        # Optionally move to In Progress when work starts
-        if progress > 0 and progress < 100:
+        # Move to In Progress when work starts (but never auto-close;
+        # closing is a human action gated by HumanGatedWorkflow).
+        if 0 < progress < 100:
             await self.move_task_to_column(task_id, "In Progress")
-        elif progress >= 100:
-            await self.move_task_to_column(task_id, "Done")
 
         return await self.add_comment(task_id, comment)
 
@@ -805,7 +811,11 @@ class KanboardKanban(KanbanInterface):
         self._column_status_map = {}
         for col in columns or []:
             name = col.get("title", "")
-            cid = int(col.get("id", 0))
+            raw_id = col.get("id")
+            if raw_id is None:
+                logger.warning("Kanboard returned column with null id; skipping: %s", col)
+                continue
+            cid = int(raw_id)
             self._column_map[name.lower()] = cid
             self._column_status_map[cid] = _COLUMN_STATUS_MAP.get(
                 name.lower(), TaskStatus.TODO

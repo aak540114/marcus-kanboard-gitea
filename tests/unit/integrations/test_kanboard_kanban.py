@@ -323,7 +323,7 @@ class TestNormalizeStatus:
         "column_name,expected",
         [
             ("Backlog", TaskStatus.TODO),
-            ("Ready", TaskStatus.TODO),
+            ("Ready", TaskStatus.READY),
             ("To Do", TaskStatus.TODO),
             ("In Progress", TaskStatus.IN_PROGRESS),
             ("WIP", TaskStatus.IN_PROGRESS),

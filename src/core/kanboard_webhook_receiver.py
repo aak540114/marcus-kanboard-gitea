@@ -48,14 +48,45 @@ logger = logging.getLogger(__name__)
 # Column-name → TaskStatus name mapping (kept in sync with KanboardKanban)
 # ---------------------------------------------------------------------------
 _COLUMN_STATUS_MAP: Dict[str, str] = {
+    # TODO-family
     "backlog": "todo",
     "todo": "todo",
+    "to do": "todo",
+    "open": "todo",
+    "new": "todo",
+    "queue": "todo",
+    # READY-family
     "ready": "ready",
+    # IN_PROGRESS-family
     "in progress": "in_progress",
+    "in development": "in_progress",
+    "wip": "in_progress",
+    "work in progress": "in_progress",
+    "doing": "in_progress",
+    "active": "in_progress",
+    "development": "in_progress",
+    "review": "in_progress",
+    "in review": "in_progress",
+    "testing": "in_progress",
+    # WAITING_FOR_HUMAN-family
     "waiting for human": "waiting_for_human",
+    "waiting": "waiting_for_human",
+    "pending review": "waiting_for_human",
+    # BLOCKED-family
     "blocked": "blocked",
+    "block": "blocked",
+    "impediment": "blocked",
+    "on hold": "blocked",
+    "hold": "blocked",
+    # DONE-family
     "done": "done",
     "closed": "done",
+    "complete": "done",
+    "completed": "done",
+    "finished": "done",
+    "resolved": "done",
+    "archive": "done",
+    "archived": "done",
 }
 
 # Kanboard event names

@@ -13,10 +13,10 @@ Configuration
     Optional group/user namespace. Defaults to the token owner.
 """
 
+import asyncio
 import logging
 import os
 import re
-import subprocess
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -194,7 +194,7 @@ class GitLabManager:
             ["git", "config", "user.name", "Marcus"],
         ]
         for cmd in cmds:
-            _run_git(cmd, cwd=local_path)
+            await _run_git(cmd, cwd=local_path)
 
         readme = os.path.join(local_path, "README.md")
         if not os.path.exists(readme):
@@ -202,15 +202,15 @@ class GitLabManager:
             with open(readme, "w") as f:
                 f.write(f"# {project_name}\n\nManaged by Marcus.\n")
 
-        _run_git(["git", "add", "README.md"], cwd=local_path)
-        _run_git(
+        await _run_git(["git", "add", "README.md"], cwd=local_path)
+        await _run_git(
             ["git", "commit", "-m", "init: initial commit from Marcus"],
             cwd=local_path,
         )
-        _run_git(
+        await _run_git(
             ["git", "remote", "add", "origin", push_url], cwd=local_path
         )
-        _run_git(
+        await _run_git(
             ["git", "push", "-u", "origin", "main"], cwd=local_path
         )
         logger.info("Pushed initial commit to %s", clone_url)
@@ -296,8 +296,8 @@ def _auth_clone_url(clone_url: str, token: str) -> str:
     return clone_url
 
 
-def _run_git(args: List[str], cwd: str) -> None:
-    """Run a git command, raising RuntimeError on non-zero exit.
+async def _run_git(args: List[str], cwd: str) -> None:
+    """Run a git command asynchronously, raising RuntimeError on non-zero exit.
 
     Parameters
     ----------
@@ -311,11 +311,17 @@ def _run_git(args: List[str], cwd: str) -> None:
     RuntimeError
         If the command exits with a non-zero code.
     """
-    result = subprocess.run(
-        args, cwd=cwd, capture_output=True, text=True  # noqa: S603
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        cwd=cwd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
-    if result.returncode != 0:
+    stdout_bytes, stderr_bytes = await proc.communicate()
+    if proc.returncode != 0:
+        # Redact any embedded credentials (http://user:TOKEN@host) before logging.
+        safe_args = [re.sub(r"://[^:@/]+:[^@]*@", "://***:***@", a) for a in args]
         raise RuntimeError(
-            f"git command failed: {' '.join(args)}\n"
-            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+            f"git command failed: {' '.join(safe_args)}\n"
+            f"stdout: {stdout_bytes.decode()}\nstderr: {stderr_bytes.decode()}"
         )

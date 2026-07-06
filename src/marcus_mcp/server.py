@@ -3339,7 +3339,15 @@ if __name__ == "__main__":
             """
             from src.core.ticket_lifecycle import TicketLifecycleManager
 
-            lm = TicketLifecycleManager()
+            # Reuse the singleton cached on the server object so we don't
+            # hit the filesystem on every poll cycle from the Kanboard plugin.
+            lm = getattr(server, "_lifecycle_manager_cache", None)
+            if lm is None:
+                lm = TicketLifecycleManager()
+                server._lifecycle_manager_cache = lm  # type: ignore[attr-defined]
+            else:
+                lm._load()  # refresh in-memory state from disk
+
             active = [
                 {
                     "agent_id": r.ai_agent_id,
@@ -3400,6 +3408,16 @@ if __name__ == "__main__":
                 response.headers["Access-Control-Allow-Origin"] = "*"
                 return response
 
+            try:
+                ticket_id_int = int(ticket_id)
+            except ValueError:
+                response = JSONResponse(
+                    {"error": f"ticket_id must be a numeric Kanboard task ID, got: {ticket_id!r}"},
+                    status_code=400,
+                )
+                response.headers["Access-Control-Allow-Origin"] = "*"
+                return response
+
             kb_url = os.getenv(
                 "KANBOARD_URL", "http://localhost:8080/jsonrpc.php"
             )
@@ -3422,7 +3440,7 @@ if __name__ == "__main__":
                             "jsonrpc": "2.0",
                             "method": "getTaskLinks",
                             "id": 1,
-                            "params": {"task_id": int(ticket_id)},
+                            "params": {"task_id": ticket_id_int},
                         },
                         auth=_httpx.BasicAuth("jsonrpc", kb_token),
                     )
