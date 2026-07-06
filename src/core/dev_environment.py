@@ -14,18 +14,18 @@ The environment shuts down automatically when:
 A ``PortAllocator`` picks free TCP ports so multiple ticket envs can
 run concurrently without collisions.
 
-Project-type detection
-----------------------
-When ``DevEnvironmentConfig.auto_detect`` is ``True`` (the default), the
-manager inspects the repo root for well-known project files (``package.json``,
-``requirements.txt``, ``Cargo.toml``, etc.) and picks the matching Docker
-image + start command automatically.  For stacks that have native hot-reload
-(Vite/webpack, uvicorn ``--reload``, Django runserver, cargo-watch, …) the
-start command handles file watching itself.  For stacks without it an
-``inotifywait`` wrapper restarts the process on every file change.
+Stack selection order
+---------------------
+1. Caller supplies a :class:`~src.core.project_description.ProjectStack`
+   (derived from the project's description document) — preferred path.
+2. ``auto_detect=True`` (the default) falls back to sniffing the repo root
+   for well-known project files (``package.json``, ``requirements.txt``, …).
+3. ``auto_detect=False`` with explicit ``docker_image`` / ``dev_command``
+   overrides everything.
 
-Set ``auto_detect=False`` and supply ``docker_image`` + ``dev_command``
-manually to override everything.
+All stacks use **``debian:bookworm-slim``** as the base Docker image so a
+single fast image covers any language.  Runtime tools (Python, Node.js, Go,
+…) are installed by the generated entrypoint script using ``apt-get``.
 
 Classes
 -------
@@ -59,100 +59,61 @@ _DEFAULT_IDLE_TIMEOUT = 4 * 3600  # 4 hours
 # Project-type detection
 # ---------------------------------------------------------------------------
 
-#: Maps stack name → Docker image, setup command, start command, and whether
-#: the start command handles hot-reload itself.  All stacks expose the app on
-#: container port **3000**; the host port is allocated by PortAllocator.
-STACK_CONFIGS: Dict[str, Dict[str, Any]] = {
-    # ── JavaScript / TypeScript ──────────────────────────────────────────
-    # native_reload=True: Vite/webpack push module diffs over a WebSocket
-    # without restarting the process.  Killing the process on every save
-    # (inotifywait) would drop the WebSocket and degrade to full-page
-    # reloads, defeating the purpose of the dev server.
-    "nodejs": {
-        "image": "node:lts-alpine",   # ~180 MB; already the fastest Node image
-        "setup": "npm install",
-        "start": "npm run dev -- --port 3000",
-        "native_reload": True,
-    },
-    # ── Python (interpreted — inotifywait restart is safe and uniform) ───
-    # No --reload flags so there is only one file-watcher in play.
-    "python-fastapi": {
-        "image": "python:3.12-alpine",  # ~60 MB vs 130 MB for slim
-        "setup": "pip install --no-cache-dir -r requirements.txt",
-        "start": "uvicorn main:app --host 0.0.0.0 --port 3000",
-        "native_reload": False,
-    },
-    "python-flask": {
-        "image": "python:3.12-alpine",
-        "setup": "pip install --no-cache-dir -r requirements.txt",
-        "start": "flask run --host 0.0.0.0 --port 3000",
-        "native_reload": False,
-        "env": {"FLASK_APP": "app.py"},
-    },
-    "python-django": {
-        "image": "python:3.12-alpine",
-        "setup": "pip install --no-cache-dir -r requirements.txt",
-        "start": "python manage.py runserver 0.0.0.0:3000 --noreload",
-        "native_reload": False,  # --noreload so only inotifywait restarts
-    },
-    "python": {
-        "image": "python:3.12-alpine",
-        "setup": "pip install --no-cache-dir -r requirements.txt 2>/dev/null || true",
-        "start": "python -m http.server 3000",
-        "native_reload": False,
-    },
-    # ── Rust ─────────────────────────────────────────────────────────────
-    # cargo-watch manages incremental compilation internally; killing it
-    # mid-compile with inotifywait would abort builds.
-    "rust": {
-        "image": "rust:alpine",   # ~600 MB vs 1.5 GB for rust:latest
-        "setup": "cargo install cargo-watch",
-        "start": "cargo watch -x run",
-        "native_reload": True,
-    },
-    # ── Go ───────────────────────────────────────────────────────────────
-    # air manages its own build/restart loop; same reasoning as Rust.
-    "go": {
-        "image": "golang:alpine",  # ~260 MB vs 800 MB for golang:latest
-        "setup": "go install github.com/air-verse/air@latest",
-        "start": "$(go env GOPATH)/bin/air",
-        "native_reload": True,
-    },
-    # ── Ruby, Java, PHP, static (interpreted / no meaningful HMR state) ──
-    "ruby": {
-        "image": "ruby:3.3-alpine",  # ~80 MB vs 900 MB for ruby:latest
-        "setup": "bundle install 2>/dev/null || true",
-        "start": "bundle exec ruby app.rb -p 3000 2>/dev/null || ruby app.rb -p 3000",
-        "native_reload": False,
-    },
-    "java": {
-        "image": "eclipse-temurin:21-jdk-alpine",  # ~340 MB vs 500 MB+ for maven:latest
-        "setup": "mvn dependency:resolve -q 2>/dev/null || gradle dependencies -q 2>/dev/null || true",
-        "start": "mvn spring-boot:run -Dspring-boot.run.jvmArguments='-Dserver.port=3000' 2>/dev/null || gradle bootRun",
-        "native_reload": False,
-    },
-    "php": {
-        "image": "php:8.3-alpine",  # ~30 MB
-        "setup": "composer install 2>/dev/null || true",
-        "start": "php -S 0.0.0.0:3000",
-        "native_reload": False,
-    },
-    "static": {
-        "image": "python:3.12-alpine",  # ~60 MB
-        "setup": "",
-        "start": "python -m http.server 3000",
-        "native_reload": False,
-    },
+#: Single base image for all dev environments.  ``debian:bookworm-slim``
+#: starts in under a second, ships ``apt-get`` so any runtime can be
+#: installed, and is ~75 MB — faster than any language-specific full image.
+_BASE_IMAGE = "debian:bookworm-slim"
+
+#: apt packages always installed in the base layer before the project setup.
+_BASE_APT = "git curl inotify-tools build-essential ca-certificates"
+
+# ---------------------------------------------------------------------------
+# Fallback stack table — used when no ProjectStack is supplied and
+# auto_detect=True sniffs well-known project files from the repo root.
+# ---------------------------------------------------------------------------
+
+#: Maps detected stack key → (install_cmd, dev_cmd, use_hm_reload).
+#: ``use_hm_reload`` is True only for stacks where killing the process on
+#: each file save would break browser-side hot-module state (Node.js/Vite)
+#: or interrupt an incremental compile cycle (cargo-watch, air).
+_FALLBACK_STACKS: Dict[str, Dict[str, Any]] = {
+    "nodejs":         {"install": "npm install",
+                       "start":   "npm run dev -- --port 3000",
+                       "hm":      True},
+    "python-fastapi": {"install": "pip install --no-cache-dir -r requirements.txt",
+                       "start":   "uvicorn main:app --host 0.0.0.0 --port 3000",
+                       "hm":      False},
+    "python-flask":   {"install": "pip install --no-cache-dir -r requirements.txt",
+                       "start":   "flask run --host 0.0.0.0 --port 3000",
+                       "hm":      False},
+    "python-django":  {"install": "pip install --no-cache-dir -r requirements.txt",
+                       "start":   "python manage.py runserver 0.0.0.0:3000 --noreload",
+                       "hm":      False},
+    "python":         {"install": "pip install --no-cache-dir -r requirements.txt 2>/dev/null || true",
+                       "start":   "python3 -m http.server 3000",
+                       "hm":      False},
+    "rust":           {"install": "cargo install cargo-watch",
+                       "start":   "cargo watch -x run",
+                       "hm":      True},
+    "go":             {"install": "go install github.com/air-verse/air@latest",
+                       "start":   "$(go env GOPATH)/bin/air",
+                       "hm":      True},
+    "ruby":           {"install": "bundle install 2>/dev/null || true",
+                       "start":   "bundle exec ruby app.rb -p 3000 2>/dev/null || ruby app.rb -p 3000",
+                       "hm":      False},
+    "java":           {"install": "mvn dependency:resolve -q 2>/dev/null || true",
+                       "start":   "mvn spring-boot:run -Dspring-boot.run.jvmArguments='-Dserver.port=3000'",
+                       "hm":      False},
+    "php":            {"install": "composer install 2>/dev/null || true",
+                       "start":   "php -S 0.0.0.0:3000",
+                       "hm":      False},
+    "static":         {"install": "",
+                       "start":   "python3 -m http.server 3000",
+                       "hm":      False},
 }
 
-#: Installs inotify-tools on Alpine images (all non-Node/Rust/Go stacks).
-#: Alpine's apk is consistently present; the apt-get fallback covers any
-#: Debian-based custom images.
-_INOTIFY_INSTALL = (
-    "apk add --no-cache inotify-tools 2>/dev/null || "
-    "apt-get install -y --no-install-recommends inotify-tools 2>/dev/null || "
-    "true"
-)
+# Keep public alias so existing imports don't break while we migrate callers.
+STACK_CONFIGS = _FALLBACK_STACKS
 
 
 def detect_project_type(repo_path: str) -> str:
@@ -371,6 +332,7 @@ class DevEnvironmentManager:
         ticket_id: str,
         provider: str,
         branch_name: str,
+        project_stack: "Optional[Any]" = None,
     ) -> DevEnvironmentInfo:
         """Start a dev environment for *branch_name*.
 
@@ -385,6 +347,9 @@ class DevEnvironmentManager:
             Kanban provider name.
         branch_name : str
             Git branch to run.
+        project_stack : Optional[ProjectStack]
+            Tech-stack parsed from the project description.  Overrides
+            file-based detection when supplied.
 
         Returns
         -------
@@ -404,7 +369,8 @@ class DevEnvironmentManager:
 
         if self.config.use_docker:
             info = await self._start_docker(
-                ticket_id, provider, branch_name, port, container_name, url
+                ticket_id, provider, branch_name, port, container_name, url,
+                project_stack=project_stack,
             )
         else:
             info = await self._start_local(
@@ -476,44 +442,61 @@ class DevEnvironmentManager:
     # Docker implementation
     # ------------------------------------------------------------------
 
-    def _build_entrypoint(self, branch_name: str, stack: str) -> str:
+    def _build_entrypoint(
+        self,
+        branch_name: str,
+        install_cmd: str,
+        start_cmd: str,
+        use_hm_reload: bool,
+        extra_apt: Optional[List[str]] = None,
+    ) -> str:
         """Build the shell command run inside the Docker container.
 
         Parameters
         ----------
         branch_name : str
             Git branch to check out before starting.
-        stack : str
-            Key from :data:`STACK_CONFIGS`.
+        install_cmd : str
+            Command that installs project dependencies (may be empty).
+        start_cmd : str
+            Command that starts the dev server on port 3000.
+        use_hm_reload : bool
+            When ``True`` the start command handles its own hot-reload
+            (Node.js/Vite, cargo-watch, air) and must NOT be killed on
+            file changes.  When ``False`` an ``inotifywait`` restart loop
+            is used.
+        extra_apt : Optional[List[str]]
+            Additional ``apt-get install`` package names beyond the base set.
 
         Returns
         -------
         str
             A ``sh -c`` compatible shell command string.
         """
-        cfg = STACK_CONFIGS[stack]
-        setup: str = cfg["setup"]
-        start: str = cfg["start"]
+        apt_extras = " ".join(extra_apt) if extra_apt else ""
+        apt_line = (
+            f"apt-get update -qq && apt-get install -y --no-install-recommends "
+            f"{_BASE_APT}{' ' + apt_extras if apt_extras else ''}"
+        )
 
-        steps = [f"git checkout {branch_name}"]
-        if setup:
-            steps.append(setup)
+        steps = [apt_line, f"git checkout {branch_name}"]
+        if install_cmd:
+            steps.append(install_cmd)
 
-        if cfg["native_reload"]:
-            steps.append(start)
+        if use_hm_reload:
+            steps.append(start_cmd)
             return " && ".join(steps)
 
-        # Wrap with inotifywait so any file change triggers a process restart.
+        # inotifywait restart loop for interpreted / non-HMR stacks.
         setup_part = " && ".join(steps)
         return (
             f"{setup_part} && "
-            f"{_INOTIFY_INSTALL} && "
-            f"{start} & APP_PID=$! && "
+            f"{start_cmd} & APP_PID=$! && "
             f"while inotifywait -e modify,create,delete,move -r /app "
             f"--exclude '\\.git' --quiet 2>/dev/null; do "
             f"echo '[marcus] File changed — restarting...'; "
             f"kill $APP_PID 2>/dev/null; wait $APP_PID 2>/dev/null; "
-            f"{start} & APP_PID=$!; "
+            f"{start_cmd} & APP_PID=$!; "
             f"done"
         )
 
@@ -525,28 +508,53 @@ class DevEnvironmentManager:
         port: int,
         container_name: str,
         url: str,
+        project_stack: "Optional[Any]" = None,
     ) -> DevEnvironmentInfo:
-        """Launch a Docker container for the ticket branch."""
-        if self.config.auto_detect:
-            stack = detect_project_type(self.config.repo_path)
-            stack_cfg = STACK_CONFIGS[stack]
-            image = stack_cfg["image"]
-            entrypoint = self._build_entrypoint(branch_name, stack)
-            stack_env: Dict[str, str] = stack_cfg.get("env", {})
+        """Launch a Docker container for the ticket branch.
+
+        Parameters
+        ----------
+        project_stack : Optional[ProjectStack]
+            Tech-stack parsed from the project description.  When supplied
+            this takes priority over file-based detection.
+        """
+        # ── Resolve install/start commands ──────────────────────────────
+        extra_apt: List[str] = []
+        if project_stack is not None:
+            # Primary path: stack from project description
+            install_cmd: str = project_stack.install_cmd
+            start_cmd: str = project_stack.dev_cmd
+            use_hm_reload: bool = project_stack.use_hm_reload
+            extra_apt = getattr(project_stack, "apt_packages", [])
             logger.info(
-                "Detected project type %r for %s; using image %s", stack, branch_name, image
+                "Using project-description stack %r for %s",
+                project_stack.language,
+                branch_name,
+            )
+        elif self.config.auto_detect:
+            # Fallback: sniff repo root for well-known files
+            stack_key = detect_project_type(self.config.repo_path)
+            fb = _FALLBACK_STACKS[stack_key]
+            install_cmd = fb["install"]
+            start_cmd = fb["start"]
+            use_hm_reload = fb["hm"]
+            logger.info(
+                "Auto-detected stack %r for %s (no project description)",
+                stack_key,
+                branch_name,
             )
         else:
-            image = self.config.docker_image
-            entrypoint = (
-                f"git checkout {branch_name} && "
-                f"{self.config.dev_command.format(port=3000)}"
-            )
-            stack_env = {}
+            # Manual override via config
+            install_cmd = ""
+            start_cmd = self.config.dev_command.format(port=3000)
+            use_hm_reload = False
 
-        all_env = {**stack_env, **self.config.env_vars}
+        entrypoint = self._build_entrypoint(
+            branch_name, install_cmd, start_cmd, use_hm_reload, extra_apt
+        )
+
         env_args: List[str] = []
-        for k, v in all_env.items():
+        for k, v in self.config.env_vars.items():
             env_args += ["-e", f"{k}={v}"]
 
         cmd = (
@@ -566,7 +574,7 @@ class DevEnvironmentManager:
             ]
             + env_args
             + [
-                image,
+                _BASE_IMAGE,
                 "sh",
                 "-c",
                 entrypoint,

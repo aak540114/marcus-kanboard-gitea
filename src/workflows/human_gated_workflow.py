@@ -957,6 +957,10 @@ class HumanGatedWorkflow:
             )
             return
 
+        # Check that the project description has enough tech-stack info.
+        # If the stack is unclear, ask the human and stop until they respond.
+        await self._check_project_stack(ticket_id)
+
         # Advance the lifecycle state to IN_PROGRESS via READY if needed.
         if record.state == TicketState.TODO:
             try:
@@ -1132,6 +1136,57 @@ class HumanGatedWorkflow:
             ``True`` if the ticket has no human assignee.
         """
         return record.assignee in (None, "", "0")
+
+    async def _check_project_stack(self, ticket_id: str) -> None:
+        """Verify the project description has enough stack info to start work.
+
+        If the stack cannot be determined, post a clarification comment on the
+        ticket and move it to "waiting for human" so the human can fill in the
+        Project Description before work resumes.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Kanboard task ID.
+        """
+        try:
+            from src.core.project_description import (
+                ProjectDescriptionManager,
+                _WAITING_COMMENT,
+            )
+
+            project_id: Optional[int] = None
+            try:
+                task = await self._kanban.get_task_by_id(ticket_id)
+                if task:
+                    src_ctx = task.source_context or {}
+                    raw = src_ctx.get("kanboard_task", {})
+                    pid_raw = raw.get("project_id")
+                    if pid_raw:
+                        project_id = int(pid_raw)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Could not fetch task for stack check: %s", exc)
+
+            if project_id is None:
+                return  # non-Kanboard providers skip description check
+
+            mgr = ProjectDescriptionManager()
+            stack = mgr.get_stack(project_id)
+            if stack is not None:
+                return  # description is complete — proceed normally
+
+            # Stack missing: ask the human and pause.
+            await self._post_comment(ticket_id, _WAITING_COMMENT)
+            try:
+                await self._kanban.move_task_to_column(ticket_id, "waiting for human")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not move ticket to waiting for human: %s", exc)
+            logger.info(
+                "Ticket %s paused — project description missing tech-stack info",
+                ticket_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Project stack check failed, proceeding anyway: %s", exc)
 
     async def _post_comment(self, ticket_id: str, body: str) -> bool:
         """Post a comment via the kanban provider (best-effort)."""

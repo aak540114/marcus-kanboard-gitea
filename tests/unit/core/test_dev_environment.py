@@ -280,49 +280,94 @@ class TestDetectProjectType:
 
 
 class TestBuildEntrypoint:
-    """Shell command builder used inside Docker containers."""
+    """Shell command builder used inside Docker containers.
+
+    _build_entrypoint now takes explicit params:
+      (branch_name, install_cmd, start_cmd, use_hm_reload, extra_apt=None)
+    """
 
     def _mgr(self) -> DevEnvironmentManager:
         return DevEnvironmentManager(DevEnvironmentConfig())
 
     def test_nodejs_uses_npm_no_inotifywait(self) -> None:
-        cmd = self._mgr()._build_entrypoint("ticket/k/1", "nodejs")
+        """nodejs stack: npm install + npm run dev, no inotifywait wrapper."""
+        cmd = self._mgr()._build_entrypoint(
+            "ticket/k/1",
+            install_cmd="npm install",
+            start_cmd="npm run dev -- --port 3000",
+            use_hm_reload=True,
+        )
         assert "npm install" in cmd
         assert "npm run dev" in cmd
         assert "inotifywait" not in cmd
 
     def test_python_fastapi_uses_uvicorn_inotifywait(self) -> None:
         """python-fastapi uses inotifywait (no --reload flag to avoid double-watcher)."""
-        cmd = self._mgr()._build_entrypoint("ticket/k/2", "python-fastapi")
+        cmd = self._mgr()._build_entrypoint(
+            "ticket/k/2",
+            install_cmd="pip install -r requirements.txt",
+            start_cmd="uvicorn main:app --host 0.0.0.0 --port 3000",
+            use_hm_reload=False,
+        )
         assert "uvicorn" in cmd
         assert "--reload" not in cmd
         assert "inotifywait" in cmd
 
     def test_static_uses_inotifywait_wrapper(self) -> None:
-        cmd = self._mgr()._build_entrypoint("ticket/k/3", "static")
+        """Static stack wraps server with inotifywait restart loop."""
+        cmd = self._mgr()._build_entrypoint(
+            "ticket/k/3",
+            install_cmd="",
+            start_cmd="python -m http.server 3000",
+            use_hm_reload=False,
+        )
         assert "inotifywait" in cmd
         assert "APP_PID" in cmd
         assert "kill $APP_PID" in cmd
 
     def test_php_uses_inotifywait_wrapper(self) -> None:
-        cmd = self._mgr()._build_entrypoint("ticket/k/4", "php")
+        """PHP stack wraps built-in server with inotifywait."""
+        cmd = self._mgr()._build_entrypoint(
+            "ticket/k/4",
+            install_cmd="",
+            start_cmd="php -S 0.0.0.0:3000",
+            use_hm_reload=False,
+        )
         assert "inotifywait" in cmd
         assert "php -S" in cmd
 
     def test_branch_name_present_in_command(self) -> None:
-        cmd = self._mgr()._build_entrypoint("feature/my-branch", "nodejs")
+        """Branch checkout appears in the generated shell command."""
+        cmd = self._mgr()._build_entrypoint(
+            "feature/my-branch",
+            install_cmd="npm install",
+            start_cmd="npm run dev",
+            use_hm_reload=True,
+        )
         assert "git checkout feature/my-branch" in cmd
 
     def test_all_native_stacks_have_no_inotifywait(self) -> None:
+        """Every stack with hm=True must not wrap with inotifywait."""
         mgr = self._mgr()
         for stack, cfg in STACK_CONFIGS.items():
-            if cfg["native_reload"]:
-                cmd = mgr._build_entrypoint("b", stack)
+            if cfg["hm"]:
+                cmd = mgr._build_entrypoint(
+                    "b",
+                    install_cmd=cfg.get("install_cmd", ""),
+                    start_cmd=cfg.get("start_cmd", "echo ok"),
+                    use_hm_reload=True,
+                )
                 assert "inotifywait" not in cmd, f"{stack!r} should not use inotifywait"
 
     def test_all_non_native_stacks_use_inotifywait(self) -> None:
+        """Every stack with hm=False must be wrapped with inotifywait."""
         mgr = self._mgr()
         for stack, cfg in STACK_CONFIGS.items():
-            if not cfg["native_reload"]:
-                cmd = mgr._build_entrypoint("b", stack)
+            if not cfg["hm"]:
+                cmd = mgr._build_entrypoint(
+                    "b",
+                    install_cmd=cfg.get("install_cmd", ""),
+                    start_cmd=cfg.get("start_cmd", "echo ok"),
+                    use_hm_reload=False,
+                )
                 assert "inotifywait" in cmd, f"{stack!r} should use inotifywait"

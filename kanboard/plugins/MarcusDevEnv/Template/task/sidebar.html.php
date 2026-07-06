@@ -21,10 +21,13 @@ $marcusUrl = getenv('MARCUS_URL') ?: 'http://localhost:4298';
 $ticketId  = $task['id'] ?? '';
 $provider  = 'kanboard';
 
+$projectId = $task['project_id'] ?? '';
+
 $viewUrl   = $marcusUrl
     . '/dev-env/view'
-    . '?ticket_id=' . urlencode((string) $ticketId)
-    . '&provider='  . urlencode($provider);
+    . '?ticket_id='  . urlencode((string) $ticketId)
+    . '&provider='   . urlencode($provider)
+    . '&project_id=' . urlencode((string) $projectId);
 
 $stopUrl   = $marcusUrl
     . '/dev-env/stop'
