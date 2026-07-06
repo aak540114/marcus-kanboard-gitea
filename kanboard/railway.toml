@@ -1,0 +1,23 @@
+# railway.toml — Railway deployment config for the Kanboard service.
+#
+# Railway reads this file when you link this directory (or the repo)
+# as a Railway service.
+#
+# Required env vars (set in Railway dashboard → Variables):
+#   MARCUS_URL              Public URL of your Marcus server
+#   KANBOARD_WEBHOOK_TOKEN  Shared webhook secret (optional but recommended)
+#   PORT                    Automatically set by Railway; Kanboard reads it
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Railway sets $PORT automatically; the Dockerfile exposes 80, so we
+# map the container's 80 to Railway's $PORT via the PORT env var in
+# docker-compose.yml.  Railway's health-check hits "/" by default.
+startCommand = "/init"
+healthcheckPath = "/"
+healthcheckTimeout = 120
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5

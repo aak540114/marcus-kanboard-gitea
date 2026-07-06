@@ -1,0 +1,66 @@
+# kanboard/docker-compose.yml
+#
+# Standalone Kanboard deployment — runs only Kanboard with the
+# MarcusDevEnv plugin pre-installed.  Use this when Kanboard lives on
+# a different server from Marcus and GitLab (e.g. Railway, Fly.io, VPS).
+#
+# Quick start (VPS / local)
+# -------------------------
+#   cd kanboard/
+#   MARCUS_URL=https://your-marcus-server.example.com \
+#     docker compose up -d
+#
+# Railway
+# -------
+#   Push this directory to its own GitHub repo (or a Railway monorepo
+#   service pointing to kanboard/) and set the env vars below in the
+#   Railway dashboard.  Railway will build from kanboard/Dockerfile.
+#
+# Environment variables
+# ---------------------
+# MARCUS_URL        Public base URL of your Marcus server, e.g.
+#                   https://marcus.example.com  (no trailing slash).
+#                   The plugin uses this to reach /api/active-agents and
+#                   /api/ticket-links.
+#
+# KANBOARD_WEBHOOK_TOKEN  (optional) Shared secret between Kanboard and
+#                   Marcus.  Set the same value in Marcus's env as
+#                   KANBOARD_WEBHOOK_TOKEN.  Leave blank to skip
+#                   webhook token validation (not recommended in prod).
+#
+# After starting
+# --------------
+# 1. Visit http://<host>:8080  (default credentials: admin / admin)
+#    Change the password immediately.
+# 2. Settings → API — copy the API token; set it on Marcus:
+#      export KANBOARD_API_TOKEN=<token>
+# 3. Settings → Integrations → Webhook URL:
+#      https://your-marcus-server.example.com/webhooks/kanboard
+#    This sends real-time push events to Marcus so it reacts instantly
+#    to column moves and assignment changes.
+# 4. Create a project and add columns:
+#      Ready | In Progress | Waiting for Human | Blocked | Done
+
+services:
+  kanboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kanboard
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8080}:80"
+    volumes:
+      - kanboard_data:/var/www/app/data
+    environment:
+      MARCUS_URL: "${MARCUS_URL:-http://localhost:4298}"
+      KANBOARD_WEBHOOK_TOKEN: "${KANBOARD_WEBHOOK_TOKEN:-}"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost/healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  kanboard_data:
