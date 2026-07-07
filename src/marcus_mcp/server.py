@@ -3511,17 +3511,21 @@ function save() {{
 
                 elif path.endswith("/ticket"):
                     tid = body.get("ticket_id")
-                    gate = body.get("gate")  # may be None to reset
-                    verify = body.get("verify")  # optional bool or None to reset
-                    if not isinstance(tid, str) or (gate is not None and gate not in ("human", "ai")):
+                    gate = body.get("gate")  # may be None to reset; absent = don't touch
+                    verify = body.get("verify")  # may be bool or None to reset; absent = don't touch
+                    if not isinstance(tid, str) or not tid or (
+                        "gate" in body and gate is not None and gate not in ("human", "ai")
+                    ):
                         r = JSONResponse(
                             {"error": "ticket_id (str) and gate ('human'|'ai'|null) required"},
                             status_code=400,
                         )
                         r.headers["Access-Control-Allow-Origin"] = "*"
                         return r
-                    gate_mgr.set_ticket_gate(str(tid), gate)
-                    if verify is None or isinstance(verify, bool):
+                    # Only persist fields that were explicitly included in the request body.
+                    if "gate" in body:
+                        gate_mgr.set_ticket_gate(str(tid), gate)
+                    if "verify" in body and (verify is None or isinstance(verify, bool)):
                         gate_mgr.set_ticket_verify(str(tid), verify)
                     r = JSONResponse({"saved": True, "ticket_id": tid, "gate": gate,
                                       "verify": gate_mgr.get_ticket_verify(str(tid))})

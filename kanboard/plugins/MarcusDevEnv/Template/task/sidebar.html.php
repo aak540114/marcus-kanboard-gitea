@@ -440,7 +440,7 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
         fetch(GATE_URL + '/ticket', {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ ticket_id: TICKET_ID, gate: null, verify: enabled }),
+            body: JSON.stringify({ ticket_id: TICKET_ID, verify: enabled }),
         })
         .then(function (r) { return r.json(); })
         .then(function () { loadGateSettings(); })

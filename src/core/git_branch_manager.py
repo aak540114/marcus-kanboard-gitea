@@ -359,7 +359,10 @@ class BranchManager:
         """
         base = base_branch or self.config.main_branch
         await self._git("fetch", self.config.remote, base)
-        _, stdout, _ = await self._git("diff", f"{base}...{branch_name}")
+        # Use the remote-tracking ref so the diff reflects the freshly fetched state,
+        # not the potentially stale local branch.
+        remote_base = f"{self.config.remote}/{base}"
+        _, stdout, _ = await self._git("diff", f"{remote_base}...{branch_name}")
         return stdout
 
     async def get_branch_commits(

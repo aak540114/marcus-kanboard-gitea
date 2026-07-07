@@ -183,15 +183,18 @@ class AIVerifier:
     def _parse(raw: str) -> VerificationResult:
         """Extract a :class:`VerificationResult` from the LLM response.
 
-        Handles JSON with surrounding prose or markdown fences by searching
-        for the first ``{...}`` block in the response.
+        Handles JSON with surrounding prose or markdown fences by finding the
+        first balanced ``{...}`` block in the response (brace-counter scan).
+        A greedy ``.*`` regex would incorrectly span from the first ``{`` to
+        the LAST ``}`` in the string, failing when the LLM adds trailing prose
+        that contains curly braces (e.g. variable names, format strings).
         """
         # Strip markdown code fences if present.
         cleaned = re.sub(r"```(?:json)?", "", raw).strip()
 
-        # Find the first JSON object.
-        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-        if not match:
+        # Locate the first balanced JSON object via brace counting.
+        start = cleaned.find("{")
+        if start == -1:
             logger.warning("AIVerifier: could not find JSON in LLM response: %r", raw[:300])
             return VerificationResult(
                 passed=False,
@@ -199,8 +202,40 @@ class AIVerifier:
                 raw_response=raw,
             )
 
+        depth = 0
+        end = -1
+        in_string = False
+        escape_next = False
+        for i, ch in enumerate(cleaned[start:], start):
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == "\\" and in_string:
+                escape_next = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+
+        if end == -1:
+            logger.warning("AIVerifier: unmatched braces in LLM response: %r", raw[:300])
+            return VerificationResult(
+                passed=False,
+                findings=["Verification inconclusive: LLM did not return valid JSON."],
+                raw_response=raw,
+            )
+
         try:
-            obj = json.loads(match.group())
+            obj = json.loads(cleaned[start : end + 1])
         except json.JSONDecodeError as exc:
             logger.warning("AIVerifier: JSON parse error: %s — raw: %r", exc, raw[:300])
             return VerificationResult(

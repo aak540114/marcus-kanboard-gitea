@@ -99,6 +99,21 @@ class TestAIVerifierParse:
         result = AIVerifier._parse(raw)
         assert result.findings == ["real issue", "another"]
 
+    def test_parse_ignores_trailing_braces_in_prose(self):
+        """JSON followed by prose containing {curly braces} is still parsed correctly."""
+        json_part = _json_response(True)
+        raw = json_part + "\n\nNote: see the {main} branch and {utils.py} for context."
+        result = AIVerifier._parse(raw)
+        # Greedy regex would have matched to the last } in {utils.py}, failing to parse.
+        assert result.passed is True
+
+    def test_parse_json_with_nested_object_in_findings(self):
+        """Findings that contain curly braces as text are extracted correctly."""
+        raw = '{"passed": false, "findings": ["Use {} format in logger calls"]}'
+        result = AIVerifier._parse(raw)
+        assert result.passed is False
+        assert result.findings == ["Use {} format in logger calls"]
+
 
 # ── AIVerifier.verify ──────────────────────────────────────────────────────
 

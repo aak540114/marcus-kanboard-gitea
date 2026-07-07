@@ -295,7 +295,7 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
             // Also send the current gate so the PUT handler has both fields
             body: JSON.stringify({
                 project_id: PROJECT_ID,
-                gate: document.getElementById('pgBtn-ai').className === 'active-ai' ? 'ai' : 'human',
+                gate: document.getElementById('pgBtn-ai').classList.contains('active-ai') ? 'ai' : 'human',
                 verify: enabled,
             }),
         })
