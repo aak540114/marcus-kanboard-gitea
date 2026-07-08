@@ -141,7 +141,7 @@ class GateSettingManager:
             stored.
         """
         val = self._project_entry(project_id).get("verify_count")
-        return int(val) if isinstance(val, int) else None
+        return int(val) if isinstance(val, int) and not isinstance(val, bool) else None
 
     def get_ticket_verify_count(self, ticket_id: str) -> Optional[int]:
         """Return the number of AI verification rounds configured for a ticket.
@@ -158,7 +158,7 @@ class GateSettingManager:
             from its project.
         """
         val = self._ticket_entry(ticket_id).get("verify_count")
-        return int(val) if isinstance(val, int) else None
+        return int(val) if isinstance(val, int) and not isinstance(val, bool) else None
 
     def get_effective_verify_count(self, ticket_id: str, project_id: int) -> int:
         """Return the resolved number of AI verification rounds for a ticket.

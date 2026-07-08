@@ -3505,7 +3505,16 @@ function save() {{
                         r.headers["Access-Control-Allow-Origin"] = "*"
                         return r
                     gate_mgr.set_project_gate(pid, gate)
-                    if "verify_count" in body and isinstance(verify_count, int) and verify_count >= 0:
+                    # Handle backward-compat: old clients may send verify:bool
+                    if "verify_count" not in body and isinstance(body.get("verify"), bool):
+                        verify_count = 1 if body["verify"] else 0
+                        gate_mgr.set_project_verify_count(pid, verify_count)
+                    elif (
+                        "verify_count" in body
+                        and isinstance(verify_count, int)
+                        and not isinstance(verify_count, bool)
+                        and verify_count >= 0
+                    ):
                         gate_mgr.set_project_verify_count(pid, verify_count)
                     r = JSONResponse({"saved": True, "project_id": pid, "gate": gate,
                                       "verify_count": gate_mgr.get_project_verify_count(pid)})
@@ -3526,9 +3535,17 @@ function save() {{
                     # Only persist fields that were explicitly included in the request body.
                     if "gate" in body:
                         gate_mgr.set_ticket_gate(str(tid), gate)
-                    if "verify_count" in body and (
+                    # Handle backward-compat: old clients may send verify:bool
+                    if "verify_count" not in body and isinstance(body.get("verify"), bool):
+                        vc_compat: Optional[int] = 1 if body["verify"] else 0
+                        gate_mgr.set_ticket_verify_count(str(tid), vc_compat)
+                    elif "verify_count" in body and (
                         verify_count is None
-                        or (isinstance(verify_count, int) and verify_count >= 0)
+                        or (
+                            isinstance(verify_count, int)
+                            and not isinstance(verify_count, bool)
+                            and verify_count >= 0
+                        )
                     ):
                         gate_mgr.set_ticket_verify_count(str(tid), verify_count)
                     r = JSONResponse({"saved": True, "ticket_id": tid, "gate": gate,

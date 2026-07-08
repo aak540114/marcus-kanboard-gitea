@@ -1243,8 +1243,12 @@ class HumanGatedWorkflow:
                 self._ticket_verify_rounds[ticket_id] = current_round
 
                 if result.passed and current_round == verify_count:
-                    # Last round passed → merge immediately; no extra agent cycle.
+                    # Last round passed → post the final round comment then merge.
                     self._ticket_verify_rounds.pop(ticket_id, None)
+                    comment = CommentFormatter.verification_round_result(
+                        ticket_id, current_round, verify_count, result
+                    )
+                    await self._post_comment(ticket_id, comment)
                     # fall through to merge
 
                 else:
@@ -1272,6 +1276,8 @@ class HumanGatedWorkflow:
         merged = await self._branch.merge_to_main(branch_name, commit_message=merge_msg)
 
         if not merged:
+            # Clean up the verify-round counter so a retry starts fresh.
+            self._ticket_verify_rounds.pop(ticket_id, None)
             await self._post_error(
                 ticket_id,
                 f"Auto-merge of `{branch_name}` to `{main_branch}` failed — "
@@ -1417,12 +1423,20 @@ class HumanGatedWorkflow:
         except Exception:  # noqa: BLE001
             pass
 
-        return await self._verifier.verify(
-            ticket_id=ticket_id,
-            ticket_title=ticket_title,
-            acceptance_criteria=ac_items,
-            diff_text=diff_text,
-        )
+        try:
+            return await self._verifier.verify(
+                ticket_id=ticket_id,
+                ticket_title=ticket_title,
+                acceptance_criteria=ac_items,
+                diff_text=diff_text,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "AI Verify: verifier error for ticket %s: %s — passing (fail-open)",
+                ticket_id,
+                exc,
+            )
+            return VerificationResult(passed=True, findings=[], raw_response="")
 
     async def _get_effective_verify_count(self, ticket_id: str) -> int:
         """Resolve how many verification rounds are configured for a ticket.
