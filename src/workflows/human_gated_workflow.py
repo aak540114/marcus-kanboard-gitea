@@ -52,7 +52,7 @@ import logging
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from src.ai.verification.ai_verifier import AIVerifier
+from src.ai.verification.ai_verifier import AIVerifier, VerificationResult
 from src.core.acceptance_criteria import ACChangeDetector, ACGenerator, ACParser
 from src.core.board_watcher import BoardWatcher
 from src.core.comment_protocol import CommentFormatter, CommentParser
@@ -1369,7 +1369,7 @@ class HumanGatedWorkflow:
         ticket_id: str,
         record: TicketRecord,
         branch_name: str,
-    ) -> Any:
+    ) -> VerificationResult:
         """Run one LLM verification pass and return the raw result.
 
         This method has NO side effects — it does not post comments or release
@@ -1392,8 +1392,6 @@ class HumanGatedWorkflow:
             ``passed=True`` (fail-open — a transient diff failure should not
             block merging).
         """
-        from src.ai.verification.ai_verifier import VerificationResult
-
         logger.info(
             "AI Verify: running verification round for ticket %s (branch %s)",
             ticket_id,

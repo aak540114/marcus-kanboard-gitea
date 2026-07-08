@@ -6,10 +6,9 @@ hitting any real kanban or git services.  Every external dependency is mocked.
 """
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from src.ai.verification.ai_verifier import VerificationResult
-from src.core.comment_protocol import CommentType
 from src.core.gate_settings import GateSettingManager
 from src.core.ticket_lifecycle import TicketLifecycleManager, TicketRecord, TicketState
 from src.workflows.human_gated_workflow import HumanGatedWorkflow

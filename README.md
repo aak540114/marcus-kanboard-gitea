@@ -16,7 +16,7 @@ A production deployment of **[Marcus](https://github.com/lwgray/marcus)** — th
 | **Hot-reload dev environments** | One-click per-ticket preview URL; supports any language/framework via project description |
 | **Project Description system** | Per-project markdown doc that AI agents read to learn the tech stack; editable from the board |
 | **Human Gate / AI Gate toggle** | Per-project and per-ticket control over whether humans review AI work before it merges |
-| **AI Verify** | Optional second-LLM code review step that runs before any AI-gate merge; findings are posted as a comment and the worker agent must fix them before merging is allowed |
+| **AI Verify** | Configurable N-round LLM code review before any AI-gate merge; each round posts a comment with findings; agent fixes issues between rounds; 0 rounds = disabled |
 
 ---
 
@@ -43,7 +43,7 @@ The plugin ships in `kanboard/plugins/MarcusDevEnv/` and is automatically active
 | **Active AI Agents badge** | Live green/grey/amber badge showing how many tickets are currently held by an AI agent. Updates every 15 s; hover to see ticket IDs. |
 | **Project Description button** | Opens the Marcus-served project description page for this project — the AI agents' shared source of truth for language, framework, and architecture. |
 | **Human Gate / AI Gate toggle** | Sets the project-level gate mode. Human Gate (default): AI pauses for human review before done. AI Gate: AI merges and closes autonomously. |
-| **AI Verify toggle** | Appears when AI Gate is active. When on, a second independent LLM reviews the branch diff against acceptance criteria before the merge is allowed. |
+| **AI Verify counter** | Appears when AI Gate is active. `[−] N [+]` sets how many sequential LLM review rounds run before the branch auto-merges. 0 = disabled. |
 
 ### Task sidebar
 | Panel | What it does |
@@ -189,13 +189,15 @@ AI agent works on the branch
     → Ticket moves to "Done" automatically
     → No human step required
 
-  AI Gate (AI Verify ON):
-    → A second LLM reviews the branch diff against acceptance criteria
-    → PASS: branch auto-merges to main, ticket moves to "Done"
-    → FAIL: findings posted as a "Marcus AI Verifier — Issues Found" comment
-            ticket stays "In Progress"; worker agent fixes issues and
-            calls signal_ready_for_review again → verification reruns
-            (repeats until clean; LLM errors are fail-open: merge proceeds)
+  AI Gate (AI Verify ON, e.g. verify_count=2):
+    → signal_ready_for_review → Round 1 of 2:
+        PASS: comment "Round 1/2: PASSED" → agent calls signal_ready again
+        FAIL: comment "Round 1/2: Issues Found" → agent fixes → signal_ready
+    → signal_ready_for_review → Round 2 of 2:
+        PASS: branch auto-merges to main, ticket moves to "Done"
+        FAIL: comment "Round 2/2: Issues Found (final)" → agent fixes → signal_ready
+              next signal_ready → merges with no further verification
+    (LLM errors are fail-open: merge proceeds; kanban errors are fail-safe: default to 1 round)
 ```
 
 ---
@@ -225,12 +227,12 @@ AI Verify adds an independent LLM code-review step to the AI Gate auto-merge pat
 ### Enabling AI Verify
 
 **Project level (board header):**
-1. Set the project gate to **AI Gate** — the AI Verify toggle appears next to it.
-2. Click the toggle to enable.
+1. Set the project gate to **AI Gate** — the **AI Verify** round counter appears next to it (`[−] 0 [+]`).
+2. Click **`+`** to increase the number of required verification rounds (0 = disabled).
 
 **Per-ticket override (task sidebar):**
 1. Open a ticket. The **Marcus Gate Mode** panel shows the current effective verify state.
-2. When the effective gate is AI, an **AI Verify** switch appears. Toggle it to override the project setting for this ticket only.
+2. When the effective gate is AI, an **AI Verify rounds** counter appears. Use `[−]` and `[+]` to set a per-ticket round count. Click **↩** to reset and inherit from the project setting.
 
 ---
 
@@ -247,9 +249,9 @@ AI Verify adds an independent LLM code-review step to the AI Gate auto-merge pat
 | `/api/ticket-links?ticket_id=<id>` | GET | Dependency graph split into `depends_on`, `blocks`, `relates_to` |
 | `/project-description?project_id=<id>` | GET | Editable project description page |
 | `/api/project-description?project_id=<id>` | GET/PUT | Project description plain-text API |
-| `/api/gate-setting?project_id=<id>[&ticket_id=<id>]` | GET | Current gate + verify settings; returns `project_gate`, `ticket_gate`, `effective`, `project_verify`, `ticket_verify`, `effective_verify` |
-| `/api/gate-setting/project` | PUT | Set project-level gate (`human`\|`ai`) and/or verify (`true`\|`false`) |
-| `/api/gate-setting/ticket` | PUT | Set per-ticket gate override (`human`\|`ai`\|`null`) and/or verify (`true`\|`false`\|`null`) |
+| `/api/gate-setting?project_id=<id>[&ticket_id=<id>]` | GET | Current gate + verify settings; returns `project_gate`, `ticket_gate`, `effective`, `project_verify_count`, `ticket_verify_count`, `effective_verify_count` |
+| `/api/gate-setting/project` | PUT | Set project-level gate (`human`\|`ai`) and/or `verify_count` (int ≥ 0) |
+| `/api/gate-setting/ticket` | PUT | Set per-ticket gate override (`human`\|`ai`\|`null`) and/or `verify_count` (int ≥ 0 or `null` to inherit) |
 
 ---
 

@@ -35,7 +35,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, Literal, Optional, cast
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +78,7 @@ class GateSettingManager:
             has been stored.
         """
         val = self._project_entry(project_id).get("gate")
-        return val if val in ("human", "ai") else None  # type: ignore[return-value]
+        return val if val in ("human", "ai") else None
 
     def get_ticket_gate(self, ticket_id: str) -> Optional[GateMode]:
         """Return the gate set for a specific ticket, or ``None`` if not set.
@@ -95,7 +95,7 @@ class GateSettingManager:
             from its project.
         """
         val = self._ticket_entry(ticket_id).get("gate")
-        return val if val in ("human", "ai") else None  # type: ignore[return-value]
+        return val if val in ("human", "ai") else None
 
     def get_effective_gate(self, ticket_id: str, project_id: int) -> GateMode:
         """Return the resolved gate mode for a ticket.
@@ -286,7 +286,7 @@ class GateSettingManager:
         if "verify" in entry and "verify_count" not in entry:
             entry["verify_count"] = 1 if entry.pop("verify") else 0
             self._save()
-        return projects[key]
+        return cast(Dict[str, Any], projects[key])
 
     def _ticket_entry(self, ticket_id: str, *, create: bool = False) -> Dict[str, Any]:
         """Return (and optionally create) the dict for a ticket."""
@@ -307,7 +307,7 @@ class GateSettingManager:
         if "verify" in entry and "verify_count" not in entry:
             entry["verify_count"] = 1 if entry.pop("verify") else 0
             self._save()
-        return tickets[key]
+        return cast(Dict[str, Any], tickets[key])
 
     # ------------------------------------------------------------------
     # Persistence
