@@ -147,6 +147,10 @@ class HumanGatedWorkflow:
         # Unique identifier for this Marcus workflow instance — used as the
         # agent_id when claiming tickets to prevent duplicate AI work.
         self._agent_id = f"marcus-{uuid.uuid4().hex[:8]}"
+        # Tracks how many verification rounds have been completed per ticket.
+        # Lost on Marcus restart, which is acceptable since verify cycles are
+        # short-lived (minutes) and the round counter resets naturally.
+        self._ticket_verify_rounds: Dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1219,14 +1223,48 @@ class HumanGatedWorkflow:
             )
             return False
 
-        # ── AI verification (when enabled) ────────────────────────────────
-        # Run an independent LLM review of the branch diff before merging.
-        # If issues are found, post findings and release the ticket back to
-        # "In Progress" so the worker can fix them.
-        if await self._get_effective_verify(ticket_id):
-            verified = await self._run_verification(ticket_id, record, branch_name)
-            if not verified:
-                return False
+        # ── AI verification (multi-round when enabled) ─────────────────────────
+        # Each call to signal_ready_for_review completes one round.  When the
+        # configured verify_count > 0 we track how many rounds are done in
+        # self._ticket_verify_rounds.  Only when all rounds pass does the
+        # branch merge.
+        verify_count = await self._get_effective_verify_count(ticket_id)
+        if verify_count > 0:
+            rounds_done = self._ticket_verify_rounds.get(ticket_id, 0)
+
+            if rounds_done >= verify_count:
+                # All N rounds completed and the agent made the final fix.
+                # Clear the counter and fall through to merge.
+                self._ticket_verify_rounds.pop(ticket_id, None)
+
+            else:
+                current_round = rounds_done + 1
+                result = await self._run_verification_round(ticket_id, record, branch_name)
+                self._ticket_verify_rounds[ticket_id] = current_round
+
+                if result.passed and current_round == verify_count:
+                    # Last round passed → merge immediately; no extra agent cycle.
+                    self._ticket_verify_rounds.pop(ticket_id, None)
+                    # fall through to merge
+
+                else:
+                    # Issues found (any round) OR passed but more rounds remain.
+                    # Post a round-result comment, release the ticket so the agent
+                    # can pick it up again to fix issues (or re-signal if clean).
+                    comment = CommentFormatter.verification_round_result(
+                        ticket_id, current_round, verify_count, result
+                    )
+                    await self._post_comment(ticket_id, comment)
+                    try:
+                        self._lifecycle.release_ticket(ticket_id, self._provider)
+                    except KeyError:
+                        pass
+                    try:
+                        await self._kanban.move_task_to_column(ticket_id, "in progress")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    await self._pickup_next_ticket()
+                    return False
 
         merge_msg = (
             f"merge: ticket/{self._provider}/{ticket_id} (auto-completed, AI gate)"
@@ -1326,18 +1364,17 @@ class HumanGatedWorkflow:
             return "human"
         return self._gate.get_effective_gate(ticket_id, project_id)
 
-    async def _run_verification(
+    async def _run_verification_round(
         self,
         ticket_id: str,
         record: TicketRecord,
         branch_name: str,
-    ) -> bool:
-        """Run the AI verifier on the branch and handle the result.
+    ) -> Any:
+        """Run one LLM verification pass and return the raw result.
 
-        If verification passes, returns ``True`` and the caller continues to
-        merge.  If verification fails, posts a findings comment, releases the
-        ticket claim, and moves the kanban card back to ``"in progress"`` so
-        the worker can fix the issues.
+        This method has NO side effects — it does not post comments or release
+        tickets.  The caller in ``_autocomplete_ticket`` handles those actions
+        based on the result and the current round number.
 
         Parameters
         ----------
@@ -1350,16 +1387,28 @@ class HumanGatedWorkflow:
 
         Returns
         -------
-        bool
-            ``True`` if verification passed; ``False`` if issues were found.
+        VerificationResult
+            Passed/failed result from the LLM.  On diff error the result is
+            ``passed=True`` (fail-open — a transient diff failure should not
+            block merging).
         """
-        logger.info("AI Verify: running verification for ticket %s (branch %s)", ticket_id, branch_name)
+        from src.ai.verification.ai_verifier import VerificationResult
+
+        logger.info(
+            "AI Verify: running verification round for ticket %s (branch %s)",
+            ticket_id,
+            branch_name,
+        )
 
         try:
             diff_text = await self._branch.get_branch_diff(branch_name)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("AI Verify: could not get diff for %s: %s — skipping", branch_name, exc)
-            return True  # fail-open on diff error
+            logger.warning(
+                "AI Verify: could not get diff for %s: %s — passing (fail-open)",
+                branch_name,
+                exc,
+            )
+            return VerificationResult(passed=True, findings=[], raw_response="")
 
         ac_items = self._get_ac_items(record)
         ticket_title = ticket_id
@@ -1370,55 +1419,20 @@ class HumanGatedWorkflow:
         except Exception:  # noqa: BLE001
             pass
 
-        result = await self._verifier.verify(
+        return await self._verifier.verify(
             ticket_id=ticket_id,
             ticket_title=ticket_title,
             acceptance_criteria=ac_items,
             diff_text=diff_text,
         )
 
-        if result.passed:
-            logger.info("AI Verify: ticket %s passed verification", ticket_id)
-            return True
-
-        logger.info(
-            "AI Verify: ticket %s failed — %d finding(s): %s",
-            ticket_id,
-            len(result.findings),
-            result.findings,
-        )
-
-        # Post the findings comment.
-        comment = CommentFormatter.verification_failed(
-            ticket_id=ticket_id,
-            findings=result.findings,
-        )
-        await self._post_comment(ticket_id, comment)
-
-        # Release the ticket so the worker (or any agent) can pick it up again.
-        try:
-            self._lifecycle.release_ticket(ticket_id, self._provider)
-        except KeyError:
-            pass
-
-        # Ensure the kanban card stays in "in progress" so agents can claim it.
-        try:
-            await self._kanban.move_task_to_column(ticket_id, "in progress")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("AI Verify: could not reset kanban column for %s: %s", ticket_id, exc)
-
-        # Signal Marcus to assign the next available ticket (same pattern as all
-        # other release_ticket call sites in this file).
-        await self._pickup_next_ticket()
-
-        return False
-
-    async def _get_effective_verify(self, ticket_id: str) -> bool:
-        """Resolve whether AI verification is enabled for a ticket.
+    async def _get_effective_verify_count(self, ticket_id: str) -> int:
+        """Resolve how many verification rounds are configured for a ticket.
 
         Fetches the kanboard task to discover its project ID, then calls
-        ``GateSettingManager.get_effective_verify``.  Returns ``False`` on
-        any error (fail-open — don't block merging on a lookup failure).
+        ``GateSettingManager.get_effective_verify_count``.  Returns ``1`` on
+        any kanban API error (fail-safe — a transient outage should not
+        silently bypass all verification rounds).
 
         Parameters
         ----------
@@ -1427,8 +1441,8 @@ class HumanGatedWorkflow:
 
         Returns
         -------
-        bool
-            ``True`` if AI verification should run before merging.
+        int
+            Number of required verification rounds (0 = disabled).
         """
         project_id: Optional[int] = None
         try:
@@ -1440,22 +1454,21 @@ class HumanGatedWorkflow:
                 if pid_raw:
                     project_id = int(pid_raw)
         except Exception as exc:  # noqa: BLE001
-            # Kanban API is unreachable — fail-safe: run verification rather than
-            # silently bypass it.  A transient outage should not allow unreviewed
-            # branches to auto-merge.
+            # Kanban API is unreachable — fail-safe: assume at least one round
+            # rather than silently allowing unreviewed branches to auto-merge.
             logger.warning(
                 "Could not fetch project_id for verify check on ticket %s: %s "
-                "— defaulting to verify=enabled (fail-safe)",
+                "— defaulting to verify_count=1 (fail-safe)",
                 ticket_id,
                 exc,
             )
-            return True
+            return 1
 
         if project_id is None:
             # Task has no project_id in its source context (e.g. non-Kanboard
             # provider or task not yet fully synced). Verification not configured.
-            return False
-        return self._gate.get_effective_verify(ticket_id, project_id)
+            return 0
+        return self._gate.get_effective_verify_count(ticket_id, project_id)
 
     async def _check_project_stack(self, ticket_id: str) -> bool:
         """Verify the project description has enough stack info to start work.

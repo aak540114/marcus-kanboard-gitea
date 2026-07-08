@@ -5,17 +5,15 @@ Gate mode controls whether human approval is required at key workflow
 checkpoints (``human``) or whether the AI works autonomously from ready to
 done without pausing for review (``ai``).
 
-AI-verify mode (only applies when gate is ``ai``) controls whether a second
-LLM pass verifies the worker agent's output before merging.  When enabled,
-Marcus runs a code-review prompt against the branch diff and acceptance
-criteria.  If the review finds issues it posts findings, releases the ticket
-back to In Progress, and the worker agent must fix them.  Only a clean review
-allows the merge to proceed.
+AI-verify count (only applies when gate is ``ai``) controls how many
+sequential LLM review rounds run before the branch is allowed to merge.
+When set to N, the workflow runs N verification rounds with agent fix
+cycles between them.  A count of 0 disables verification entirely.
 
 Precedence for both settings (highest to lowest):
 1. Per-ticket setting
 2. Per-project setting
-3. Hard default (``"human"`` for gate; ``False`` for verify)
+3. Hard default (``"human"`` for gate; ``0`` for verify_count)
 
 Settings are persisted as a JSON file at::
 
@@ -24,8 +22,8 @@ Settings are persisted as a JSON file at::
 Schema::
 
     {
-      "projects": {"1": {"gate": "human"}, "2": {"gate": "ai", "verify": true}},
-      "tickets":  {"42": {"gate": "ai"}, "99": {"gate": null, "verify": false}}
+      "projects": {"1": {"gate": "human"}, "2": {"gate": "ai", "verify_count": 2}},
+      "tickets":  {"42": {"gate": "ai"}, "99": {"gate": null, "verify_count": 0}}
     }
 
 A ticket entry of ``null`` for a key means "reset to project default" — the
@@ -43,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 GateMode = Literal["human", "ai"]
 _DEFAULT_GATE: GateMode = "human"
-_DEFAULT_VERIFY: bool = False
+_DEFAULT_VERIFY_COUNT: int = 0
 _DEFAULT_DATA_DIR = Path(os.getcwd()) / "data"
 
 
@@ -125,11 +123,11 @@ class GateSettingManager:
         return _DEFAULT_GATE
 
     # ------------------------------------------------------------------
-    # AI verify — read
+    # AI verify count — read
     # ------------------------------------------------------------------
 
-    def get_project_verify(self, project_id: int) -> Optional[bool]:
-        """Return the verify flag for a project, or ``None`` if not set.
+    def get_project_verify_count(self, project_id: int) -> Optional[int]:
+        """Return the number of AI verification rounds configured for a project.
 
         Parameters
         ----------
@@ -138,14 +136,15 @@ class GateSettingManager:
 
         Returns
         -------
-        Optional[bool]
-            ``True`` / ``False``, or ``None`` when no setting has been stored.
+        Optional[int]
+            Non-negative integer count, or ``None`` when no setting has been
+            stored.
         """
-        val = self._project_entry(project_id).get("verify")
-        return bool(val) if isinstance(val, bool) else None
+        val = self._project_entry(project_id).get("verify_count")
+        return int(val) if isinstance(val, int) else None
 
-    def get_ticket_verify(self, ticket_id: str) -> Optional[bool]:
-        """Return the verify flag for a specific ticket, or ``None`` if not set.
+    def get_ticket_verify_count(self, ticket_id: str) -> Optional[int]:
+        """Return the number of AI verification rounds configured for a ticket.
 
         Parameters
         ----------
@@ -154,17 +153,17 @@ class GateSettingManager:
 
         Returns
         -------
-        Optional[bool]
-            ``True`` / ``False``, or ``None`` when the ticket inherits from
-            its project.
+        Optional[int]
+            Non-negative integer count, or ``None`` when the ticket inherits
+            from its project.
         """
-        val = self._ticket_entry(ticket_id).get("verify")
-        return bool(val) if isinstance(val, bool) else None
+        val = self._ticket_entry(ticket_id).get("verify_count")
+        return int(val) if isinstance(val, int) else None
 
-    def get_effective_verify(self, ticket_id: str, project_id: int) -> bool:
-        """Return the resolved AI-verify flag for a ticket.
+    def get_effective_verify_count(self, ticket_id: str, project_id: int) -> int:
+        """Return the resolved number of AI verification rounds for a ticket.
 
-        Resolution order: ticket → project → ``False``.
+        Resolution order: ticket → project → ``0``.
 
         Parameters
         ----------
@@ -175,16 +174,16 @@ class GateSettingManager:
 
         Returns
         -------
-        bool
-            ``True`` if AI verification is enabled for this ticket.
+        int
+            Number of required verification rounds.  ``0`` means disabled.
         """
-        ticket_verify = self.get_ticket_verify(ticket_id)
-        if ticket_verify is not None:
-            return ticket_verify
-        project_verify = self.get_project_verify(project_id)
-        if project_verify is not None:
-            return project_verify
-        return _DEFAULT_VERIFY
+        ticket_count = self.get_ticket_verify_count(ticket_id)
+        if ticket_count is not None:
+            return ticket_count
+        project_count = self.get_project_verify_count(project_id)
+        if project_count is not None:
+            return project_count
+        return _DEFAULT_VERIFY_COUNT
 
     # ------------------------------------------------------------------
     # Gate mode — write
@@ -226,43 +225,43 @@ class GateSettingManager:
         logger.info("Set ticket %s gate to %r", ticket_id, gate)
 
     # ------------------------------------------------------------------
-    # AI verify — write
+    # AI verify count — write
     # ------------------------------------------------------------------
 
-    def set_project_verify(self, project_id: int, verify: bool) -> None:
-        """Persist the AI-verify flag for a project.
+    def set_project_verify_count(self, project_id: int, count: int) -> None:
+        """Persist the AI-verify round count for a project.
 
         Parameters
         ----------
         project_id : int
             Kanboard project ID.
-        verify : bool
-            ``True`` to enable AI verification; ``False`` to disable.
+        count : int
+            Number of verification rounds (0 = disabled).
         """
-        self._project_entry(project_id, create=True)["verify"] = verify
+        self._project_entry(project_id, create=True)["verify_count"] = count
         self._save()
-        logger.info("Set project %d verify to %r", project_id, verify)
+        logger.info("Set project %d verify_count to %d", project_id, count)
 
-    def set_ticket_verify(self, ticket_id: str, verify: Optional[bool]) -> None:
-        """Persist (or clear) the AI-verify flag for a specific ticket.
+    def set_ticket_verify_count(self, ticket_id: str, count: Optional[int]) -> None:
+        """Persist (or clear) the AI-verify round count for a specific ticket.
 
         Parameters
         ----------
         ticket_id : str
             Kanboard task ID.
-        verify : Optional[bool]
-            ``True`` / ``False`` to override; ``None`` to reset to the
+        count : Optional[int]
+            Non-negative integer to override; ``None`` to reset to the
             project-level setting.
         """
         entry = self._ticket_entry(ticket_id, create=True)
-        if verify is None:
-            entry.pop("verify", None)
+        if count is None:
+            entry.pop("verify_count", None)
             if not entry:
                 self._data.get("tickets", {}).pop(str(ticket_id), None)
         else:
-            entry["verify"] = verify
+            entry["verify_count"] = count
         self._save()
-        logger.info("Set ticket %s verify to %r", ticket_id, verify)
+        logger.info("Set ticket %s verify_count to %r", ticket_id, count)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -282,6 +281,11 @@ class GateSettingManager:
         if isinstance(entry, str):
             projects[key] = {"gate": entry}
             self._save()  # persist so the migration doesn't re-run every restart
+        # Migrate old bool verify → int verify_count
+        entry = projects[key]
+        if "verify" in entry and "verify_count" not in entry:
+            entry["verify_count"] = 1 if entry.pop("verify") else 0
+            self._save()
         return projects[key]
 
     def _ticket_entry(self, ticket_id: str, *, create: bool = False) -> Dict[str, Any]:
@@ -298,6 +302,11 @@ class GateSettingManager:
         if isinstance(entry, str):
             tickets[key] = {"gate": entry}
             self._save()  # persist so the migration doesn't re-run every restart
+        # Migrate old bool verify → int verify_count
+        entry = tickets[key]
+        if "verify" in entry and "verify_count" not in entry:
+            entry["verify_count"] = 1 if entry.pop("verify") else 0
+            self._save()
         return tickets[key]
 
     # ------------------------------------------------------------------

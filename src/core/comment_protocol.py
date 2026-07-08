@@ -75,6 +75,12 @@ class CommentType(Enum):
         Branch was merged to main.
     ERROR : str
         An error occurred; needs human attention.
+    VERIFICATION_FAILED : str
+        Legacy single-round verification failure (kept for log compatibility).
+    VERIFICATION_ROUND_PASSED : str
+        One multi-round verification pass completed without issues.
+    VERIFICATION_ROUND_FAILED : str
+        One multi-round verification pass found issues.
     """
 
     AC_GENERATED = "ac_generated"
@@ -86,6 +92,8 @@ class CommentType(Enum):
     MERGED = "merged"
     ERROR = "error"
     VERIFICATION_FAILED = "verification_failed"
+    VERIFICATION_ROUND_PASSED = "verification_round_passed"
+    VERIFICATION_ROUND_FAILED = "verification_round_failed"
 
 
 @dataclass
@@ -503,6 +511,90 @@ class CommentFormatter:
             f"verification automatically."
             f"{_FOOTER}"
         )
+        return body
+
+    @classmethod
+    def verification_round_result(
+        cls,
+        ticket_id: str,
+        round_num: int,
+        total_rounds: int,
+        result: Any,
+    ) -> str:
+        """Comment posted after each multi-round verification pass completes.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Ticket identifier.
+        round_num : int
+            The round that just completed (1-based).
+        total_rounds : int
+            Total number of configured verification rounds.
+        result : VerificationResult
+            Result from the AI verifier.  Expected to have ``passed`` (bool)
+            and ``findings`` (List[str]) attributes.
+
+        Returns
+        -------
+        str
+            Full comment body.
+        """
+        round_label = f"Round {round_num} of {total_rounds}"
+
+        if result.passed:
+            comment_type = CommentType.VERIFICATION_ROUND_PASSED
+            if round_num == total_rounds:
+                # Last round passed → merge happening immediately
+                rounds_word = "round" if total_rounds == 1 else "rounds"
+                body_text = (
+                    f"All {total_rounds} verification {rounds_word} complete. "
+                    f"Merging now."
+                )
+                action = ""
+            else:
+                # Passed but more rounds remain
+                next_round = round_num + 1
+                body_text = "No issues found in this round."
+                action = (
+                    f"\n\n**Next step:** Call `signal_ready_for_review` again to "
+                    f"proceed to verification round {next_round} of {total_rounds}."
+                )
+            body = (
+                f"{cls._header(comment_type, ticket_id)}\n"
+                f"### Marcus AI Verifier — {round_label}: PASSED ✓\n\n"
+                f"{body_text}"
+                f"{action}"
+                f"{_FOOTER}"
+            )
+        else:
+            comment_type = CommentType.VERIFICATION_ROUND_FAILED
+            items = (
+                "\n".join(f"- {f}" for f in result.findings)
+                if result.findings
+                else "- (no details)"
+            )
+            if round_num == total_rounds:
+                action = (
+                    "\n\n**Action needed:** This was the final verification round. "
+                    "Please fix the issues above and call `signal_ready_for_review` "
+                    "one last time — Marcus will merge without further verification."
+                )
+            else:
+                next_round = round_num + 1
+                action = (
+                    f"\n\n**Action needed:** Fix the issues above and call "
+                    f"`signal_ready_for_review` again. Marcus will run verification "
+                    f"round {next_round} of {total_rounds} next."
+                )
+            body = (
+                f"{cls._header(comment_type, ticket_id)}\n"
+                f"### Marcus AI Verifier — {round_label}: Issues Found\n\n"
+                f"The AI code reviewer checked the branch and found problems:\n\n"
+                f"{items}"
+                f"{action}"
+                f"{_FOOTER}"
+            )
         return body
 
 

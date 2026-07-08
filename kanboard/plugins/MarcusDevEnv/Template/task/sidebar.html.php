@@ -12,6 +12,11 @@
  *   Per-ticket Human Gate / AI Gate toggle.  Shows the project-level default
  *   and lets the human override it for this ticket only.
  *
+ *   AI Verify counter: when the effective gate is AI, shows [−] N [+] to
+ *   set how many LLM review rounds run before the branch auto-merges.
+ *   The reset button (↩) clears the per-ticket override and inherits
+ *   from the project setting.
+ *
  * Section 3 — "Dependencies" panel
  *   Shows which tickets this one depends on ("is blocked by") and which
  *   tickets depend on this one ("blocks"), fetched live from Marcus's
@@ -105,7 +110,7 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
 }
 .m-gate-saving { font-size:10px; color:#9ca3af; display:none; }
 
-/* ── AI Verify (sidebar) ─────────────────────────────────────────── */
+/* ── AI Verify counter (sidebar) ────────────────────────────────── */
 .m-verify-section {
     margin-top: 8px;
     padding-top: 6px;
@@ -113,57 +118,76 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
     display: none; /* shown only when effective gate is AI */
 }
 .m-verify-section.visible { display: block; }
-.m-verify-row {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-}
 .m-verify-desc {
     font-size: 10px;
     color: #888;
-    margin: 3px 0 6px;
+    margin: 0 0 6px;
     line-height: 1.4;
 }
-.m-verify-switch {
-    position: relative;
-    display: inline-block;
-    width: 32px;
-    height: 18px;
-    flex-shrink: 0;
+.m-verify-row {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    flex-wrap: wrap;
 }
-.m-verify-switch input { opacity: 0; width: 0; height: 0; }
-.m-verify-slider {
-    position: absolute;
+.m-verify-counter {
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    overflow: hidden;
+    background: #f9fafb;
+}
+.m-verify-btn {
+    width: 22px;
+    height: 22px;
+    border: none;
+    background: transparent;
     cursor: pointer;
-    inset: 0;
-    background: #d1d5db;
-    border-radius: 18px;
-    transition: background 0.2s;
-}
-.m-verify-slider:before {
-    content: '';
-    position: absolute;
-    width: 12px; height: 12px;
-    left: 3px; bottom: 3px;
-    background: white;
-    border-radius: 50%;
-    transition: transform 0.2s;
-}
-.m-verify-switch input:checked + .m-verify-slider { background: #7c3aed; }
-.m-verify-switch input:checked + .m-verify-slider:before { transform: translateX(14px); }
-.m-verify-badge {
-    font-size: 10px;
+    font-size: 14px;
     font-weight: 700;
-    padding: 2px 6px;
-    border-radius: 4px;
-    background: #f3e8ff;
-    color: #7c3aed;
+    color: #6b7280;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.1s;
+    line-height: 1;
 }
-.m-verify-badge.off { background: #f3f4f6; color: #6b7280; }
+.m-verify-btn:hover:not(:disabled) { background: #e5e7eb; }
+.m-verify-btn:disabled { opacity: .4; cursor: default; }
+.m-verify-val {
+    padding: 0 6px;
+    font-size: 12px;
+    font-weight: 700;
+    color: #9ca3af;
+    min-width: 18px;
+    text-align: center;
+    user-select: none;
+}
+.m-verify-val.active { color: #7c3aed; }
+.m-verify-rounds-label {
+    font-size: 10px;
+    color: #6b7280;
+    white-space: nowrap;
+}
+.m-verify-reset-btn {
+    border: none;
+    background: #f3f4f6;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 11px;
+    color: #6b7280;
+    padding: 2px 5px;
+    transition: background 0.1s;
+    display: none;
+}
+.m-verify-reset-btn:hover { background: #e5e7eb; }
+.m-verify-reset-btn:disabled { opacity: .4; cursor: default; }
 .m-verify-inherit-row {
-    margin-top: 4px;
+    margin-top: 3px;
     font-size: 10px;
     color: #9ca3af;
+    width: 100%;
 }
 </style>
 
@@ -211,20 +235,23 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
             Effective: <strong id="marcus-eff-gate">loading&hellip;</strong>
         </div>
 
-        <!-- AI Verify (only shown when effective gate is AI) -->
+        <!-- AI Verify counter (only shown when effective gate is AI) -->
         <div class="m-verify-section" id="marcus-verify-section">
             <p class="m-verify-desc">
-                When <strong>AI Verify</strong> is on, a second AI agent reviews
-                the implementation before merging. Issues are posted as a comment
-                and the worker agent must fix them.
+                <strong>AI Verify rounds</strong>: how many independent LLM reviews
+                run before this ticket's branch is auto-merged.  0 = no verification.
             </p>
-            <!-- Per-ticket verify override -->
             <div class="m-verify-row">
-                <label class="m-verify-switch" title="Toggle AI verification for this ticket">
-                    <input type="checkbox" id="marcus-verify-chk" onchange="setTicketVerify(this.checked)">
-                    <span class="m-verify-slider"></span>
-                </label>
-                <span id="marcus-verify-badge" class="m-verify-badge off">Off</span>
+                <div class="m-verify-counter">
+                    <button class="m-verify-btn" id="marcus-tverify-dec"
+                            onclick="adjustTicketVerify(-1)" title="Decrease verification rounds">&#8722;</button>
+                    <span class="m-verify-val" id="marcus-tverify-val">0</span>
+                    <button class="m-verify-btn" id="marcus-tverify-inc"
+                            onclick="adjustTicketVerify(1)" title="Increase verification rounds">&#43;</button>
+                </div>
+                <span class="m-verify-rounds-label">rounds</span>
+                <button class="m-verify-reset-btn" id="marcus-tverify-reset"
+                        onclick="resetTicketVerify()" title="Inherit from project">&#8617;</button>
                 <span class="m-gate-saving" id="marcus-verify-saving">saving&hellip;</span>
             </div>
             <div class="m-verify-inherit-row" id="marcus-verify-inherit-note"></div>
@@ -341,13 +368,15 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
         });
 
     /* ── Gate mode panel ─────────────────────────────────────────── */
-    var saving       = document.getElementById('marcus-tg-saving');
-    var effEl        = document.getElementById('marcus-eff-gate');
+    var saving        = document.getElementById('marcus-tg-saving');
+    var effEl         = document.getElementById('marcus-eff-gate');
     var verifySection = document.getElementById('marcus-verify-section');
-    var verifyChk    = document.getElementById('marcus-verify-chk');
-    var verifyBadge  = document.getElementById('marcus-verify-badge');
-    var verifySaving = document.getElementById('marcus-verify-saving');
-    var verifyNote   = document.getElementById('marcus-verify-inherit-note');
+    var verifySaving  = document.getElementById('marcus-verify-saving');
+    var verifyNote    = document.getElementById('marcus-verify-inherit-note');
+    var tVerifyDecBtn = document.getElementById('marcus-tverify-dec');
+    var tVerifyIncBtn = document.getElementById('marcus-tverify-inc');
+    var tVerifyValEl  = document.getElementById('marcus-tverify-val');
+    var tVerifyReset  = document.getElementById('marcus-tverify-reset');
 
     // Apply visual state to project-level pill row (read-only indicator)
     function applyProjectPills(gate) {
@@ -379,13 +408,21 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
         }
     }
 
-    function applyVerify(ticketVerify, projectVerify, effectiveVerify) {
-        verifyChk.checked = !!effectiveVerify;
-        verifyBadge.textContent = effectiveVerify ? 'On' : 'Off';
-        verifyBadge.className = 'marcus-verify-badge' + (effectiveVerify ? '' : ' off');
-        // Show inherit note when ticket has no explicit setting
-        if (ticketVerify === null || ticketVerify === undefined) {
-            var src = projectVerify ? 'project: On' : 'project: Off';
+    // ticketVerifyCount: null = inheriting; number = per-ticket override
+    function applyVerify(ticketVerifyCount, projectVerifyCount, effectiveVerifyCount) {
+        var count = effectiveVerifyCount || 0;
+        tVerifyValEl.textContent = count;
+        tVerifyValEl.className = 'm-verify-val' + (count > 0 ? ' active' : '');
+        tVerifyDecBtn.disabled = (count <= 0);
+
+        // Show reset button only when there is a per-ticket override to clear
+        var hasOverride = (ticketVerifyCount !== null && ticketVerifyCount !== undefined);
+        tVerifyReset.style.display = hasOverride ? 'inline' : 'none';
+
+        if (!hasOverride) {
+            var src = (projectVerifyCount || 0) > 0
+                ? 'project: ' + projectVerifyCount + (projectVerifyCount === 1 ? ' round' : ' rounds')
+                : 'project: off';
             verifyNote.textContent = '(inheriting from ' + src + ')';
         } else {
             verifyNote.textContent = '';
@@ -398,15 +435,19 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
             .then(function (r) { return r.json(); })
             .then(function (data) {
                 applyProjectPills(data.project_gate || 'human');
-                applyTicketPills(data.ticket_gate);          // null = inheriting
+                applyTicketPills(data.ticket_gate);
                 applyEffective(data.effective || 'human');
-                applyVerify(data.ticket_verify, data.project_verify, data.effective_verify);
+                applyVerify(
+                    data.ticket_verify_count,
+                    data.project_verify_count || 0,
+                    data.effective_verify_count || 0
+                );
             })
             .catch(function () {
                 applyProjectPills('human');
                 applyTicketPills(null);
                 applyEffective('human');
-                applyVerify(null, false, false);
+                applyVerify(null, 0, 0);
             });
     }
 
@@ -432,21 +473,33 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
         });
     };
 
-    // Called by AI Verify toggle
-    window.setTicketVerify = function (enabled) {
+    window.adjustTicketVerify = function (delta) {
+        var cur = parseInt(tVerifyValEl.textContent, 10) || 0;
+        var next = Math.max(0, cur + delta);
+        if (next === cur) { return; }
+        setTicketVerify(next);
+    };
+
+    window.resetTicketVerify = function () {
+        setTicketVerify(null);
+    };
+
+    window.setTicketVerify = function (count) {
         verifySaving.style.display = 'inline';
-        verifyChk.disabled = true;
+        tVerifyDecBtn.disabled = tVerifyIncBtn.disabled = tVerifyReset.disabled = true;
 
         fetch(GATE_URL + '/ticket', {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ ticket_id: TICKET_ID, verify: enabled }),
+            body: JSON.stringify({ ticket_id: TICKET_ID, verify_count: count }),
         })
         .then(function (r) { return r.json(); })
         .then(function () { loadGateSettings(); })
         .catch(function () { /* keep current visual state */ })
         .finally(function () {
-            verifyChk.disabled = false;
+            tVerifyDecBtn.disabled = false;
+            tVerifyIncBtn.disabled = false;
+            tVerifyReset.disabled = false;
             verifySaving.style.display = 'none';
         });
     };
