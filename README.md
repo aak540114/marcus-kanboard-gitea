@@ -113,7 +113,7 @@ docker compose logs -f gitea | grep "Listen"
    ```
    http://host.docker.internal:4298/webhooks/kanboard
    ```
-4. Create a project and add columns: `Ready`, `In Progress`, `Waiting for Human`, `Blocked`, `Done`
+4. Create a project and add columns: `Todo`, `Ready`, `In Progress`, `Waiting for Human`, `Blocked`, `Done`
 
 ### 3. First-time Gitea setup
 
