@@ -159,6 +159,26 @@ Anything that speaks the OpenAI API works (`llama.cpp` server, LocalAI, text-gen
 }
 ```
 
+### Using your Claude Pro/Max subscription instead of an API key
+
+If you don't want a metered API key at all — you already pay for Claude Pro or Max and want Marcus's own planner calls (decomposition, dependency inference, effort estimation, blocker analysis) to ride that subscription instead — set `ai.provider` to `"claude_subscription"`:
+
+```json
+{
+  "ai": {
+    "provider": "claude_subscription",
+    "claude_cli_model": "sonnet"
+  }
+}
+```
+
+This requires the `claude` CLI installed and logged in (`claude login`) on the same machine Marcus itself runs on — Marcus shells out to `claude -p` for each planner call, using whatever the CLI is already authenticated with. No `anthropic_api_key` or `CLAUDE_API_KEY` is read or set.
+
+Trade-offs versus a direct API key or local Ollama:
+- Each call spawns a full `claude` CLI process, so it's slower per call (several seconds to tens of seconds, versus sub-second for a direct API request or a local model).
+- Subscription usage limits apply and are shared with any interactive Claude Code sessions on the same account.
+- This only covers Marcus's own internal planner calls — the coding agents (workers) already use their own `claude` CLI sessions independently of this setting, so nothing changes there.
+
 ### Configuration priority
 
 1. Environment variables (`MARCUS_*`)

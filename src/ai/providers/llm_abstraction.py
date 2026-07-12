@@ -341,6 +341,29 @@ class LLMAbstraction:
                 except Exception as e:
                     logger.warning(f"Failed to initialize local LLM provider: {e}")
 
+        # ----- Claude subscription (CLI) --------------------------------------
+        # Routes Marcus's own decomposition/analysis calls through a locally
+        # installed `claude` CLI in print mode instead of a metered API key —
+        # uses whatever auth the CLI is already logged into (typically a
+        # Claude Pro/Max subscription). No credentials to validate here; a
+        # missing/unauthenticated CLI surfaces as a runtime error on first
+        # use, handled the same way every provider's transport failures are.
+        if _allowed("claude_subscription"):
+            try:
+                from .claude_cli_provider import ClaudeCliProvider
+
+                self.providers["claude_subscription"] = ClaudeCliProvider(
+                    model=config.ai.claude_cli_model
+                )
+                self.fallback_providers.append("claude_subscription")
+                logger.info(
+                    "Successfully initialized Claude subscription (CLI) provider"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to initialize Claude subscription provider: {e}"
+                )
+
         # Hard-fail when the user explicitly set a provider and it didn't
         # initialize. The earlier code logged a warning and silently
         # cascaded to whichever provider happened to be available — that

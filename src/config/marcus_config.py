@@ -51,7 +51,8 @@ class AISettings:
     Parameters
     ----------
     provider : str
-        AI provider to use: "anthropic", "openai", "local", or "cloud"
+        AI provider to use: "anthropic", "openai", "local", "cloud", or
+        "claude_subscription"
     anthropic_api_key : Optional[str]
         Anthropic API key (required if provider="anthropic")
     openai_api_key : Optional[str]
@@ -66,6 +67,18 @@ class AISettings:
         API key for generic cloud provider (required if provider="cloud")
     cloud_url : Optional[str]
         Base URL for generic cloud provider (required if provider="cloud")
+    claude_cli_model : Optional[str]
+        Model alias passed to ``claude --model`` when
+        provider="claude_subscription" (e.g. "sonnet", "opus", "haiku").
+        ``None`` (default) omits the flag and lets the CLI use its own
+        session default. Deliberately separate from ``model`` below —
+        that field's default is an old Anthropic API model string, not a
+        valid CLI alias, and reusing it here would break the CLI
+        invocation for anyone using this provider's defaults. No API key
+        required for this provider — it shells out to a locally
+        installed, already-authenticated ``claude`` CLI (typically logged
+        into a Claude Pro/Max subscription via ``claude login``) instead
+        of calling the Anthropic API directly.
     model : Optional[str]
         Model name (e.g., "claude-3-haiku-20240307")
     temperature : float
@@ -84,6 +97,7 @@ class AISettings:
     local_key: Optional[str] = None
     cloud_api_key: Optional[str] = None
     cloud_url: Optional[str] = None
+    claude_cli_model: Optional[str] = None
     model: Optional[str] = "claude-3-haiku-20240307"
     temperature: float = 0.7
     max_tokens: int = 4096

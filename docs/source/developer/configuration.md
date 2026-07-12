@@ -94,7 +94,7 @@ To switch transports or ports:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `MARCUS_AI_ENABLED` | Enable/disable AI features | `true` |
-| `MARCUS_LLM_PROVIDER` | Provider: `anthropic`, `openai`, `local` | `anthropic` |
+| `MARCUS_LLM_PROVIDER` | Provider: `anthropic`, `openai`, `local`, `cloud`, `claude_subscription` | `anthropic` |
 | `MARCUS_AI_MODEL` | Model name | `claude-haiku-4-5-20251001` |
 
 #### Anthropic (Claude)
@@ -114,6 +114,13 @@ To switch transports or ports:
 | `MARCUS_LOCAL_LLM_PATH` | Model name (e.g., `qwen2.5-coder:7b`) — maps to `ai.local_model` in the config file | Yes if using local |
 | `MARCUS_LOCAL_LLM_URL` | Ollama server URL (e.g., `http://localhost:11434/v1`) — maps to `ai.local_url` | Optional |
 | `MARCUS_LOCAL_LLM_KEY` | API key for the local server — maps to `ai.local_key` | Optional |
+
+#### Claude Subscription (CLI, no API key)
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `ai.claude_cli_model` (config file only, no env override) | Model alias passed to `claude --model` (e.g. `sonnet`, `opus`, `haiku`) | Optional |
+
+No API key variable applies here. This provider shells out to a locally-installed `claude` CLI and uses whatever it's already logged into (`claude login`) — most commonly a Claude Pro/Max subscription. Requires the `claude` CLI installed and authenticated on the same machine Marcus runs on. See [Setting Up Local LLMs](../getting-started/setup-local-llm.md#using-your-claude-promax-subscription-instead-of-an-api-key) for details and trade-offs.
 
 ### Communication
 | Variable | Description | Default |

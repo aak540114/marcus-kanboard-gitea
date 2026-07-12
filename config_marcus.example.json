@@ -10,6 +10,7 @@
   "board_name": "Marcus Todo Demo",
   "auto_find_board": false,
   "ai": {
+    "_comment_provider": "provider: 'anthropic' | 'openai' | 'local' | 'cloud' | 'claude_subscription'. 'claude_subscription' runs Marcus's own decomposition/analysis calls through a locally-installed, already-logged-in `claude` CLI (Pro/Max subscription) instead of a metered API key -- see claude_cli_model below and no anthropic_api_key/openai_api_key is needed for it.",
     "provider": "anthropic",
     "anthropic_api_key": "${CLAUDE_API_KEY}",
     "openai_api_key": "${OPENAI_API_KEY}",
@@ -17,6 +18,8 @@
     "local_url": "http://localhost:11434/v1",
     "local_key": "none",
     "model": "claude-haiku-4-5-20251001",
+    "claude_cli_model": "sonnet",
+    "_comment_claude_cli_model": "Only used when provider is 'claude_subscription'. Model alias passed to `claude --model` (e.g. 'sonnet', 'opus', 'haiku'). Requires the `claude` CLI installed and authenticated (`claude login`) on the same machine Marcus runs on.",
     "temperature": 0.1,
     "max_tokens": 16384,
     "enabled": true

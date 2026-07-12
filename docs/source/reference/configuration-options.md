@@ -133,7 +133,7 @@ The simplest way to get started. No Docker, no external services.
 
 | Option | Type | Default | Env Override | Description |
 |--------|------|---------|--------------|-------------|
-| `ai.provider` | string | "openai" | `MARCUS_LLM_PROVIDER` | Provider: openai, anthropic, or local |
+| `ai.provider` | string | "openai" | `MARCUS_LLM_PROVIDER` | Provider: openai, anthropic, local, cloud, or claude_subscription |
 | `ai.enabled` | boolean | true | `MARCUS_AI_ENABLED` | Enable/disable AI features globally |
 | `ai.model` | string | - | `MARCUS_AI_MODEL` | Default model name |
 | `ai.anthropic_api_key` | string | - | `MARCUS_AI_ANTHROPIC_API_KEY` | Anthropic API key |
@@ -141,12 +141,14 @@ The simplest way to get started. No Docker, no external services.
 | `ai.local_model` | string | - | `MARCUS_LOCAL_LLM_PATH` | Local model name (e.g., "qwen2.5:7b") |
 | `ai.local_url` | string | - | `MARCUS_LOCAL_LLM_URL` | Local LLM server URL (e.g., Ollama) |
 | `ai.local_key` | string | "none" | `MARCUS_LOCAL_LLM_KEY` | Local LLM API key (if required) |
+| `ai.claude_cli_model` | string | - | - | Model alias for the `claude` CLI (e.g. "sonnet"), used only when `ai.provider` is "claude_subscription" |
 
 ### Supported Providers
 
 - **openai**: OpenAI GPT models (requires `openai_api_key`)
 - **anthropic**: Anthropic Claude models (requires `anthropic_api_key`)
 - **local**: Local LLM via Ollama or similar (requires `local_url` and `local_model`)
+- **claude_subscription**: Routes Marcus's own decomposition/analysis calls through a locally-installed `claude` CLI, using whatever account it's already logged into (e.g. a Claude Pro/Max subscription via `claude login`) instead of a metered API key. No `anthropic_api_key`/`openai_api_key` required. Requires the `claude` CLI installed and authenticated on the same machine Marcus runs on — this only applies to Marcus's own internal LLM calls (decomposition, dependency inference, effort estimation, blocker analysis), not the coding agents themselves, which already use their own `claude` CLI sessions independently of this setting. See `ai.claude_cli_model` to pin a specific model alias.
 
 ---
 
