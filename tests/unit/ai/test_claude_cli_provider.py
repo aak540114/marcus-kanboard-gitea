@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
+from src.core.error_framework import AIProviderError
 from src.core.models import Priority, Task, TaskStatus
 
 
@@ -79,6 +80,7 @@ class _FakeProcess:
         self._stderr = stderr
         self.returncode = returncode
         self.killed = False
+        self.pid = 999999
 
     async def communicate(self):
         return self._stdout, self._stderr
@@ -172,7 +174,34 @@ class TestCallClaudeCli:
         assert "analyze this" in args
         assert "--output-format" in args
         assert "json" in args
-        assert "--allowedTools" in args
+        # `--tools ""` is the CLI's documented "disable all tools" flag
+        # (`claude --help`: "Use \"\" to disable all tools") — not
+        # `--allowedTools`, whose empty-string behavior isn't documented.
+        assert "--tools" in args
+        tools_idx = args.index("--tools")
+        assert args[tools_idx + 1] == ""
+        assert "--dangerously-skip-permissions" in args
+
+    @pytest.mark.asyncio
+    async def test_subprocess_started_with_no_stdin_and_own_process_group(
+        self,
+    ) -> None:
+        """stdin=DEVNULL (never blocks on a read) and start_new_session=True
+        (so a timeout/cancellation can kill the whole descendant tree)."""
+        from src.ai.providers.claude_cli_provider import ClaudeCliProvider
+
+        cfg = _mock_config()
+        with patch("src.config.marcus_config.get_config", return_value=cfg):
+            provider = ClaudeCliProvider()
+
+        fake_proc = _FakeProcess(_envelope())
+        create_mock = AsyncMock(return_value=fake_proc)
+        with patch("asyncio.create_subprocess_exec", create_mock):
+            await provider._call_claude_cli("analyze this")
+
+        kwargs = create_mock.call_args.kwargs
+        assert kwargs["stdin"] == asyncio.subprocess.DEVNULL
+        assert kwargs["start_new_session"] is True
 
     @pytest.mark.asyncio
     async def test_passes_model_flag_when_configured(self) -> None:
@@ -244,8 +273,11 @@ class TestCallClaudeCli:
         with patch(
             "asyncio.create_subprocess_exec", AsyncMock(return_value=fake_proc)
         ):
-            with pytest.raises(RuntimeError, match="exited"):
+            with pytest.raises(AIProviderError) as exc_info:
                 await provider._call_claude_cli("analyze this")
+
+        assert "exited" in str(exc_info.value.cause)
+        assert exc_info.value.retryable is True
 
     @pytest.mark.asyncio
     async def test_raises_on_is_error_envelope(self) -> None:
@@ -259,8 +291,10 @@ class TestCallClaudeCli:
         with patch(
             "asyncio.create_subprocess_exec", AsyncMock(return_value=fake_proc)
         ):
-            with pytest.raises(RuntimeError, match="rate limited"):
+            with pytest.raises(AIProviderError) as exc_info:
                 await provider._call_claude_cli("analyze this")
+
+        assert "rate limited" in str(exc_info.value.cause)
 
     @pytest.mark.asyncio
     async def test_raises_on_non_json_stdout(self) -> None:
@@ -274,8 +308,30 @@ class TestCallClaudeCli:
         with patch(
             "asyncio.create_subprocess_exec", AsyncMock(return_value=fake_proc)
         ):
-            with pytest.raises(RuntimeError, match="non-JSON"):
+            with pytest.raises(AIProviderError) as exc_info:
                 await provider._call_claude_cli("analyze this")
+
+        assert isinstance(exc_info.value.cause, json.JSONDecodeError)
+
+    @pytest.mark.asyncio
+    async def test_raises_on_non_object_json_stdout(self) -> None:
+        """A syntactically valid but non-object JSON payload (e.g. a bare
+        list) must not slip past the json.JSONDecodeError guard and crash
+        with an undocumented AttributeError on envelope.get(...)."""
+        from src.ai.providers.claude_cli_provider import ClaudeCliProvider
+
+        cfg = _mock_config()
+        with patch("src.config.marcus_config.get_config", return_value=cfg):
+            provider = ClaudeCliProvider()
+
+        fake_proc = _FakeProcess(b"[]")
+        with patch(
+            "asyncio.create_subprocess_exec", AsyncMock(return_value=fake_proc)
+        ):
+            with pytest.raises(AIProviderError) as exc_info:
+                await provider._call_claude_cli("analyze this")
+
+        assert isinstance(exc_info.value.cause, TypeError)
 
     @pytest.mark.asyncio
     async def test_raises_and_kills_process_on_timeout(self) -> None:
@@ -293,13 +349,78 @@ class TestCallClaudeCli:
 
         fake_proc.communicate = _hang  # type: ignore[method-assign]
 
+        kill_mock = AsyncMock()
+        with patch(
+            "asyncio.create_subprocess_exec", AsyncMock(return_value=fake_proc)
+        ), patch(
+            "src.ai.providers.claude_cli_provider._kill_process_group", kill_mock
+        ):
+            with pytest.raises(AIProviderError) as exc_info:
+                await provider._call_claude_cli("analyze this")
+
+        assert "timed out" in str(exc_info.value.cause)
+        assert exc_info.value.retryable is True
+        kill_mock.assert_awaited_once_with(fake_proc)
+
+    @pytest.mark.asyncio
+    async def test_reaps_process_on_non_timeout_exception_during_communicate(
+        self,
+    ) -> None:
+        """A non-timeout exception (e.g. task cancellation) must still kill
+        the process group instead of leaking the child — only TimeoutError
+        was previously handled."""
+        from src.ai.providers.claude_cli_provider import ClaudeCliProvider
+
+        cfg = _mock_config()
+        with patch("src.config.marcus_config.get_config", return_value=cfg):
+            provider = ClaudeCliProvider()
+
+        fake_proc = _FakeProcess(_envelope())
+
+        async def _broken_pipe(*a, **k):
+            raise OSError("broken pipe")
+
+        fake_proc.communicate = _broken_pipe  # type: ignore[method-assign]
+
+        kill_mock = AsyncMock()
+        with patch(
+            "asyncio.create_subprocess_exec", AsyncMock(return_value=fake_proc)
+        ), patch(
+            "src.ai.providers.claude_cli_provider._kill_process_group", kill_mock
+        ):
+            with pytest.raises(OSError, match="broken pipe"):
+                await provider._call_claude_cli("analyze this")
+
+        kill_mock.assert_awaited_once_with(fake_proc)
+
+    @pytest.mark.asyncio
+    async def test_null_usage_field_does_not_crash(self) -> None:
+        """A present-but-null usage field (`"input_tokens": null`) must not
+        turn an otherwise-successful response into a crash — `.get(key, 0)`
+        alone only substitutes the default when the key is absent."""
+        from src.ai.providers.claude_cli_provider import ClaudeCliProvider
+
+        cfg = _mock_config()
+        with patch("src.config.marcus_config.get_config", return_value=cfg):
+            provider = ClaudeCliProvider()
+
+        envelope = {
+            "is_error": False,
+            "result": "hello",
+            "usage": {
+                "input_tokens": None,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": None,
+                "cache_read_input_tokens": None,
+            },
+        }
+        fake_proc = _FakeProcess(json.dumps(envelope).encode())
         with patch(
             "asyncio.create_subprocess_exec", AsyncMock(return_value=fake_proc)
         ):
-            with pytest.raises(RuntimeError, match="timed out"):
-                await provider._call_claude_cli("analyze this")
+            result = await provider._call_claude_cli("analyze this")
 
-        assert fake_proc.killed is True
+        assert result == "hello"
 
     @pytest.mark.asyncio
     async def test_strips_leading_think_block(self) -> None:

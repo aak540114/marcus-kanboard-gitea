@@ -359,3 +359,93 @@ class TestProviderLockdownRegression:
         finally:
             if prev is not None:
                 os.environ["CLAUDE_API_KEY"] = prev
+
+
+class TestClaudeSubscriptionOptInGate:
+    """Regression: ``claude_subscription`` must gate on the ``claude``
+    binary actually being on PATH, the same way ``local`` gates on
+    ``local_model`` being set.
+
+    Before this fix, ``ClaudeCliProvider.__init__`` never failed on its
+    own (no credential/binary check), so with no provider configured and
+    no other credentials present, ``claude_subscription`` would always
+    "successfully" initialize and become the sole/default provider on a
+    host that never installed the CLI — silently defeating both the
+    "no providers available" startup check and the Marcus #531 hard-fail
+    for an explicitly-misconfigured provider.
+    """
+
+    def test_skipped_when_binary_not_on_path_and_nothing_else_configured(self):
+        """No claude binary + no other credentials -> the original
+        "no providers" RuntimeError must still fire, not a silent
+        claude_subscription fallback."""
+        mock_config = Mock()
+        mock_config.ai.provider = ""
+        mock_config.ai.anthropic_api_key = None
+        mock_config.ai.openai_api_key = None
+        mock_config.ai.local_model = None
+        mock_config.ai.cloud_api_key = None
+        mock_config.ai.cloud_url = None
+        mock_config.ai.model = None
+        mock_config.ai.claude_cli_model = None
+
+        with patch("src.config.marcus_config.get_config", return_value=mock_config), \
+            patch("src.ai.providers.llm_abstraction.shutil.which", return_value=None), \
+            patch.dict(os.environ, {}, clear=True):
+            llm = LLMAbstraction()
+            with pytest.raises(RuntimeError, match="No LLM providers could be initialized"):
+                llm._initialize_providers()
+
+        assert "claude_subscription" not in llm.providers
+
+    def test_initializes_when_binary_is_on_path(self):
+        """When the claude binary IS on PATH, claude_subscription joins
+        the pool (legacy auto-discovery, no provider explicitly set)."""
+        mock_config = Mock()
+        mock_config.ai.provider = ""
+        mock_config.ai.anthropic_api_key = None
+        mock_config.ai.openai_api_key = None
+        mock_config.ai.local_model = None
+        mock_config.ai.cloud_api_key = None
+        mock_config.ai.cloud_url = None
+        mock_config.ai.model = None
+        mock_config.ai.claude_cli_model = None
+
+        fake_provider = Mock()
+        with patch("src.config.marcus_config.get_config", return_value=mock_config), \
+            patch(
+                "src.ai.providers.llm_abstraction.shutil.which",
+                return_value="/usr/local/bin/claude",
+            ), \
+            patch(
+                "src.ai.providers.claude_cli_provider.ClaudeCliProvider",
+                return_value=fake_provider,
+            ):
+            llm = LLMAbstraction()
+            llm._initialize_providers()
+
+        assert llm.providers["claude_subscription"] is fake_provider
+        assert "claude_subscription" in llm.fallback_providers
+
+    def test_respects_provider_lockdown_even_when_binary_present(self):
+        """Provider explicitly set to something else -> claude_subscription
+        must not be attempted, regardless of binary presence."""
+        mock_config = Mock()
+        mock_config.ai.provider = "local"
+        mock_config.ai.local_model = "test-model"
+        mock_config.ai.local_url = "http://localhost:11434/v1"
+        mock_config.ai.local_key = "none"
+        mock_config.ai.anthropic_api_key = None
+        mock_config.ai.openai_api_key = None
+        mock_config.ai.claude_cli_model = None
+
+        with patch("src.config.marcus_config.get_config", return_value=mock_config), \
+            patch(
+                "src.ai.providers.llm_abstraction.shutil.which",
+                return_value="/usr/local/bin/claude",
+            ):
+            llm = LLMAbstraction()
+            llm._initialize_providers()
+
+        assert "claude_subscription" not in llm.providers
+        assert "claude_subscription" not in llm.fallback_providers

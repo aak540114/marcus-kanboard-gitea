@@ -30,6 +30,7 @@ import asyncio
 import functools
 import logging
 import os
+import shutil
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, TypeVar
 
@@ -345,23 +346,36 @@ class LLMAbstraction:
         # Routes Marcus's own decomposition/analysis calls through a locally
         # installed `claude` CLI in print mode instead of a metered API key —
         # uses whatever auth the CLI is already logged into (typically a
-        # Claude Pro/Max subscription). No credentials to validate here; a
-        # missing/unauthenticated CLI surfaces as a runtime error on first
-        # use, handled the same way every provider's transport failures are.
+        # Claude Pro/Max subscription). No *credentials* to validate (the
+        # CLI's own login state isn't something Marcus can check here), but
+        # unlike every other branch above, construction never fails on its
+        # own — ClaudeCliProvider.__init__ does no I/O — so without a gate
+        # this provider would always "succeed" and could silently become the
+        # active provider on any host that never configured or installed it,
+        # defeating both the "no providers available" startup check below
+        # and the #531 hard-fail for an explicitly-misconfigured provider.
+        # Gate on the `claude` binary actually being on PATH, mirroring how
+        # the "local" block above gates on local_model_path being set.
         if _allowed("claude_subscription"):
-            try:
-                from .claude_cli_provider import ClaudeCliProvider
+            if shutil.which("claude"):
+                try:
+                    from .claude_cli_provider import ClaudeCliProvider
 
-                self.providers["claude_subscription"] = ClaudeCliProvider(
-                    model=config.ai.claude_cli_model
-                )
-                self.fallback_providers.append("claude_subscription")
-                logger.info(
-                    "Successfully initialized Claude subscription (CLI) provider"
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Failed to initialize Claude subscription provider: {e}"
+                    self.providers["claude_subscription"] = ClaudeCliProvider(
+                        model=config.ai.claude_cli_model
+                    )
+                    self.fallback_providers.append("claude_subscription")
+                    logger.info(
+                        "Successfully initialized Claude subscription (CLI) provider"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to initialize Claude subscription provider: {e}"
+                    )
+            else:
+                logger.debug(
+                    "Skipping Claude subscription (CLI) provider — "
+                    "`claude` binary not found on PATH"
                 )
 
         # Hard-fail when the user explicitly set a provider and it didn't
