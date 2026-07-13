@@ -207,6 +207,8 @@ If you don't provide a domain, setup leaves the stack on plain HTTP and tells yo
 
 > ⚠️ **Still change the defaults and firewall it.** Kanboard (`admin`/`admin`) and Gitea (`root`/the printed `GITEA_ADMIN_PASSWORD`) ship with well-known credentials and are exposed alongside Marcus when you answer Yes — change them before real use. Requiring the bearer token also closes the earlier CSRF gap (a browser can't attach the `Authorization` header cross-origin), but defense-in-depth still means restricting the stack to just the hosts your agents run on with a firewall/security-group, especially on a cloud VPS.
 
+> ℹ️ **Known limitation — the browser dashboard under a token.** The token gates *every* Marcus HTTP route (that's the point: a rogue agent can't read or change board state). But the MarcusDevEnv Kanboard-plugin widgets (Active Agents badge, gate toggle, project-description link) are fetched by your *browser*, which can't attach an `Authorization: Bearer` header — so with `MARCUS_AGENT_TOKEN` set, those widgets show errors and the dashboard degrades. Agent connectivity (the MCP endpoint) is unaffected. If you need the browser dashboard to work over an authenticated remote Marcus, the plugin needs to forward the token — not wired up yet; open an issue / ask if you want it.
+
 ---
 
 ## AI provider
