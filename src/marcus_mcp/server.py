@@ -3240,6 +3240,7 @@ if __name__ == "__main__":
         from starlette.responses import JSONResponse, RedirectResponse, HTMLResponse, Response
         from starlette.routing import Mount, Route
 
+        from src.core.agent_auth import BearerAuthMiddleware, get_agent_token
         from src.core.kanboard_webhook_receiver import KanboardWebhookReceiver
 
         if server.events is None:
@@ -3859,6 +3860,22 @@ function save() {{
                 Mount("/", app=mcp_app),
             ]
         )
+
+        # Bearer-token auth: when MARCUS_AGENT_TOKEN is set (scripts/setup.sh
+        # sets it when the operator opts into remote access), every route
+        # except the Kanboard webhook (which has its own ?token= secret)
+        # requires `Authorization: Bearer <token>` — so unaccounted agents
+        # can't reach the MCP control plane or the gate/description APIs.
+        # A pass-through when unset, preserving the localhost-only default.
+        agent_token = get_agent_token()
+        app = BearerAuthMiddleware(app, token=agent_token)  # type: ignore[assignment]  # noqa: E501
+        if agent_token:
+            print("[I] Auth:           bearer token REQUIRED (MARCUS_AGENT_TOKEN set)")
+        else:
+            print(
+                "[I] Auth:           OPEN (no MARCUS_AGENT_TOKEN) — fine for "
+                "localhost-only; set a token before exposing remotely"
+            )
 
         print(f"[I] Webhook URL:    http://{host}:{port}/webhooks/kanboard")
         print(f"[I] Dev-env view:   http://{host}:{port}/dev-env/view?ticket_id=<id>")

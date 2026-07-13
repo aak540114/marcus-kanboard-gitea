@@ -177,6 +177,14 @@ services:
       # src/core/kanboard_webhook_receiver.py. Must match the value seeded
       # into Kanboard's own webhook_token setting by scripts/setup.sh.
       KANBOARD_WEBHOOK_TOKEN: "${KANBOARD_WEBHOOK_TOKEN:-}"
+      # Shared bearer token every connecting AI agent must present as
+      # `Authorization: Bearer <token>` (src/core/agent_auth.py). When set,
+      # Marcus rejects unauthenticated requests to the MCP control plane and
+      # the gate/description APIs with 401 — so only agents you've given the
+      # token to can read or change tickets/branches/code. scripts/setup.sh
+      # generates it when you opt into remote access. Empty = auth disabled
+      # (fine for the localhost-only default; required before exposing).
+      MARCUS_AGENT_TOKEN: "${MARCUS_AGENT_TOKEN:-}"
       # GITEA_URL/GITEA_TOKEN: provisioned by scripts/setup.sh and correct,
       # but not yet consumed by anything in src/ — GiteaManager and
       # ProjectSyncWorkflow (src/integrations/gitea_manager.py,

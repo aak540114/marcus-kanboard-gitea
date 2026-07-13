@@ -1,0 +1,26 @@
+# Caddyfile — TLS reverse proxy for Marcus (see docker-compose.tls.yml).
+#
+# The site address is taken from MARCUS_PUBLIC_DOMAIN. When that is set to
+# a real domain, Caddy automatically obtains a Let's Encrypt certificate
+# for it (using MARCUS_ACME_EMAIL for the ACME account). When it is left
+# blank, the placeholder `localhost` address makes Caddy serve its own
+# internal self-signed certificate — usable for local testing only.
+#
+# Either way, Caddy just terminates TLS and forwards to Marcus over the
+# internal compose network. Marcus's own bearer-token check
+# (MARCUS_AGENT_TOKEN) is what authenticates agents; Caddy does not add or
+# strip the Authorization header, so it passes straight through.
+
+{
+	# ACME account email for Let's Encrypt (ignored for the self-signed
+	# localhost path). Empty is fine — Caddy will still issue internal
+	# certs and, for a real domain, prompt-less ACME without an email.
+	email {$MARCUS_ACME_EMAIL}
+}
+
+# If MARCUS_PUBLIC_DOMAIN is unset/blank, this expands to `localhost`,
+# which triggers Caddy's internal self-signed CA. If it's a real domain,
+# Caddy provisions a publicly-trusted Let's Encrypt cert for it.
+{$MARCUS_PUBLIC_DOMAIN:localhost} {
+	reverse_proxy marcus:4298
+}

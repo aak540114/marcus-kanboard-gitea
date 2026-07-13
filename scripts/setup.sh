@@ -168,6 +168,11 @@ mkdir -p "$HOME/.claude"
 
 log "Configuring network access..."
 
+# COMPOSE_FILES is the set of compose files every subsequent `docker
+# compose` call in this script uses. The TLS overlay is appended to it
+# only when the operator opts into HTTPS below.
+COMPOSE_FILES=(-f docker-compose.yml)
+
 if [ -z "$(env_get MARCUS_BIND_HOST)" ]; then
     if [ -t 0 ]; then
         # `|| allow_remote=""` so a Ctrl-D (EOF) at the prompt falls
@@ -177,13 +182,38 @@ if [ -z "$(env_get MARCUS_BIND_HOST)" ]; then
         read -r -p "Allow OTHER machines (e.g. a remote VPS, agents on other hosts) to reach this stack? [y/N]: " allow_remote || allow_remote=""
         case "$allow_remote" in
             [yY]|[yY][eE][sS])
-                env_set MARCUS_BIND_HOST "0.0.0.0"
-                log "Marcus, Kanboard, and Gitea ports will be published on all interfaces — reachable from other machines once your firewall/network allows it."
-                log "SECURITY: Marcus's HTTP endpoints are UNAUTHENTICATED and Kanboard/Gitea use default credentials — put a firewall/VPN in front and change those passwords before real use."
+                # Remote access opted in. Two things make this safe(r):
+                # (1) a bearer token every agent must present, so
+                # unaccounted agents are rejected; (2) an optional HTTPS
+                # reverse proxy so the token isn't sent in cleartext.
+                if [ -z "$(env_get MARCUS_AGENT_TOKEN)" ]; then
+                    env_set MARCUS_AGENT_TOKEN "$(openssl rand -hex 32)"
+                    log "Generated MARCUS_AGENT_TOKEN — connecting agents must present it as 'Authorization: Bearer <token>'."
+                fi
+
+                tls_domain=""
+                read -r -p "Terminate HTTPS with a built-in proxy? Enter a public domain for a real (Let's Encrypt) cert, or leave blank for plain HTTP: " tls_domain || tls_domain=""
+                if [ -n "$tls_domain" ]; then
+                    # TLS mode: only Caddy (443) is exposed off-host; the
+                    # stack itself stays on loopback.
+                    env_set MARCUS_BIND_HOST "127.0.0.1"
+                    env_set MARCUS_PUBLIC_DOMAIN "$tls_domain"
+                    acme_email=""
+                    read -r -p "  Email for Let's Encrypt (optional, press Enter to skip): " acme_email || acme_email=""
+                    env_set MARCUS_ACME_EMAIL "$acme_email"
+                    COMPOSE_FILES+=(-f docker-compose.tls.yml)
+                    log "HTTPS enabled via built-in Caddy proxy for https://${tls_domain}/ — Marcus/Kanboard/Gitea stay on loopback; only 443 is exposed."
+                    log "Requires DNS for ${tls_domain} to point at this host and ports 80+443 reachable from the internet."
+                else
+                    env_set MARCUS_BIND_HOST "0.0.0.0"
+                    log "Plain HTTP on all interfaces. Marcus is protected by the bearer token, but the token travels UNENCRYPTED —"
+                    log "put the stack behind a VPN/tunnel (Tailscale, WireGuard, Cloudflare Tunnel), or re-run and provide a domain for HTTPS."
+                    log "Kanboard/Gitea also use default credentials — change them before real use."
+                fi
                 ;;
             *)
                 env_set MARCUS_BIND_HOST "127.0.0.1"
-                log "Marcus, Kanboard, and Gitea will only be reachable from this machine (127.0.0.1)."
+                log "Marcus, Kanboard, and Gitea will only be reachable from this machine (127.0.0.1). No agent token needed for local-only use."
                 ;;
         esac
     else
@@ -192,10 +222,15 @@ if [ -z "$(env_get MARCUS_BIND_HOST)" ]; then
         # to the network without the operator explicitly opting in.
         env_set MARCUS_BIND_HOST "127.0.0.1"
         log "No terminal available to ask — defaulting to localhost-only access (127.0.0.1)."
-        log "Set MARCUS_BIND_HOST=0.0.0.0 in .env before re-running to allow remote agents instead."
+        log "To allow remote agents: set MARCUS_BIND_HOST=0.0.0.0 and MARCUS_AGENT_TOKEN=\$(openssl rand -hex 32) in .env before re-running."
     fi
 else
     log "MARCUS_BIND_HOST=$(env_get MARCUS_BIND_HOST) already set in .env — leaving it as-is."
+    # Honor a pre-existing TLS choice on re-runs.
+    if [ -n "$(env_get MARCUS_PUBLIC_DOMAIN)" ]; then
+        COMPOSE_FILES+=(-f docker-compose.tls.yml)
+        log "MARCUS_PUBLIC_DOMAIN set — including the HTTPS (Caddy) overlay."
+    fi
 fi
 
 # ---------------------------------------------------------------------
@@ -307,9 +342,15 @@ fi
 # ---------------------------------------------------------------------
 
 log "Building and starting Marcus..."
-if ! docker compose up -d --build --wait --wait-timeout 60 marcus; then
-    err "Marcus did not become healthy in time — most likely a KANBOARD_API_TOKEN mismatch, or a missing ~/.claude.json / ~/.claude/.credentials.json for the claude_subscription provider."
-    docker compose logs marcus --tail=50 || true
+# Start marcus (always) plus caddy (only when the TLS overlay is active —
+# MARCUS_PUBLIC_DOMAIN set adds -f docker-compose.tls.yml to COMPOSE_FILES).
+start_services=(marcus)
+if [ -n "$(env_get MARCUS_PUBLIC_DOMAIN)" ]; then
+    start_services+=(caddy)
+fi
+if ! docker compose "${COMPOSE_FILES[@]}" up -d --build --wait --wait-timeout 90 "${start_services[@]}"; then
+    err "Marcus (or the TLS proxy) did not become healthy in time — most likely a KANBOARD_API_TOKEN mismatch, a missing ~/.claude.json / ~/.claude/.credentials.json for the claude_subscription provider, or (TLS) DNS/ports for MARCUS_PUBLIC_DOMAIN not yet reachable."
+    docker compose "${COMPOSE_FILES[@]}" logs "${start_services[@]}" --tail=50 || true
     exit 1
 fi
 
@@ -324,6 +365,14 @@ echo "======================================================================"
 host_port="$(env_get MARCUS_PORT)"
 host_port="${host_port:-4298}"
 
+# Bearer-token suffix for the connect command, when a token is configured.
+agent_token="$(env_get MARCUS_AGENT_TOKEN)"
+auth_flag=""
+if [ -n "$agent_token" ]; then
+    auth_flag=" \\
+     -H \"Authorization: Bearer ${agent_token}\""
+fi
+
 echo " Kanboard:  http://localhost:8080   (admin / admin)"
 echo " Gitea:     http://localhost:3000   (root / $(env_get GITEA_ADMIN_PASSWORD))"
 echo " Marcus:    http://localhost:${host_port}/mcp"
@@ -331,37 +380,45 @@ echo
 echo " Kanboard project: $(env_get KANBOARD_PROJECT_NAME) (id $(env_get KANBOARD_PROJECT_ID))"
 echo " Webhook:   configured — board changes reach Marcus instantly."
 echo " AI provider: $(env_get MARCUS_AI_PROVIDER) (Marcus's own decomposition/analysis calls)"
+if [ -n "$agent_token" ]; then
+    echo " Agent auth: REQUIRED — connecting agents must pass the bearer token below."
+else
+    echo " Agent auth: none (localhost-only). Set MARCUS_AGENT_TOKEN before exposing remotely."
+fi
 echo
 echo " Connect an AI agent from this machine:"
-echo "   claude mcp add --transport http marcus http://localhost:${host_port}/mcp"
+echo "   claude mcp add --transport http marcus http://localhost:${host_port}/mcp${auth_flag}"
 echo
 
 bind_host="$(env_get MARCUS_BIND_HOST)"
-case "$bind_host" in
-    127.0.0.1|localhost|"")
-        # Loopback-only (also the effective default when unset — compose
-        # substitutes 127.0.0.1).
-        echo " Remote access: DISABLED — Marcus only accepts connections from this machine."
-        echo " To allow AI agents on other machines to connect, set MARCUS_BIND_HOST=0.0.0.0"
-        echo " in .env and re-run: docker compose up -d --build marcus"
-        ;;
-    0.0.0.0)
-        echo " Remote access: ENABLED (all interfaces) — reachable from other machines on"
-        echo " port ${host_port} once your firewall/network allows it. From another machine:"
-        echo "   claude mcp add --transport http marcus http://<this-machine's-address>:${host_port}/mcp"
-        ;;
-    *)
-        # A specific interface IP — reachable from other machines via that
-        # address, but NOT via localhost, so the "from this machine" line
-        # above may not apply.
-        echo " Remote access: ENABLED (bound to ${bind_host}) — reachable from other machines"
-        echo " at that address on port ${host_port} once your firewall/network allows it:"
-        echo "   claude mcp add --transport http marcus http://${bind_host}:${host_port}/mcp"
-        echo " (Note: bound to ${bind_host}, so the http://localhost line above won't work"
-        echo "  unless ${bind_host} is a local address.)"
-        ;;
-esac
+tls_domain="$(env_get MARCUS_PUBLIC_DOMAIN)"
+if [ -n "$tls_domain" ]; then
+    echo " Remote access: ENABLED over HTTPS via built-in proxy (https://${tls_domain}/)."
+    echo " The stack itself stays on loopback; only the proxy's 443 is exposed. From another machine:"
+    echo "   claude mcp add --transport http marcus https://${tls_domain}/mcp${auth_flag}"
+    echo " (A real cert requires DNS for ${tls_domain} → this host and ports 80+443 open. Give"
+    echo "  Caddy a minute on first run to obtain the certificate.)"
+else
+    case "$bind_host" in
+        127.0.0.1|localhost|"")
+            echo " Remote access: DISABLED — the stack only accepts connections from this machine."
+            echo " To allow other machines, re-run setup and answer yes (or set MARCUS_BIND_HOST=0.0.0.0"
+            echo " and MARCUS_AGENT_TOKEN in .env, then: docker compose up -d --build)."
+            ;;
+        *)
+            conn_host="$bind_host"
+            [ "$conn_host" = "0.0.0.0" ] && conn_host="<this-machine's-address>"
+            echo " Remote access: ENABLED over plain HTTP (bound to ${bind_host}) — the bearer token"
+            echo " authenticates agents but is sent UNENCRYPTED; use a VPN/tunnel, or re-run for HTTPS."
+            echo " From another machine:"
+            echo "   claude mcp add --transport http marcus http://${conn_host}:${host_port}/mcp${auth_flag}"
+            ;;
+    esac
+fi
 echo
 echo " Save the Gitea admin password above if you plan to log in manually —"
 echo " it won't be printed again (it's also in .env, which is git-ignored)."
+if [ -n "$agent_token" ]; then
+    echo " The agent token is stored in .env (git-ignored). Anyone with it can drive the board."
+fi
 echo "======================================================================"

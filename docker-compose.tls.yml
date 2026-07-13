@@ -1,0 +1,61 @@
+# docker-compose.tls.yml — optional HTTPS reverse-proxy overlay.
+#
+# Adds a Caddy container that terminates TLS in front of Marcus, so remote
+# AI agents connect over https:// instead of plain http://. Use it TOGETHER
+# with the base file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d
+#
+# (scripts/setup.sh does this for you when you choose the HTTPS option.)
+#
+# Two certificate modes, chosen by whether MARCUS_PUBLIC_DOMAIN is set:
+#
+#   * Public domain (recommended for real use):
+#       MARCUS_PUBLIC_DOMAIN=marcus.example.com  MARCUS_ACME_EMAIL=you@example.com
+#     Caddy automatically obtains and renews a real, browser-trusted
+#     Let's Encrypt certificate. Requires the domain's DNS to point at this
+#     host and ports 80+443 reachable from the internet.
+#
+#   * No domain (testing only):
+#     Caddy serves its own internal self-signed certificate. Agents will
+#     reject it unless they trust Caddy's local CA — so this is for local
+#     testing, not real remote agents. For real remote use, either set a
+#     public domain above, or keep plain HTTP and put the stack behind a
+#     VPN/tunnel (Tailscale, WireGuard, Cloudflare Tunnel). Marcus's bearer
+#     token (MARCUS_AGENT_TOKEN) is the actual access control either way.
+#
+# Marcus itself stays on the internal compose network (not host-published)
+# in this mode — set MARCUS_BIND_HOST=127.0.0.1 so only Caddy's 443 is
+# exposed to other machines. The bearer-token check still runs inside
+# Marcus, so even an attacker who reached it directly on the internal
+# network could not use it without the token.
+
+services:
+  caddy:
+    image: caddy:2
+    container_name: marcus-caddy
+    restart: unless-stopped
+    depends_on:
+      marcus:
+        condition: service_healthy
+    ports:
+      # Published on all interfaces so remote agents can reach it. This is
+      # the ONLY port exposed off-host in TLS mode; keep MARCUS_BIND_HOST
+      # at 127.0.0.1 so Marcus/Kanboard/Gitea stay internal.
+      - "80:80"
+      - "443:443"
+    environment:
+      # Consumed by Caddyfile below. Blank domain -> Caddy's internal
+      # self-signed CA (test only); a real domain -> Let's Encrypt.
+      MARCUS_PUBLIC_DOMAIN: "${MARCUS_PUBLIC_DOMAIN:-}"
+      MARCUS_ACME_EMAIL: "${MARCUS_ACME_EMAIL:-}"
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Persist issued certs so restarts don't re-request them (and don't
+      # hit Let's Encrypt rate limits).
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
