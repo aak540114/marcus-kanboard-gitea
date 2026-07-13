@@ -718,6 +718,25 @@ class MarcusConfig:
 
         # Validate AI settings
         if self.ai.enabled:
+            # Reject an unrecognized provider name up front, with a clear
+            # message. Without this, a typo (e.g. "anthorpic") passes
+            # validation and only surfaces much later as LLMAbstraction's
+            # generic "provider failed to initialize... check credentials"
+            # RuntimeError, which misleadingly blames credentials.
+            # "local" and "claude_subscription" are valid and need no
+            # credentials, so they have no per-provider branch below.
+            _known_providers = {
+                "anthropic",
+                "openai",
+                "cloud",
+                "local",
+                "claude_subscription",
+            }
+            if self.ai.provider not in _known_providers:
+                errors.append(
+                    f"AI provider '{self.ai.provider}' is not recognized. "
+                    f"Valid values: {', '.join(sorted(_known_providers))}."
+                )
             if self.ai.provider == "anthropic":
                 if not self.ai.anthropic_api_key:
                     errors.append(

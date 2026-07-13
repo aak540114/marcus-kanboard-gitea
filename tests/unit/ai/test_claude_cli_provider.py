@@ -180,7 +180,11 @@ class TestCallClaudeCli:
         assert "--tools" in args
         tools_idx = args.index("--tools")
         assert args[tools_idx + 1] == ""
-        assert "--dangerously-skip-permissions" in args
+        # Must NOT pass --dangerously-skip-permissions: the CLI refuses it
+        # under root/sudo, and Marcus's container runs as root — passing it
+        # made every call fail. `-p` + non-TTY stdout + `--tools ""` already
+        # covers the non-interactive/no-prompt requirement.
+        assert "--dangerously-skip-permissions" not in args
 
     @pytest.mark.asyncio
     async def test_subprocess_started_with_no_stdin_and_own_process_group(

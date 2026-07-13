@@ -33,7 +33,13 @@ services:
     container_name: marcus-kanboard
     restart: unless-stopped
     ports:
-      - "8080:80"
+      # Same MARCUS_BIND_HOST gate as the marcus service (default
+      # 127.0.0.1 = localhost-only): answering "no" to setup.sh's remote-
+      # access prompt must keep the WHOLE stack off the network, not just
+      # Marcus — Kanboard ships with well-known default creds (admin/admin)
+      # and holds the same project data, so leaving it on 0.0.0.0 while
+      # Marcus is localhost-only would defeat the point of choosing "no".
+      - "${MARCUS_BIND_HOST:-127.0.0.1}:8080:80"
     volumes:
       - kanboard_data:/var/www/app/data
       # Bind-mount the plugin from source so edits are immediately testable
@@ -70,8 +76,12 @@ services:
     container_name: marcus-gitea
     restart: unless-stopped
     ports:
-      - "3000:3000"
-      - "2222:22"
+      # Gated by MARCUS_BIND_HOST too (default 127.0.0.1) — same reasoning
+      # as the kanboard service: Gitea ships with a known default admin
+      # password (GITEA_ADMIN_PASSWORD, printed by setup.sh) and exposes
+      # both HTTP and SSH, so "no" must keep it localhost-only as well.
+      - "${MARCUS_BIND_HOST:-127.0.0.1}:3000:3000"
+      - "${MARCUS_BIND_HOST:-127.0.0.1}:2222:22"
     volumes:
       - gitea_data:/data
     environment:
@@ -130,12 +140,23 @@ services:
       # subscription, with no separate API key. Deliberately scoped to
       # just these two files (not the whole ~/.claude directory, which
       # also holds unrelated project session transcripts under
-      # ~/.claude/projects). ${HOME} must be set in the shell that runs
-      # `docker compose up` — scripts/setup.sh always has it; if you
-      # invoke compose directly from an environment without it, either
-      # export HOME or switch to MARCUS_AI_PROVIDER=anthropic.
-      - ${HOME}/.claude.json:/root/.claude.json
-      - ${HOME}/.claude/.credentials.json:/root/.claude/.credentials.json
+      # ~/.claude/projects). The `${HOME:?...}` form makes compose FAIL
+      # with that message if HOME is unset (e.g. a systemd/cron/CI
+      # invocation), rather than silently expanding to "/.claude.json"
+      # and mounting the wrong path — scripts/setup.sh always has HOME.
+      #
+      # These are the HOST's live credential files, mounted read-write
+      # because the CLI needs to refresh its own OAuth token. Two
+      # consequences worth knowing: (1) running interactive Claude Code on
+      # the host at the same time as Marcus shares one login — a token
+      # refresh on either side can momentarily invalidate the other; and
+      # (2) macOS keeps the login token in the Keychain, NOT in
+      # .credentials.json, so this mount does not carry it and the
+      # provider won't authenticate inside Docker on a Mac host (use
+      # CLAUDE_API_KEY / MARCUS_AI_PROVIDER=anthropic there). See README's
+      # "AI provider" section.
+      - ${HOME:?HOME must be set for the claude_subscription bind mounts; export HOME or set MARCUS_AI_PROVIDER=anthropic}/.claude.json:/root/.claude.json
+      - ${HOME:?HOME must be set for the claude_subscription bind mounts; export HOME or set MARCUS_AI_PROVIDER=anthropic}/.claude/.credentials.json:/root/.claude/.credentials.json
     environment:
       # Container-to-container URLs use Docker service names, not
       # localhost. Note Kanboard listens on port 80 *inside* the compose

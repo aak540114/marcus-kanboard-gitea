@@ -221,15 +221,18 @@ class ClaudeCliProvider(LocalLLMProvider):
             # string semantics. No tool access is needed or wanted here:
             # unlike the coding agents Runner mode spawns, these are pure
             # analysis calls with no file/Bash access.
+            #
+            # Deliberately NOT `--dangerously-skip-permissions`: the CLI
+            # refuses that flag when run as root/sudo ("cannot be used with
+            # root/sudo privileges for security reasons"), and Marcus's
+            # container runs as root — so passing it made every call fail.
+            # It's also unnecessary here: `-p` with a non-TTY stdout already
+            # skips the workspace-trust dialog (documented in `claude
+            # --help`), stdin is /dev/null below so nothing can block on a
+            # read, and `--tools ""` leaves no tool for a permission prompt
+            # to ask about.
             "--tools",
             "",
-            # Belt-and-suspenders against any interactive prompt (workspace
-            # trust, settings-validation dialog, etc.) hanging this fully
-            # non-interactive call: `-p` already skips the trust dialog
-            # when stdout isn't a TTY (documented in `claude --help`), and
-            # `--tools ""` leaves nothing for a permission prompt to ask
-            # about, but this closes the gap for any other prompt class.
-            "--dangerously-skip-permissions",
         ]
         if self.model:
             cmd += ["--model", self.model]

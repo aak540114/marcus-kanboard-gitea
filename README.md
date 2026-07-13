@@ -144,7 +144,13 @@ docker compose exec -u git gitea gitea admin user create \
 ```
 Then log in at http://localhost:3000 as `root` / `Marcus123!` → **Settings → Applications → Generate New Token** (scopes `write:repository`, `read:user`).
 
-**Configure and start Marcus** — put the values you just collected into `.env` (see `.env.example`, including `MARCUS_AI_PROVIDER`/`CLAUDE_API_KEY` — see [AI provider](#ai-provider) below). If using `MARCUS_AI_PROVIDER=claude_subscription`, make sure `~/.claude.json` and `~/.claude/.credentials.json` exist on this host first (`docker compose up` fails if a bind-mounted file is missing entirely — `./scripts/setup.sh` creates empty placeholders automatically, this manual path doesn't). Then:
+**Configure and start Marcus** — put the values you just collected into `.env` (see `.env.example`). You **must** set `MARCUS_AI_PROVIDER` explicitly on this manual path — `.env.example` ships it blank and Docker Compose defaults an unset value to `claude_subscription`, so if you meant to use an API key, set `MARCUS_AI_PROVIDER=anthropic` (and `CLAUDE_API_KEY=...`) — see [AI provider](#ai-provider).
+
+If you use `MARCUS_AI_PROVIDER=claude_subscription`, first make sure both `~/.claude.json` and `~/.claude/.credentials.json` **exist as files** on this host:
+```bash
+mkdir -p ~/.claude && [ -f ~/.claude.json ] || echo '{}' > ~/.claude.json && [ -f ~/.claude/.credentials.json ] || echo '{}' > ~/.claude/.credentials.json
+```
+This matters because Docker does **not** fail when a bind-mount source is missing — it silently creates a **root-owned directory** at that path, which would break both the container's `claude` CLI and your host's own Claude Code. (`./scripts/setup.sh` does this step for you.) Then:
 ```bash
 docker compose up -d --build marcus
 ```
@@ -165,12 +171,12 @@ This always works from the same machine Marcus runs on. Connecting from a **diff
 
 ## Network access
 
-`./scripts/setup.sh` asks once, interactively: **"Allow AI agents on OTHER machines to connect to Marcus?"** The answer is written to `.env` as `MARCUS_BIND_HOST` and controls which host interface Docker publishes Marcus's port on:
+`./scripts/setup.sh` asks once, interactively: **"Allow OTHER machines to reach this stack?"** The answer is written to `.env` as `MARCUS_BIND_HOST` and controls which host interface Docker publishes the ports on — for **all three** services (Marcus, Kanboard, and Gitea), so "no" genuinely means the whole stack stays on this machine:
 
 | Answer | `MARCUS_BIND_HOST` | Effect |
 |---|---|---|
-| No (default) | `127.0.0.1` | Marcus only accepts connections from this machine. Nothing changes about how you use it locally — this is the default for a reason: it's the safer choice, and it's what most local/single-machine setups want. |
-| Yes | `0.0.0.0` | Marcus's port is published on all interfaces, reachable from other machines once your firewall/network allows it. |
+| No (default) | `127.0.0.1` | Marcus, Kanboard, and Gitea only accept connections from this machine. Nothing changes about how you use it locally — this is the default for a reason: it's the safer choice, and it's what most local/single-machine setups want. |
+| Yes | `0.0.0.0` | All three services' ports are published on all interfaces, reachable from other machines once your firewall/network allows it. |
 
 Answering **Yes** is what a distributed setup needs — Marcus, Kanboard, and Gitea can each run on separate hosts (see [Independent deployment](#independent-deployment)), with AI agents on individual machines all connecting to Marcus's one MCP endpoint over the network:
 
@@ -178,9 +184,13 @@ Answering **Yes** is what a distributed setup needs — Marcus, Kanboard, and Gi
 claude mcp add --transport http marcus http://<this-machine's-address>:4298/mcp
 ```
 
-If there's no terminal to ask (e.g. running the script from CI), it defaults to **No** rather than guessing. To change your answer later, edit `MARCUS_BIND_HOST` in `.env` and run `docker compose up -d --build marcus` again — no need to re-run the whole setup script.
+If there's no terminal to ask (e.g. running the script from CI), it defaults to **No** rather than guessing. To change your answer later, edit `MARCUS_BIND_HOST` in `.env` and run `docker compose up -d` again — no need to re-run the whole setup script.
 
-Note this only gates the *port-level* reachability of Marcus's MCP endpoint; it doesn't add authentication in front of it. If you open it to other machines, treat it the same as any other unauthenticated network service — restrict it with a firewall/VPN/security group to just the hosts your AI agents actually run on, especially on a cloud VPS.
+> ⚠️ **Security — read before answering Yes.** `MARCUS_BIND_HOST` gates *port reachability only*; it adds **no authentication**. When exposed:
+> - **Marcus's HTTP endpoints are unauthenticated.** That includes state-mutating routes — anyone who can reach the port can flip a project from Human Gate to AI Gate (turning on unreviewed auto-merge), overwrite a project's description, or drive the full MCP task loop. Treat an exposed Marcus as giving full control of the board.
+> - **Kanboard and Gitea ship with well-known default credentials** (`admin`/`admin`; `root`/the `GITEA_ADMIN_PASSWORD` printed at the end of setup). Change these before exposing them.
+>
+> If you answer Yes, put the whole stack behind a firewall/VPN/security-group restricted to just the hosts your agents run on, and change the default passwords — especially on a cloud VPS. The `Access-Control-Allow-Origin: *` headers on Marcus's API also mean a malicious web page can reach a *localhost*-bound Marcus from your browser (CSRF), so this caution isn't only about the `0.0.0.0` case.
 
 ---
 
@@ -194,9 +204,14 @@ Marcus's own decomposition, dependency-inference, and effort-estimation calls ne
 2. **Otherwise, this machine has an authenticated `claude` CLI** (you've run `claude login` here — the same login Claude Code itself uses) → uses the `claude_subscription` provider. The script bind-mounts your `~/.claude.json` and `~/.claude/.credentials.json` into the `marcus` container (see `docker-compose.yml`), so `claude` CLI calls made *inside* the container ride the same Claude Pro/Max subscription, with no separate API key. Marcus's `Dockerfile` installs the `claude` CLI itself (Node.js + `npm install -g @anthropic-ai/claude-code`) for this.
 3. **Neither is available** → the script fails with instructions (`claude login`, or set `CLAUDE_API_KEY` yourself) instead of prompting interactively.
 
-You can also set `MARCUS_AI_PROVIDER` in `.env` yourself to override this — see `.env.example`.
+You can also set `MARCUS_AI_PROVIDER` in `.env` yourself to override this — an explicit value always wins over the auto-detection above — see `.env.example`.
 
-**Trade-offs of `claude_subscription`:** each call spawns a full `claude` CLI process inside the container (several seconds to tens of seconds, versus sub-second for a direct API call), and it shares your subscription's usage limits with any interactive Claude Code sessions on the same account. Sharing `~/.claude.json`/`~/.claude/.credentials.json` into the container also means the container can act as that login for `claude` CLI calls — reasonable for the local/demo use this stack targets (see the Gitea admin password note above), less so for a shared or internet-exposed host. If you'd rather not share host credentials at all, set `CLAUDE_API_KEY` in `.env` before running `./scripts/setup.sh` to use the `anthropic` provider instead.
+> ⚠️ **macOS hosts:** on macOS the `claude` CLI stores its login token in the **login Keychain**, not in `~/.claude/.credentials.json`. That file can't be shared into a Linux container, so `claude_subscription` will **not** authenticate inside Docker on a Mac host — every AI call fails. `setup.sh` detects macOS and warns you. On a Mac, use the API-key path instead: set `CLAUDE_API_KEY` in `.env` before running setup. (Linux hosts, where the token lives in the credentials file, are unaffected.)
+
+**Trade-offs of `claude_subscription`:**
+- Each call spawns a full `claude` CLI process inside the container (several seconds to tens of seconds, versus sub-second for a direct API call), and shares your subscription's usage limits with any interactive Claude Code sessions on the same account.
+- The container mounts your **live** `~/.claude.json` / `~/.claude/.credentials.json` read-write and acts as that login. Running interactive Claude Code on the host *at the same time* as Marcus means both share one login — an OAuth token refresh on either side can momentarily invalidate the other, so you may occasionally have to re-run `claude login`. Fine for the local/demo use this stack targets; think twice on a shared host.
+- If you'd rather not share host credentials at all, set `CLAUDE_API_KEY` in `.env` before running `./scripts/setup.sh` to use the `anthropic` provider instead.
 
 ---
 

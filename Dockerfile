@@ -25,11 +25,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # API key. docker-compose.yml bind-mounts the host's ~/.claude.json and
 # ~/.claude/.credentials.json into this image so the CLI here is
 # authenticated the same way the host's `claude login` already is.
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && rm -rf /var/lib/apt/lists/* \
-    && npm install -g @anthropic-ai/claude-code \
-    && npm cache clean --force
+#
+# CLAUDE_CLI_VERSION is PINNED deliberately: the provider hard-codes this
+# CLI's contract (the `-p`/`--output-format json`/`--tools ""` flags and
+# the exact `is_error`/`result`/`usage`/`session_id` JSON envelope it
+# parses). An unpinned `@latest` would let a future CLI release that
+# renames a flag or reshapes that envelope silently break every AI call
+# on the next rebuild, with no code change to explain it. Bump this
+# deliberately and re-verify the provider against the new CLI.
+ARG CLAUDE_CLI_VERSION=2.1.42
+# `bash -o pipefail` so a failure of the piped `curl` fails the RUN loudly
+# instead of being masked by the exit status of the downstream `bash`.
+RUN ["bash", "-o", "pipefail", "-c", "curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y --no-install-recommends nodejs && rm -rf /var/lib/apt/lists/* && npm install -g @anthropic-ai/claude-code@${CLAUDE_CLI_VERSION} && npm cache clean --force"]
 
 WORKDIR /app
 

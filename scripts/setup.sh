@@ -39,6 +39,20 @@ trap 'echo "[setup.sh] failed at line $LINENO — see the error above." >&2' ERR
 log()  { echo "==> $*"; }
 err()  { echo "error: $*" >&2; }
 
+# Return 0 iff this machine has a real, authenticated `claude` subscription
+# login. Deliberately checks for the `oauthAccount` key inside
+# ~/.claude.json (written only when logged into a subscription) rather than
+# just the file's existence — otherwise a bare `{}` placeholder (which this
+# script itself writes below so the container bind-mount source exists) or
+# an installed-but-never-logged-in CLI would falsely pass, and Marcus would
+# select claude_subscription and then fail every AI call at runtime.
+claude_login_present() {
+    command -v claude >/dev/null 2>&1 || return 1
+    [ -f "$HOME/.claude.json" ] || return 1
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("oauthAccount") else 1)' \
+        "$HOME/.claude.json" 2>/dev/null
+}
+
 # ---------------------------------------------------------------------
 # .env helpers — idempotent get/set against a simple KEY=VALUE file.
 # ---------------------------------------------------------------------
@@ -106,34 +120,48 @@ fi
 
 log "Selecting AI provider..."
 
-if [ -n "$(env_get CLAUDE_API_KEY)" ]; then
-    # An API key is already configured — respect that explicit choice
-    # rather than silently switching it to the subscription provider.
-    if [ -z "$(env_get MARCUS_AI_PROVIDER)" ]; then
-        env_set MARCUS_AI_PROVIDER "anthropic"
-    fi
-    log "CLAUDE_API_KEY found in .env — using the 'anthropic' provider."
-elif [ -z "$(env_get MARCUS_AI_PROVIDER)" ]; then
-    if command -v claude >/dev/null 2>&1 && [ -f "$HOME/.claude.json" ]; then
-        env_set MARCUS_AI_PROVIDER "claude_subscription"
-        log "Found a local 'claude' CLI login — using the 'claude_subscription' provider (your Claude Pro/Max subscription, no API key)."
-        log "If Marcus's AI calls fail later (check: docker compose logs marcus), it usually means this login isn't actually authenticated —"
-        log "run 'claude login' again, or set CLAUDE_API_KEY in .env and re-run this script to switch to the API-key provider instead."
-    else
-        err "No Claude API key configured and no local 'claude' CLI login found on this machine."
-        err "Either:"
-        err "  - run 'claude login' here, then re-run ./scripts/setup.sh, or"
-        err "  - set an API key yourself: echo 'CLAUDE_API_KEY=sk-ant-...' >> .env, then re-run ./scripts/setup.sh"
-        exit 1
-    fi
-else
+if [ -n "$(env_get MARCUS_AI_PROVIDER)" ]; then
+    # Explicit choice in .env always wins — never second-guess it.
     log "MARCUS_AI_PROVIDER=$(env_get MARCUS_AI_PROVIDER) already set in .env — leaving it as-is."
+elif [ -n "$(env_get CLAUDE_API_KEY)" ]; then
+    # An API key is configured but no provider chosen — use the metered
+    # API provider (the key's presence is the signal of intent).
+    env_set MARCUS_AI_PROVIDER "anthropic"
+    log "CLAUDE_API_KEY found in .env — using the 'anthropic' provider."
+elif claude_login_present; then
+    env_set MARCUS_AI_PROVIDER "claude_subscription"
+    log "Found an authenticated 'claude' CLI login — using the 'claude_subscription' provider (your Claude Pro/Max subscription, no API key)."
+    case "$(uname -s)" in
+        Darwin)
+            # On macOS the CLI keeps its OAuth token in the login Keychain,
+            # NOT in ~/.claude/.credentials.json — so the credential file
+            # bind-mounted into the (Linux) container is empty and the
+            # container's claude cannot authenticate. Warn loudly rather
+            # than let it fail silently at first AI call.
+            log "WARNING: on macOS the 'claude' login token lives in the Keychain, which cannot be shared into a Linux container."
+            log "         The claude_subscription provider will most likely FAIL inside Docker on this host. If Marcus's AI"
+            log "         calls error out (docker compose logs marcus), set CLAUDE_API_KEY in .env and re-run to use the API provider."
+            ;;
+    esac
+else
+    err "No Claude API key configured and no authenticated 'claude' CLI login found on this machine."
+    err "Either:"
+    err "  - run 'claude login' here, then re-run ./scripts/setup.sh, or"
+    err "  - set an API key yourself: echo 'CLAUDE_API_KEY=sk-ant-...' >> .env, then re-run ./scripts/setup.sh"
+    exit 1
 fi
 
 # The claude-credential bind-mount sources in docker-compose.yml must
-# exist even when unused (MARCUS_AI_PROVIDER=anthropic) — `docker compose
-# up` fails outright if a file bind-mount's host source path is missing.
-# Never overwrites a real login if one is already there.
+# exist on the host, because Docker Compose *silently creates a
+# root-owned directory* at a bind-mount source path that doesn't exist
+# (it does NOT fail) — and a directory where claude expects its config
+# file would break both the container's CLI and the host's own Claude
+# Code. Pre-create them as empty files so the mount binds a real file.
+# Never overwrites a real login if one is already there. NOTE: an empty
+# `{}` here is only a placeholder to satisfy the mount; the
+# claude_login_present() check above deliberately ignores `{}` so a
+# leftover placeholder from a prior run can never be mistaken for a real
+# login on a re-run.
 mkdir -p "$HOME/.claude"
 [ -f "$HOME/.claude.json" ] || echo '{}' > "$HOME/.claude.json"
 [ -f "$HOME/.claude/.credentials.json" ] || echo '{}' > "$HOME/.claude/.credentials.json"
@@ -142,15 +170,20 @@ log "Configuring network access..."
 
 if [ -z "$(env_get MARCUS_BIND_HOST)" ]; then
     if [ -t 0 ]; then
-        read -r -p "Allow AI agents on OTHER machines (e.g. a remote VPS) to connect to Marcus? [y/N]: " allow_remote
+        # `|| allow_remote=""` so a Ctrl-D (EOF) at the prompt falls
+        # through to the safe "No" default instead of returning non-zero
+        # and aborting the whole script under `set -e`.
+        allow_remote=""
+        read -r -p "Allow OTHER machines (e.g. a remote VPS, agents on other hosts) to reach this stack? [y/N]: " allow_remote || allow_remote=""
         case "$allow_remote" in
             [yY]|[yY][eE][sS])
                 env_set MARCUS_BIND_HOST "0.0.0.0"
-                log "Marcus's port will be published on all interfaces — reachable from other machines once your firewall/network allows it."
+                log "Marcus, Kanboard, and Gitea ports will be published on all interfaces — reachable from other machines once your firewall/network allows it."
+                log "SECURITY: Marcus's HTTP endpoints are UNAUTHENTICATED and Kanboard/Gitea use default credentials — put a firewall/VPN in front and change those passwords before real use."
                 ;;
             *)
                 env_set MARCUS_BIND_HOST "127.0.0.1"
-                log "Marcus's port will only be reachable from this machine (127.0.0.1)."
+                log "Marcus, Kanboard, and Gitea will only be reachable from this machine (127.0.0.1)."
                 ;;
         esac
     else
@@ -304,15 +337,30 @@ echo "   claude mcp add --transport http marcus http://localhost:${host_port}/mc
 echo
 
 bind_host="$(env_get MARCUS_BIND_HOST)"
-if [ "$bind_host" = "0.0.0.0" ]; then
-    echo " Remote access: ENABLED — reachable from other machines on port ${host_port}"
-    echo " once your firewall/network allows it. Connect an AI agent from another machine:"
-    echo "   claude mcp add --transport http marcus http://<this-machine's-address>:${host_port}/mcp"
-else
-    echo " Remote access: DISABLED — Marcus only accepts connections from this machine."
-    echo " To allow AI agents on other machines to connect, set MARCUS_BIND_HOST=0.0.0.0"
-    echo " in .env and re-run: docker compose up -d --build marcus"
-fi
+case "$bind_host" in
+    127.0.0.1|localhost|"")
+        # Loopback-only (also the effective default when unset — compose
+        # substitutes 127.0.0.1).
+        echo " Remote access: DISABLED — Marcus only accepts connections from this machine."
+        echo " To allow AI agents on other machines to connect, set MARCUS_BIND_HOST=0.0.0.0"
+        echo " in .env and re-run: docker compose up -d --build marcus"
+        ;;
+    0.0.0.0)
+        echo " Remote access: ENABLED (all interfaces) — reachable from other machines on"
+        echo " port ${host_port} once your firewall/network allows it. From another machine:"
+        echo "   claude mcp add --transport http marcus http://<this-machine's-address>:${host_port}/mcp"
+        ;;
+    *)
+        # A specific interface IP — reachable from other machines via that
+        # address, but NOT via localhost, so the "from this machine" line
+        # above may not apply.
+        echo " Remote access: ENABLED (bound to ${bind_host}) — reachable from other machines"
+        echo " at that address on port ${host_port} once your firewall/network allows it:"
+        echo "   claude mcp add --transport http marcus http://${bind_host}:${host_port}/mcp"
+        echo " (Note: bound to ${bind_host}, so the http://localhost line above won't work"
+        echo "  unless ${bind_host} is a local address.)"
+        ;;
+esac
 echo
 echo " Save the Gitea admin password above if you plan to log in manually —"
 echo " it won't be printed again (it's also in .env, which is git-ignored)."

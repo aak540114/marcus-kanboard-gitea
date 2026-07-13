@@ -246,6 +246,47 @@ class TestMarcusConfigValidation:
         # Should not raise even without API key
         config.validate()
 
+    def test_validation_passes_for_claude_subscription_without_credentials(
+        self, tmp_path: Path
+    ) -> None:
+        """claude_subscription needs no API key (it uses a local CLI login),
+        so validation must accept it with no credentials configured."""
+        config_file = tmp_path / "test_config.json"
+        config_data = {
+            "ai": {"provider": "claude_subscription"},
+            "kanban": {
+                "provider": "planka",
+                "planka_base_url": "http://localhost:3333",
+                "planka_email": "test@test.com",
+                "planka_password": "testpass",  # pragma: allowlist secret
+            },
+        }
+        with open(config_file, "w") as f:
+            json.dump(config_data, f)
+
+        config = MarcusConfig.from_file(str(config_file))
+        config.validate()  # must not raise
+
+    def test_validation_fails_for_unknown_provider(self, tmp_path: Path) -> None:
+        """A typo'd/unrecognized provider must be rejected up front with a
+        clear message, not pass validation and fail cryptically later."""
+        config_file = tmp_path / "test_config.json"
+        config_data = {
+            "ai": {"provider": "anthorpic"},  # typo of "anthropic"
+            "kanban": {
+                "provider": "planka",
+                "planka_base_url": "http://localhost:3333",
+                "planka_email": "test@test.com",
+                "planka_password": "testpass",  # pragma: allowlist secret
+            },
+        }
+        with open(config_file, "w") as f:
+            json.dump(config_data, f)
+
+        config = MarcusConfig.from_file(str(config_file))
+        with pytest.raises(ValueError, match="not recognized"):
+            config.validate()
+
     def test_validation_creates_directories(self, tmp_path: Path) -> None:
         """Test that validation creates data and cache directories."""
         config_file = tmp_path / "test_config.json"
