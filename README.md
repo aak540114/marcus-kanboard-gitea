@@ -11,9 +11,9 @@ A production deployment of **[Marcus](https://github.com/lwgray/marcus)** — th
 | Feature | Description |
 |---|---|
 | **Kanboard provider** | Full Kanboard JSON-RPC integration — tickets, columns, comments, assignments |
-| **Gitea integration** | `GiteaManager` + `ProjectSyncWorkflow` (`src/integrations/gitea_manager.py`, `src/workflows/project_sync_workflow.py`) can auto-create a Gitea repo per Kanboard project and push branches per ticket — the classes are complete and tested, but not yet instantiated by the running server (`src/marcus_mcp/server.py`), so this doesn't fire automatically today. Tracked as follow-up work. |
+| **Gitea integration** | `GiteaManager` + `ProjectSyncWorkflow` (`src/integrations/gitea_manager.py`, `src/workflows/project_sync_workflow.py`) auto-create a Gitea repo the first time an agent calls `get_work_context` for a ticket whose project doesn't have one yet — no manual repo setup. |
 | **MarcusDevEnv plugin** | Kanboard plugin that adds AI-aware UI to every board and task |
-| **Hot-reload dev environments** | One-click per-ticket preview URL; supports any language/framework via project description |
+| **Hot-reload dev environments** | One-click per-ticket preview URL; supports any language/framework via project description. Refreshes **instantly** on every `git push` to the ticket branch via a Gitea webhook (`/webhooks/gitea`) — no polling, no manual webhook setup. A global "Max dev environments" setting caps how many preview containers can run at once. |
 | **Project Description system** | Per-project markdown doc (tech stack, architecture notes) that AI agents read via the `get_project_description` MCP tool; editable from the board |
 | **Enriched ticket context** | `get_work_context` — the first call every agent makes — also returns priority, labels, due date, estimated hours, dependency links (`depends_on`/`blocks`/`relates_to`), and the ticket's last 10 comments, so a human's reply to a paused ticket is actually visible to the agent |
 | **Human Gate / AI Gate toggle** | Per-project and per-ticket control over whether humans review AI work before it merges |
@@ -49,6 +49,7 @@ The plugin ships in `kanboard/plugins/MarcusDevEnv/` and is automatically active
 | **Project Description button** | Opens the Marcus-served project description page for this project — the AI agents' shared source of truth for language, framework, and architecture. |
 | **Human Gate / AI Gate toggle** | Sets the project-level gate mode. Human Gate (default): AI pauses for human review before done. AI Gate: AI merges and closes autonomously. |
 | **AI Verify counter** | Appears when AI Gate is active. `[−] N [+]` sets how many sequential LLM review rounds run before the branch auto-merges. 0 = disabled. |
+| **Max dev environments counter** | Global, always visible. `[−] N [+]` caps how many "Open Dev Environment" Docker containers can run at once across every ticket — `∞` (default) means unlimited. Once the limit is reached, starting a new one fails until an existing one is stopped. |
 
 ### Task sidebar
 | Panel | What it does |
@@ -323,15 +324,17 @@ AI Verify adds an independent LLM code-review step to the AI Gate auto-merge pat
 
 ## HTTP endpoints
 
-When `MARCUS_AGENT_TOKEN` is set (automatic once you allow remote access — see [Authenticating remote agents](#authenticating-remote-agents)), **every** endpoint below except `/webhooks/kanboard` requires an `Authorization: Bearer <token>` header and returns `401` without it. `/webhooks/kanboard` authenticates separately with its own `?token=` secret that Kanboard sends. With no token set (localhost-only default), all endpoints are open.
+When `MARCUS_AGENT_TOKEN` is set (automatic once you allow remote access — see [Authenticating remote agents](#authenticating-remote-agents)), **every** endpoint below except `/webhooks/kanboard` and `/webhooks/gitea` requires an `Authorization: Bearer <token>` header and returns `401` without it. Those two webhook routes authenticate separately (their own `?token=` / HMAC signature). With no token set (localhost-only default), all endpoints are open.
 
 | Endpoint | Method | Purpose |
 |---|---|---|
 | `/mcp` | GET/POST | MCP protocol — all AI agent tooling |
 | `/webhooks/kanboard` | POST | Receives Kanboard push webhooks (own `?token=` auth) |
+| `/webhooks/gitea` | POST | Receives Gitea push webhooks, triggers an instant dev-env refresh (own `X-Gitea-Signature` HMAC auth — see [Hot-reload dev environments](#hot-reload-dev-environments)) |
 | `/dev-env/view?ticket_id=<id>&project_id=<id>` | GET | Starts hot-reload dev environment, redirects to preview URL |
 | `/dev-env/stop?ticket_id=<id>` | POST | Tears down a running dev environment |
 | `/api/dev-env/status?ticket_id=<id>` | GET | Returns `{running, url}` for a ticket's dev environment |
+| `/api/dev-env-setting` | GET/PUT | Global `max_parallel_containers` limit (`null` = unlimited) — see [Hot-reload dev environments](#hot-reload-dev-environments) |
 | `/api/active-agents` | GET | All tickets currently claimed by an AI agent |
 | `/api/ticket-links?ticket_id=<id>` | GET | Dependency graph split into `depends_on`, `blocks`, `relates_to` |
 | `/project-description?project_id=<id>` | GET | Editable project description page |
@@ -339,6 +342,14 @@ When `MARCUS_AGENT_TOKEN` is set (automatic once you allow remote access — see
 | `/api/gate-setting?project_id=<id>[&ticket_id=<id>]` | GET | Current gate + verify settings; returns `project_gate`, `ticket_gate`, `effective`, `project_verify_count`, `ticket_verify_count`, `effective_verify_count` |
 | `/api/gate-setting/project` | PUT | Set project-level gate (`human`\|`ai`) and/or `verify_count` (int ≥ 0) |
 | `/api/gate-setting/ticket` | PUT | Set per-ticket gate override (`human`\|`ai`\|`null`) and/or `verify_count` (int ≥ 0 or `null` to inherit) |
+
+### Hot-reload dev environments
+
+Clicking **Open** in a ticket's **Marcus Dev Environment** panel (or visiting `/dev-env/view?ticket_id=<id>&project_id=<id>`) starts a Docker container running that ticket's branch, with hot reload, and redirects your browser to it. Marcus spawns this as a *sibling* container on the host — not nested inside its own container — via a `/var/run/docker.sock` mount (Docker-outside-of-Docker; see `docker-compose.yml`'s `marcus.volumes` comment for the security tradeoff this implies).
+
+**Instant refresh, no polling:** every dev-env container's code directory is the same host path Marcus and the agent both operate on. The first time an agent asks for a ticket's work context, Marcus auto-creates that project's Gitea repo *and* a push webhook (`GiteaManager.create_webhook`, signed with `GITEA_WEBHOOK_TOKEN`) — zero manual clicks in Gitea's UI. From then on, every `git push` to the ticket branch POSTs to `/webhooks/gitea`, which runs `git fetch && git reset --hard` inside the running container. The container's own file-watcher (inotify restart loop, or the stack's native hot-module-reload for Node/Vite, cargo-watch, air) picks up the change automatically — the same mechanism as if you'd run `git pull` and the dev server noticed on its own.
+
+**Resource limit:** the board header's "Max dev environments" `[−] N [+]` counter (backed by `/api/dev-env-setting`) caps how many of these containers can run at once, globally. Once the limit is hit, `/dev-env/view` returns an error until an existing environment is stopped — `∞` (the default) means no limit.
 
 ---
 
