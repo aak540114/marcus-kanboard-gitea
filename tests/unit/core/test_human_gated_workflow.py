@@ -467,6 +467,169 @@ class TestGetWorkContext:
 
 
 # ---------------------------------------------------------------------------
+# get_work_context: enriched ticket data (priority/labels/due_date/
+# estimated_hours/links/recent_comments)
+# ---------------------------------------------------------------------------
+
+
+def _make_task_mock(
+    priority=None, labels=None, due_date=None, estimated_hours=None
+):
+    """Build a minimal Task-like mock carrying only the fields
+    get_work_context reads for the enrichment fields."""
+    task = MagicMock()
+    task.name = "Enriched ticket"
+    task.description = "desc"
+    task.source_context = {"kanboard_task": {"project_id": 9}}
+    task.priority = priority
+    task.labels = labels or []
+    task.due_date = due_date
+    task.estimated_hours = estimated_hours
+    return task
+
+
+class TestGetWorkContextEnrichedFields:
+    """get_work_context surfaces priority/labels/due_date/estimated_hours
+    (already parsed onto the Task by the provider) and links/comments
+    (fetched via optional provider methods), instead of discarding them."""
+
+    @pytest.mark.asyncio
+    async def test_priority_and_labels_surfaced(self, workflow, lifecycle, mock_kanban):
+        lifecycle.get_or_create("60", "kanboard")
+        from src.core.models import Priority
+
+        mock_kanban.get_task_by_id = AsyncMock(
+            return_value=_make_task_mock(
+                priority=Priority.HIGH, labels=["backend", "urgent"]
+            )
+        )
+        ctx = await workflow.get_work_context("60")
+        assert ctx["priority"] == "high"
+        assert ctx["labels"] == ["backend", "urgent"]
+
+    @pytest.mark.asyncio
+    async def test_due_date_serialized_to_iso_string(self, workflow, lifecycle, mock_kanban):
+        from datetime import datetime, timezone
+
+        lifecycle.get_or_create("61", "kanboard")
+        due = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        mock_kanban.get_task_by_id = AsyncMock(
+            return_value=_make_task_mock(due_date=due)
+        )
+        ctx = await workflow.get_work_context("61")
+        assert ctx["due_date"] == due.isoformat()
+
+    @pytest.mark.asyncio
+    async def test_missing_priority_and_due_date_are_none(self, workflow, lifecycle, mock_kanban):
+        lifecycle.get_or_create("62", "kanboard")
+        mock_kanban.get_task_by_id = AsyncMock(return_value=_make_task_mock())
+        ctx = await workflow.get_work_context("62")
+        assert ctx["priority"] is None
+        assert ctx["due_date"] is None
+        assert ctx["labels"] == []
+        assert ctx["estimated_hours"] is None
+
+    @pytest.mark.asyncio
+    async def test_links_fetched_when_kanban_supports_it(self, workflow, lifecycle, mock_kanban):
+        lifecycle.get_or_create("63", "kanboard")
+        mock_kanban.get_task_by_id = AsyncMock(return_value=_make_task_mock())
+        expected_links = {
+            "depends_on": [{"task_id": "1", "title": "x", "column": "Done"}],
+            "blocks": [],
+            "relates_to": [],
+        }
+        mock_kanban.get_task_links = AsyncMock(return_value=expected_links)
+        ctx = await workflow.get_work_context("63")
+        assert ctx["links"] == expected_links
+
+    @pytest.mark.asyncio
+    async def test_links_empty_when_provider_lacks_support(self, workflow, lifecycle):
+        """A provider that genuinely doesn't implement get_task_links (e.g.
+        a non-Kanboard KanbanInterface) must not crash get_work_context —
+        links/comments just default to empty."""
+        lifecycle.get_or_create("64", "kanboard")
+        limited_kanban = MagicMock(spec=["get_task_by_id"])
+        limited_kanban.get_task_by_id = AsyncMock(return_value=_make_task_mock())
+        workflow._kanban = limited_kanban
+        ctx = await workflow.get_work_context("64")
+        assert ctx["links"] == {"depends_on": [], "blocks": [], "relates_to": []}
+        assert ctx["recent_comments"] == []
+
+    @pytest.mark.asyncio
+    async def test_recent_comments_capped_at_ten(self, workflow, lifecycle, mock_kanban):
+        lifecycle.get_or_create("65", "kanboard")
+        mock_kanban.get_task_by_id = AsyncMock(return_value=_make_task_mock())
+        all_comments = [
+            {"content": f"c{i}", "author": "alice", "date": i} for i in range(15)
+        ]
+        mock_kanban.get_comments = AsyncMock(return_value=all_comments)
+        ctx = await workflow.get_work_context("65")
+        assert ctx["recent_comments"] == all_comments[-10:]
+        assert len(ctx["recent_comments"]) == 10
+
+
+# ---------------------------------------------------------------------------
+# get_project_description
+# ---------------------------------------------------------------------------
+
+
+class TestGetProjectDescription:
+    """get_project_description resolves the ticket's project and returns
+    its description document + parsed tech stack."""
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_ticket_has_no_project_id(
+        self, workflow, mock_kanban
+    ):
+        mock_kanban.get_task_by_id = AsyncMock(return_value=None)
+        result = await workflow.get_project_description("70")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_description_and_stack(self, workflow, mock_kanban):
+        mock_kanban.get_task_by_id = AsyncMock(
+            return_value=_make_task_mock()
+        )
+        from src.core.project_description import ProjectStack
+
+        fake_stack = ProjectStack(
+            language="python", framework="fastapi", install_cmd="pip install -r requirements.txt", dev_cmd="uvicorn main:app"
+        )
+        with patch(
+            "src.core.project_description.ProjectDescriptionManager"
+        ) as MockMgr:
+            instance = MockMgr.return_value
+            instance.get_description.return_value = "# My Project\n..."
+            instance.get_stack.return_value = fake_stack
+            result = await workflow.get_project_description("71")
+
+        assert result == {
+            "project_id": 9,
+            "description": "# My Project\n...",
+            "stack": {
+                "language": "python",
+                "framework": "fastapi",
+                "install_cmd": "pip install -r requirements.txt",
+                "dev_cmd": "uvicorn main:app",
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_stack_is_none_when_unparseable(self, workflow, mock_kanban):
+        mock_kanban.get_task_by_id = AsyncMock(return_value=_make_task_mock())
+        with patch(
+            "src.core.project_description.ProjectDescriptionManager"
+        ) as MockMgr:
+            instance = MockMgr.return_value
+            instance.get_description.return_value = "empty doc"
+            instance.get_stack.return_value = None
+            result = await workflow.get_project_description("72")
+
+        assert result["stack"] is None
+        assert result["description"] == "empty doc"
+
+
+# ---------------------------------------------------------------------------
 # _is_unassigned helper
 # ---------------------------------------------------------------------------
 

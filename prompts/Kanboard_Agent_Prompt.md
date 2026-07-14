@@ -64,8 +64,28 @@ The response contains:
 | `local_repo_path` | Absolute path to the git repo on disk |
 | `gitea_repo_url` | Gitea remote URL (for reference) |
 | `state` | Should be `in_progress` — if not, do not proceed |
+| `priority` | `low` / `medium` / `high` / `urgent`, or `null` if unset |
+| `labels` | Kanboard tags on the ticket, e.g. `["backend", "urgent"]` |
+| `due_date` | ISO 8601 timestamp, or `null` |
+| `estimated_hours` | Time estimate from Kanboard, or `null` |
+| `links` | `{depends_on, blocks, relates_to}` — other tickets this one is connected to. Check `depends_on` before starting: those tickets should be done first |
+| `recent_comments` | Up to the last 10 comments on the ticket, oldest first — `{content, author, date}`. **Read this if the ticket was ever sent to `signal_waiting_for_human`** — a human's reply here is the only place their clarification text appears |
 | `mcp_server_url` | MCP endpoint (already connected) |
 | `instructions` | Step-by-step checklist |
+
+If you need more than per-ticket context — the project's tech stack, install/dev-server commands, or architecture notes — call `get_project_description` with the same `ticket_id`/`provider`:
+
+```json
+{
+  "tool": "get_project_description",
+  "arguments": {
+    "ticket_id": "<YOUR_TICKET_ID>",
+    "provider": "kanboard"
+  }
+}
+```
+
+It returns `{project_id, description, stack}`, where `stack` is `{language, framework, install_cmd, dev_cmd}` (or `null` if the project description doesn't have enough structure to parse yet).
 
 ---
 
@@ -175,6 +195,7 @@ will receive the updated context on your next poll.
 | Tool | When to call it |
 |---|---|
 | `get_work_context` | **First call.** Get ticket + repo + branch context |
+| `get_project_description` | Project-wide tech stack / context, if the ticket alone isn't enough |
 | `post_ticket_progress` | At 25 / 50 / 75 / 100 % completion |
 | `signal_ready_for_review` | Implementation complete, push done |
 | `signal_waiting_for_human` | Need human input to continue |

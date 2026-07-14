@@ -898,6 +898,10 @@ class HumanGatedWorkflow:
         title = ticket_id
         description = ""
         kanboard_project_id: Optional[int] = None
+        priority: Optional[str] = None
+        labels: List[str] = []
+        due_date: Optional[str] = None
+        estimated_hours: Optional[float] = None
         try:
             task = await self._kanban.get_task_by_id(ticket_id)
             if task:
@@ -908,8 +912,39 @@ class HumanGatedWorkflow:
                 project_id_raw = raw.get("project_id")
                 if project_id_raw:
                     kanboard_project_id = int(project_id_raw)
+                # Already parsed onto the Task object by the provider — no
+                # extra API calls needed to surface these to the agent.
+                priority = task.priority.value if task.priority else None
+                labels = task.labels or []
+                due_date = task.due_date.isoformat() if task.due_date else None
+                estimated_hours = task.estimated_hours or None
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not fetch task %s from kanban: %s", ticket_id, exc)
+
+        # Dependency links and comment history — best-effort; only
+        # KanboardKanban implements these (see get_task_links/get_comments
+        # docstrings), so skip gracefully for any other provider.
+        links: Dict[str, List[Dict[str, str]]] = {
+            "depends_on": [],
+            "blocks": [],
+            "relates_to": [],
+        }
+        recent_comments: List[Dict[str, Any]] = []
+        get_links = getattr(self._kanban, "get_task_links", None)
+        if get_links is not None:
+            try:
+                links = await get_links(ticket_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not fetch links for %s: %s", ticket_id, exc)
+        get_comments = getattr(self._kanban, "get_comments", None)
+        if get_comments is not None:
+            try:
+                all_comments = await get_comments(ticket_id)
+                # Cap the payload — an agent needs recent clarifications,
+                # not a full ticket history transcript.
+                recent_comments = all_comments[-10:]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not fetch comments for %s: %s", ticket_id, exc)
 
         # Repo info from ProjectSyncWorkflow (if wired up).
         local_repo_path: Optional[str] = None
@@ -932,6 +967,12 @@ class HumanGatedWorkflow:
             "state": record.state.value,
             "assignee": record.assignee,
             "already_claimed_by": record.ai_agent_id,
+            "priority": priority,
+            "labels": labels,
+            "due_date": due_date,
+            "estimated_hours": estimated_hours,
+            "links": links,
+            "recent_comments": recent_comments,
             "mcp_server_url": "http://localhost:4298/mcp",
             "gate_mode": (
                 self._gate.get_effective_gate(ticket_id, kanboard_project_id)
@@ -953,6 +994,71 @@ class HumanGatedWorkflow:
                     )
                     else ", or signal_waiting_for_human / signal_blocked if stuck"
                 )
+            ),
+        }
+
+    async def get_project_description(self, ticket_id: str) -> Optional[Dict[str, Any]]:
+        """Return the project description document for a ticket's project.
+
+        The project description is a markdown document maintained per
+        Kanboard project (see ``src/core/project_description.py``) — tech
+        stack, architecture notes, and context that applies across every
+        ticket in the project. It's the same document a human edits at
+        ``/project-description?project_id={id}``; this gives an AI agent
+        the same read access.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Kanboard task ID — used only to resolve which project's
+            description to return.
+
+        Returns
+        -------
+        Optional[Dict[str, Any]]
+            ``{"project_id": int, "description": str, "stack": {"language",
+            "framework", "install_cmd", "dev_cmd"} | None}`` — ``stack`` is
+            the parsed tech-stack info when the description has enough
+            structure to extract it, else ``None``. Returns ``None`` if the
+            ticket isn't tracked or its project can't be resolved (e.g. a
+            non-Kanboard provider).
+        """
+        project_id: Optional[int] = None
+        try:
+            task = await self._kanban.get_task_by_id(ticket_id)
+            if task:
+                src_ctx = task.source_context or {}
+                raw = src_ctx.get("kanboard_task", {})
+                pid_raw = raw.get("project_id")
+                if pid_raw:
+                    project_id = int(pid_raw)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not fetch project_id for description lookup on ticket %s: %s",
+                ticket_id,
+                exc,
+            )
+
+        if project_id is None:
+            return None
+
+        from src.core.project_description import ProjectDescriptionManager
+
+        mgr = ProjectDescriptionManager()
+        description = mgr.get_description(project_id) or ""
+        stack = mgr.get_stack(project_id)
+        return {
+            "project_id": project_id,
+            "description": description,
+            "stack": (
+                {
+                    "language": stack.language,
+                    "framework": stack.framework,
+                    "install_cmd": stack.install_cmd,
+                    "dev_cmd": stack.dev_cmd,
+                }
+                if stack is not None
+                else None
             ),
         }
 

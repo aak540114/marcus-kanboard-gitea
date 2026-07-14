@@ -16,6 +16,7 @@ from src.integrations.providers.kanboard_kanban import (
     KanboardKanban,
     _marcus_priority_to_kb,
     _parse_kanboard_ts,
+    classify_task_links,
 )
 
 # ---------------------------------------------------------------------------
@@ -308,6 +309,16 @@ class TestToTask:
         task = kanban._to_task(_make_raw_task(project_id=5))
         assert task.project_id == "5"
 
+    def test_source_context_carries_raw_project_id(self, kanban):
+        """Regression: source_context must carry the raw (int) Kanboard
+        project_id so HumanGatedWorkflow can resolve gate_mode/verify_count/
+        tech-stack checks. Previously this was never set, so those lookups
+        always silently missed and fell back to defaults regardless of what
+        was actually configured."""
+        kanban._column_status_map = {1: TaskStatus.TODO}
+        task = kanban._to_task(_make_raw_task(project_id=5))
+        assert task.source_context == {"kanboard_task": {"project_id": 5}}
+
 
 # ---------------------------------------------------------------------------
 # normalize_status / normalize_priority tests
@@ -508,6 +519,118 @@ class TestAddComment:
 
 
 # ---------------------------------------------------------------------------
+# get_comments tests
+# ---------------------------------------------------------------------------
+
+
+class TestGetComments:
+    """Test get_comments()."""
+
+    @pytest.mark.asyncio
+    async def test_normalizes_comment_fields(self, kanban):
+        """get_comments() maps Kanboard's raw fields to content/author/date."""
+        kanban._client = AsyncMock()
+        raw = [
+            {"comment": "First reply", "username": "alice", "date_creation": 1700000001},
+            {"comment": "Second reply", "username": "", "date_creation": 1700000002},
+        ]
+        kanban._client.post = AsyncMock(return_value=_rpc_response(raw))
+        result = await kanban.get_comments("1")
+        assert result == [
+            {"content": "First reply", "author": "alice", "date": 1700000001},
+            {"content": "Second reply", "author": None, "date": 1700000002},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_list_when_no_comments(self, kanban):
+        """get_comments() returns [] when Kanboard's result is empty/None."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(return_value=_rpc_response(None))
+        result = await kanban.get_comments("1")
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_list_on_rpc_failure(self, kanban):
+        """get_comments() fails soft (empty list) rather than raising —
+        comment history is supplementary context, not a hard requirement."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(side_effect=RuntimeError("API error"))
+        result = await kanban.get_comments("1")
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_raises_if_not_connected(self, kanban):
+        """get_comments() raises RuntimeError when client is None."""
+        with pytest.raises(RuntimeError, match="connect()"):
+            await kanban.get_comments("1")
+
+
+# ---------------------------------------------------------------------------
+# get_task_links tests
+# ---------------------------------------------------------------------------
+
+
+class TestGetTaskLinks:
+    """Test get_task_links()."""
+
+    @pytest.mark.asyncio
+    async def test_classifies_links_by_direction(self, kanban):
+        """get_task_links() splits raw links into depends_on/blocks/relates_to."""
+        kanban._client = AsyncMock()
+        raw = [
+            {
+                "label": "is blocked by",
+                "opposite_task_id": 5,
+                "title": "Schema migration",
+                "column_title": "Done",
+            },
+            {
+                "label": "blocks",
+                "opposite_task_id": 9,
+                "title": "Deploy",
+                "column_title": "Todo",
+            },
+            {
+                "label": "related",
+                "opposite_task_id": 3,
+                "title": "Docs",
+                "column_title": "Backlog",
+            },
+        ]
+        kanban._client.post = AsyncMock(return_value=_rpc_response(raw))
+        result = await kanban.get_task_links("1")
+        assert result == {
+            "depends_on": [
+                {"task_id": "5", "title": "Schema migration", "column": "Done"}
+            ],
+            "blocks": [{"task_id": "9", "title": "Deploy", "column": "Todo"}],
+            "relates_to": [{"task_id": "3", "title": "Docs", "column": "Backlog"}],
+        }
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_on_no_links(self, kanban):
+        """get_task_links() returns all-empty groups for a ticket with no links."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(return_value=_rpc_response(None))
+        result = await kanban.get_task_links("1")
+        assert result == {"depends_on": [], "blocks": [], "relates_to": []}
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_on_rpc_failure(self, kanban):
+        """get_task_links() fails soft rather than raising."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(side_effect=RuntimeError("API error"))
+        result = await kanban.get_task_links("1")
+        assert result == {"depends_on": [], "blocks": [], "relates_to": []}
+
+    @pytest.mark.asyncio
+    async def test_raises_if_not_connected(self, kanban):
+        """get_task_links() raises RuntimeError when client is None."""
+        with pytest.raises(RuntimeError, match="connect()"):
+            await kanban.get_task_links("1")
+
+
+# ---------------------------------------------------------------------------
 # move_task_to_column tests
 # ---------------------------------------------------------------------------
 
@@ -702,3 +825,59 @@ class TestMarcusPriorityToKb:
     def test_priority_conversions(self, priority, expected):
         """Marcus priority values convert to the correct Kanboard integers."""
         assert _marcus_priority_to_kb(priority) == expected
+
+
+# ---------------------------------------------------------------------------
+# classify_task_links tests
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyTaskLinks:
+    """Test the module-level classify_task_links() helper directly."""
+
+    def test_empty_input_returns_empty_groups(self):
+        assert classify_task_links([]) == {
+            "depends_on": [],
+            "blocks": [],
+            "relates_to": [],
+        }
+
+    @pytest.mark.parametrize(
+        "label,group",
+        [
+            ("is blocked by", "depends_on"),
+            ("is a child of", "depends_on"),
+            ("depends on", "depends_on"),
+            ("blocks", "blocks"),
+            ("is a parent of", "blocks"),
+            ("relates to", "relates_to"),
+            ("", "relates_to"),
+        ],
+    )
+    def test_label_classification(self, label, group):
+        raw = [
+            {
+                "label": label,
+                "opposite_task_id": 7,
+                "title": "Other ticket",
+                "column_title": "Todo",
+            }
+        ]
+        result = classify_task_links(raw)
+        assert len(result[group]) == 1
+        assert result[group][0] == {
+            "task_id": "7",
+            "title": "Other ticket",
+            "column": "Todo",
+        }
+
+    def test_label_matching_is_case_insensitive(self):
+        raw = [{"label": "BLOCKS", "opposite_task_id": 1, "title": "x", "column_title": "y"}]
+        result = classify_task_links(raw)
+        assert len(result["blocks"]) == 1
+
+    def test_missing_fields_default_safely(self):
+        """A link entry missing opposite_task_id/title/column_title must not
+        raise — fields default to empty rather than crashing."""
+        result = classify_task_links([{"label": "blocks"}])
+        assert result["blocks"] == [{"task_id": "", "title": "", "column": ""}]

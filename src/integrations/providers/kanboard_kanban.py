@@ -459,6 +459,77 @@ class KanboardKanban(KanbanInterface):
             logger.error("add_comment failed for task %s: %s", task_id, exc)
             return False
 
+    async def get_comments(self, task_id: str) -> List[Dict[str, Any]]:
+        """
+        Return a task's comment history, oldest first.
+
+        Parameters
+        ----------
+        task_id : str
+            Kanboard task ID.
+
+        Returns
+        -------
+        List[Dict[str, Any]]
+            One dict per comment, each with normalised keys ``content``
+            (the comment text), ``author`` (Kanboard username, or ``None``
+            for the system/API user), and ``date`` (ISO 8601 string, or
+            ``None`` if Kanboard didn't return a timestamp field). Returns
+            an empty list on any RPC failure rather than raising — comment
+            history is supplementary context, not a hard requirement for
+            an agent to keep working.
+        """
+        if self._client is None:
+            raise RuntimeError("Call connect() before get_comments()")
+        try:
+            raw = await self._rpc("getAllComments", task_id=int(task_id))
+        except Exception as exc:
+            logger.warning("get_comments failed for task %s: %s", task_id, exc)
+            return []
+
+        comments: List[Dict[str, Any]] = []
+        for item in raw or []:
+            comments.append(
+                {
+                    "content": item.get("comment", "") or "",
+                    "author": item.get("username") or item.get("name") or None,
+                    "date": item.get("date_creation") or item.get("date") or None,
+                }
+            )
+        return comments
+
+    async def get_task_links(self, task_id: str) -> Dict[str, List[Dict[str, str]]]:
+        """
+        Return this task's dependency links, classified by direction.
+
+        Parameters
+        ----------
+        task_id : str
+            Kanboard task ID.
+
+        Returns
+        -------
+        Dict[str, List[Dict[str, str]]]
+            ``{"depends_on": [...], "blocks": [...], "relates_to": [...]}``,
+            each entry ``{"task_id": str, "title": str, "column": str}``.
+            Returns all-empty on any RPC failure rather than raising — link
+            data is supplementary context, matching ``get_comments``.
+        """
+        empty: Dict[str, List[Dict[str, str]]] = {
+            "depends_on": [],
+            "blocks": [],
+            "relates_to": [],
+        }
+        if self._client is None:
+            raise RuntimeError("Call connect() before get_task_links()")
+        try:
+            raw_links = await self._rpc("getTaskLinks", task_id=int(task_id))
+        except Exception as exc:
+            logger.warning("get_task_links failed for task %s: %s", task_id, exc)
+            return empty
+
+        return classify_task_links(raw_links or [])
+
     async def get_project_metrics(self) -> Dict[str, Any]:
         """
         Return task counts by status for the configured project.
@@ -911,12 +982,69 @@ class KanboardKanban(KanbanInterface):
             project_name=self._project_name,
             labels=labels,
             estimated_hours=estimated_hours,
+            # HumanGatedWorkflow reads kanboard_project_id from here
+            # (task.source_context["kanboard_task"]["project_id"]) to
+            # resolve per-project gate mode / verify count / tech-stack
+            # checks. Leaving this unset previously made those lookups
+            # always miss and silently fall back to defaults (gate_mode
+            # always "human", verify_count always 0, stack-check always
+            # skipped) regardless of what was actually configured.
+            source_context={
+                "kanboard_task": {"project_id": raw.get("project_id")}
+            },
         )
 
 
 # ------------------------------------------------------------------
 # Module-level helpers
 # ------------------------------------------------------------------
+
+
+# Kanboard link labels (lower-case) → dependency direction. Mirrors the
+# classification used by the human-facing /api/ticket-links route in
+# src/marcus_mcp/server.py, so a ticket's links read the same way whether
+# a human views them in the MarcusDevEnv sidebar or an agent reads them
+# via get_work_context.
+_DEPENDS_ON_LABELS = {"is blocked by", "is a child of", "depends on"}
+_BLOCKS_LABELS = {"blocks", "is a parent of"}
+
+
+def classify_task_links(
+    raw_links: List[Dict[str, Any]],
+) -> Dict[str, List[Dict[str, str]]]:
+    """
+    Split Kanboard's raw ``getTaskLinks`` result by dependency direction.
+
+    Parameters
+    ----------
+    raw_links : List[Dict[str, Any]]
+        Raw link objects from the Kanboard ``getTaskLinks`` JSON-RPC call.
+
+    Returns
+    -------
+    Dict[str, List[Dict[str, str]]]
+        ``{"depends_on": [...], "blocks": [...], "relates_to": [...]}``,
+        each entry ``{"task_id": str, "title": str, "column": str}``.
+    """
+    depends_on: List[Dict[str, str]] = []
+    blocks: List[Dict[str, str]] = []
+    relates_to: List[Dict[str, str]] = []
+
+    for link in raw_links:
+        label = (link.get("label") or "").lower().strip()
+        entry = {
+            "task_id": str(link.get("opposite_task_id", "")),
+            "title": link.get("title", ""),
+            "column": link.get("column_title", ""),
+        }
+        if label in _DEPENDS_ON_LABELS:
+            depends_on.append(entry)
+        elif label in _BLOCKS_LABELS:
+            blocks.append(entry)
+        else:
+            relates_to.append(entry)
+
+    return {"depends_on": depends_on, "blocks": blocks, "relates_to": relates_to}
 
 
 def _parse_kanboard_ts(value: Any) -> Optional[datetime]:

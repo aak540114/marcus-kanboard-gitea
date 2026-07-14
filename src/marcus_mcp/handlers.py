@@ -1001,6 +1001,30 @@ def get_tool_definitions(role: str = "agent") -> List[types.Tool]:
             },
         ),
         types.Tool(
+            name="get_project_description",
+            description=(
+                "Return the project-wide tech-stack/context document for a "
+                "ticket's project (language, framework, dev/install commands, "
+                "architecture notes) — the same document a human edits at "
+                "/project-description. Call if get_work_context's per-ticket "
+                "fields aren't enough context to start."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "ticket_id": {
+                        "type": "string",
+                        "description": "Any ticket ID in the project",
+                    },
+                    "provider": {
+                        "type": "string",
+                        "description": "Kanban provider name (e.g. 'kanboard')",
+                    },
+                },
+                "required": ["ticket_id", "provider"],
+            },
+        ),
+        types.Tool(
             name="generate_acceptance_criteria",
             description="Generate and post an acceptance-criteria checklist for a ticket",
             inputSchema={
@@ -1727,6 +1751,7 @@ async def handle_tool_call(
         # Human-gated workflow tools (Kanboard+Gitea integration)
         elif name in {
             "get_work_context",
+            "get_project_description",
             "generate_acceptance_criteria",
             "post_ticket_progress",
             "signal_ready_for_review",
@@ -1741,6 +1766,7 @@ async def handle_tool_call(
 
             _dispatch = {
                 "get_work_context": _hg.get_work_context,
+                "get_project_description": _hg.get_project_description,
                 "generate_acceptance_criteria": _hg.generate_acceptance_criteria,
                 "post_ticket_progress": _hg.post_ticket_progress,
                 "signal_ready_for_review": _hg.signal_ready_for_review,

@@ -36,6 +36,9 @@ Tool list
     Return the URL of the running dev environment, if any.
 ``get_pending_tickets``
     Return tickets in a given lifecycle state.
+``get_project_description``
+    Return the project-wide tech-stack/context document for a ticket's
+    project — the same document a human edits at ``/project-description``.
 """
 
 import logging
@@ -573,8 +576,14 @@ async def get_work_context(
     Dict[str, Any]
         ``{success, result: {ticket_id, provider, title, description,
         acceptance_criteria, branch_name, local_repo_path, gitea_repo_url,
-        state, assignee, mcp_server_url, instructions}}``
-        or ``{success: False, error}``.
+        state, assignee, priority, labels, due_date, estimated_hours,
+        links, recent_comments, mcp_server_url, instructions}}`` or
+        ``{success: False, error}``. ``links`` is
+        ``{depends_on, blocks, relates_to}`` (each a list of
+        ``{task_id, title, column}``); ``recent_comments`` is the last 10
+        comments on the ticket, oldest first, each
+        ``{content, author, date}`` — the only place a human's reply after
+        ``signal_waiting_for_human`` is visible to the agent.
 
     Example
     -------
@@ -593,6 +602,12 @@ async def get_work_context(
           "local_repo_path": "./repos/my-app",
           "gitea_repo_url": "http://localhost:3000/root/my-app.git",
           "state": "in_progress",
+          "priority": "high",
+          "labels": ["frontend"],
+          "due_date": null,
+          "estimated_hours": 2.0,
+          "links": {"depends_on": [], "blocks": [], "relates_to": []},
+          "recent_comments": [],
           "mcp_server_url": "http://localhost:4298/mcp",
           "instructions": "1. cd into local_repo_path ..."
         }
@@ -621,4 +636,60 @@ async def get_work_context(
         return {"success": True, "result": context}
     except Exception as exc:  # noqa: BLE001
         logger.error("get_work_context failed: %s", exc)
+        return {"success": False, "error": str(exc)}
+
+
+async def get_project_description(
+    arguments: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Return the project-wide tech-stack/context document for a ticket.
+
+    Every Kanboard project has one project description — a markdown
+    document covering language, framework, dev-server command, and
+    architecture notes that apply to every ticket in it. Call this if
+    ``get_work_context``'s per-ticket fields aren't enough context to
+    start, e.g. you need the install/dev-server command or broader
+    architecture notes.
+
+    Parameters
+    ----------
+    arguments : Dict[str, Any]
+        Required:
+            ``ticket_id`` — Any ticket in the project (used to resolve
+            which project's description to return).
+            ``provider``  — Kanban provider name (e.g. ``"kanboard"``).
+
+    Returns
+    -------
+    Dict[str, Any]
+        ``{success, result: {project_id, description, stack}}`` where
+        ``stack`` is ``{language, framework, install_cmd, dev_cmd}`` or
+        ``None`` if the description doesn't have enough structure to
+        parse yet. ``{success: False, error}`` if the ticket/project
+        can't be resolved.
+    """
+    ticket_id = arguments.get("ticket_id", "")
+    provider = arguments.get("provider", "")
+
+    if not ticket_id or not provider:
+        return {"success": False, "error": "ticket_id and provider are required"}
+
+    wf = _workflow()
+    if wf is None:
+        return {"success": False, "error": "HumanGatedWorkflow not initialised"}
+
+    try:
+        result = await wf.get_project_description(ticket_id)
+        if result is None:
+            return {
+                "success": False,
+                "error": (
+                    f"Could not resolve a project for ticket {ticket_id!r} — "
+                    "ensure the ticket exists in Kanboard and has been seen "
+                    "by the BoardWatcher at least once."
+                ),
+            }
+        return {"success": True, "result": result}
+    except Exception as exc:  # noqa: BLE001
+        logger.error("get_project_description failed: %s", exc)
         return {"success": False, "error": str(exc)}

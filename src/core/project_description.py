@@ -9,8 +9,10 @@ single source of truth for:
 - High-level project context that AI agents carry through all tickets
 
 AI agents read this via the Marcus MCP tool ``get_project_description``
-and update it via ``update_project_description``.  Humans view and edit
-it through the Marcus web UI at ``/project-description?project_id={id}``.
+(``src/marcus_mcp/tools/human_gated.py``) — read-only for agents.  Humans
+view and edit it through the Marcus web UI at
+``/project-description?project_id={id}`` (backed by
+``/api/project-description``, ``GET``/``PUT``, in ``server.py``).
 
 Classes
 -------
