@@ -58,7 +58,7 @@ Send = Callable[[Message], Awaitable[None]]
 # this interop boundary without a cast.
 ASGIApp = Callable[..., Awaitable[None]]
 
-_DEFAULT_EXEMPT_PATHS = frozenset({"/webhooks/kanboard"})
+_DEFAULT_EXEMPT_PATHS = frozenset({"/webhooks/kanboard", "/webhooks/gitea"})
 
 
 def get_agent_token() -> Optional[str]:

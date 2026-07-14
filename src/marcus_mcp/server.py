@@ -3429,6 +3429,39 @@ if __name__ == "__main__":
                 return JSONResponse({"status": "ok"}, status_code=200)
             return JSONResponse({"status": "rejected"}, status_code=403)
 
+        async def gitea_webhook(request: Request) -> JSONResponse:
+            """Receive a Gitea push webhook and trigger an instant dev-env refresh.
+
+            Zero manual setup: GiteaManager.create_webhook() registers this
+            URL automatically (see ProjectSyncWorkflow.ensure_repo) whenever
+            GITEA_WEBHOOK_TOKEN is configured — nothing to click in Gitea's
+            own UI. Authenticates via the X-Gitea-Signature HMAC header
+            instead of MARCUS_AGENT_TOKEN (see agent_auth.py's exempt paths).
+            """
+            from src.core.gitea_webhook_receiver import GiteaWebhookReceiver
+
+            dev_mgr = getattr(server, "_dev_env_manager", None)
+            if dev_mgr is None:
+                # Dev-env subsystem isn't wired (Events/kanban not
+                # configured) — nothing to refresh, but this isn't the
+                # webhook delivery's fault, so don't report an error.
+                return JSONResponse(
+                    {"status": "ignored", "reason": "dev-env not configured"},
+                    status_code=200,
+                )
+
+            receiver = getattr(server, "_gitea_webhook_receiver", None)
+            if receiver is None:
+                receiver = GiteaWebhookReceiver(dev_env_manager=dev_mgr)
+                server._gitea_webhook_receiver = receiver  # type: ignore[attr-defined]
+
+            signature = request.headers.get("X-Gitea-Signature")
+            body = await request.body()
+            accepted = await receiver.handle_request(body, signature=signature)
+            if accepted:
+                return JSONResponse({"status": "ok"}, status_code=200)
+            return JSONResponse({"status": "rejected"}, status_code=403)
+
         async def dev_env_view(request: Request) -> Response:
             """
             Start (or look up) a hot-reload dev environment for a ticket
@@ -4082,6 +4115,7 @@ function save() {{
         app = Starlette(
             routes=[
                 Route("/webhooks/kanboard", kanboard_webhook, methods=["POST"]),
+                Route("/webhooks/gitea", gitea_webhook, methods=["POST"]),
                 Route("/dev-env/view", dev_env_view, methods=["GET"]),
                 Route("/dev-env/stop", dev_env_stop, methods=["GET", "POST"]),
                 Route("/api/dev-env/status", dev_env_status, methods=["GET"]),

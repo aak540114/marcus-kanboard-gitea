@@ -158,6 +158,20 @@ class TestBearerAuthMiddleware:
         assert inner.called is True
         assert messages == []
 
+    async def test_gitea_webhook_path_is_exempt(self) -> None:
+        """The Gitea webhook authenticates via its own HMAC signature, so
+        the bearer middleware must let it through even with no header."""
+        inner = _Recorder()
+        mw = BearerAuthMiddleware(inner, token="secret")
+        messages, send = await _drain_send()
+
+        await mw(
+            _http_scope(path="/webhooks/gitea", auth=None), _noop_receive, send
+        )
+
+        assert inner.called is True
+        assert messages == []
+
     async def test_non_http_scope_passes_through(self) -> None:
         """lifespan/websocket scopes are not gated."""
         inner = _Recorder()
