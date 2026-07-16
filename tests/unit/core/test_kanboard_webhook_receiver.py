@@ -203,7 +203,7 @@ class TestMoveColumn:
 
 
 # ---------------------------------------------------------------------------
-# task.assignee.change → ticket.assigned / ticket.unassigned
+# task.assignee_change → ticket.assigned / ticket.unassigned
 # ---------------------------------------------------------------------------
 
 
@@ -214,7 +214,7 @@ class TestAssigneeChange:
     async def test_assign_emits_ticket_assigned(self, receiver, mock_events):
         """Test that setting owner_id emits ticket.assigned."""
         body = _body(
-            "task.assignee.change",
+            "task.assignee_change",
             {
                 "task": {
                     "id": 10,
@@ -232,7 +232,7 @@ class TestAssigneeChange:
     async def test_unassign_emits_ticket_unassigned(self, receiver, mock_events):
         """Test that clearing owner_id (to '0') emits ticket.unassigned."""
         body = _body(
-            "task.assignee.change",
+            "task.assignee_change",
             {"task": {"id": 10, "owner_id": "0"}},
         )
         await receiver.handle_request(body)

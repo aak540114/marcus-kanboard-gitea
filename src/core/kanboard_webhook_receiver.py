@@ -12,7 +12,7 @@ Event mapping
 Kanboard event          → Marcus event
 ``task.move.column``    → ``ticket.status_changed``
 ``task.update``         → ``ticket.status_changed`` (if column changed)
-``task.assignee.change``→ ``ticket.assigned`` / ``ticket.unassigned``
+``task.assignee_change``→ ``ticket.assigned`` / ``ticket.unassigned``
 ``task.close``          → ``ticket.closed``
 ``task.open``           → ``ticket.reopened``
 ``task.create``         → ``ticket.new``
@@ -92,7 +92,11 @@ _COLUMN_STATUS_MAP: Dict[str, str] = {
 # Kanboard event names
 _EV_MOVE = "task.move.column"
 _EV_UPDATE = "task.update"
-_EV_ASSIGN = "task.assignee.change"
+# NOTE the underscore: Kanboard's TaskModel::EVENT_ASSIGNEE_CHANGE is
+# 'task.assignee_change' — inconsistent with its dotted siblings
+# (task.move.column, task.user.mention) in Kanboard's own source, and an
+# easy one to get wrong. Verified against v1.2.52 app/Model/TaskModel.php.
+_EV_ASSIGN = "task.assignee_change"
 _EV_CLOSE = "task.close"
 _EV_OPEN = "task.open"
 _EV_CREATE = "task.create"
