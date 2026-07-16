@@ -4387,9 +4387,29 @@ function save() {{
 
         server_instance = uvicorn.Server(uvicorn_config)
 
-        # Run the server (this will handle shutdown gracefully)
+        # Run the server (this will handle shutdown gracefully).
+        #
+        # Deliberately `loop.run_until_complete(server_instance.serve())`,
+        # NOT `server_instance.run()` — `.run()` is a thin wrapper around
+        # `asyncio.run(self.serve(...))`, which creates a BRAND NEW event
+        # loop, completely separate from `loop` above (the one
+        # `setup_http_server()` ran on, via `loop.run_until_complete(
+        # setup_http_server())`). `server.initialize()` — called inside
+        # `setup_http_server()` — connects the kanban client, which
+        # constructs an `httpx.AsyncClient` bound to whatever loop is
+        # running AT THAT MOMENT (that first `loop`). Reusing `.run()`'s
+        # fresh second loop to serve requests would then hand that
+        # already-loop-bound client to a DIFFERENT loop the moment
+        # anything (e.g. BoardWatcher's poll cycle) tries to use it —
+        # surfacing as "<asyncio.locks.Event ...> is bound to a different
+        # event loop" deep inside httpx/httpcore/anyio. Explicitly reusing
+        # `loop` here keeps server initialization and request serving on
+        # the SAME loop for the server's entire lifetime, avoiding the
+        # split altogether — this is exactly what `.run()` does
+        # internally too (drive `serve()` via `run_until_complete`), just
+        # on the loop we already have instead of a fresh one.
         try:
-            server_instance.run()
+            loop.run_until_complete(server_instance.serve())
         except KeyboardInterrupt:
             print("\n✅ HTTP server shutdown complete")
     else:
