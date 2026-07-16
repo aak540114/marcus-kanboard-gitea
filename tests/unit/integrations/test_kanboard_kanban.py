@@ -275,10 +275,16 @@ class TestToTask:
         task = kanban._to_task(_make_raw_task(priority=2))
         assert task.priority == Priority.HIGH
 
-    def test_estimated_hours_from_seconds(self, kanban):
-        """time_estimated in seconds is converted to hours."""
+    def test_estimated_hours_passthrough(self, kanban):
+        """time_estimated is Kanboard's raw hours value, passed through as-is.
+
+        Kanboard stores time_estimated in HOURS (its UI renders the raw
+        value with an 'hours' suffix — app/Template/task/
+        time_tracking_summary.php in Kanboard v1.2.52); an earlier version
+        of this provider wrongly assumed seconds and divided by 3600.
+        """
         kanban._column_status_map = {1: TaskStatus.TODO}
-        task = kanban._to_task(_make_raw_task(time_estimated=7200))  # 2h
+        task = kanban._to_task(_make_raw_task(time_estimated=2))  # 2 hours
         assert task.estimated_hours == 2.0
 
     def test_due_date_populated(self, kanban):
@@ -575,24 +581,32 @@ class TestGetTaskLinks:
 
     @pytest.mark.asyncio
     async def test_classifies_links_by_direction(self, kanban):
-        """get_task_links() splits raw links into depends_on/blocks/relates_to."""
+        """get_task_links() splits raw links into depends_on/blocks/relates_to.
+
+        Raw link fixtures use the REAL Kanboard v1.2.52 payload shape:
+        TaskLinkModel::getAll() aliases the opposite task's id to a key
+        named ``task_id`` (``opposite_task_id AS task_id``) — there is no
+        ``opposite_task_id`` key in the response. An earlier version of
+        this suite used ``opposite_task_id`` fixtures, matching the (buggy)
+        implementation but not real payloads.
+        """
         kanban._client = AsyncMock()
         raw = [
             {
                 "label": "is blocked by",
-                "opposite_task_id": 5,
+                "task_id": 5,
                 "title": "Schema migration",
                 "column_title": "Done",
             },
             {
                 "label": "blocks",
-                "opposite_task_id": 9,
+                "task_id": 9,
                 "title": "Deploy",
                 "column_title": "Todo",
             },
             {
                 "label": "related",
-                "opposite_task_id": 3,
+                "task_id": 3,
                 "title": "Docs",
                 "column_title": "Backlog",
             },
@@ -606,6 +620,26 @@ class TestGetTaskLinks:
             "blocks": [{"task_id": "9", "title": "Deploy", "column": "Todo"}],
             "relates_to": [{"task_id": "3", "title": "Docs", "column": "Backlog"}],
         }
+
+    @pytest.mark.asyncio
+    async def test_calls_getAllTaskLinks_rpc_method(self, kanban):
+        """get_task_links() must call getAllTaskLinks — getTaskLinks does not exist.
+
+        Kanboard v1.2.52's TaskLinkProcedure defines getAllTaskLinks(task_id);
+        there is no getTaskLinks method, and Kanboard registers no aliases —
+        calling it returns a JSON-RPC "Method not found" error, which the
+        soft-fail path silently turned into permanently empty link data.
+        """
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(return_value=_rpc_response([]))
+        await kanban.get_task_links("7")
+        body = kanban._client.post.call_args.kwargs.get("json") or (
+            kanban._client.post.call_args.args[1]
+            if len(kanban._client.post.call_args.args) > 1
+            else None
+        )
+        assert body["method"] == "getAllTaskLinks"
+        assert body["params"] == {"task_id": 7}
 
     @pytest.mark.asyncio
     async def test_returns_empty_on_no_links(self, kanban):
@@ -661,10 +695,108 @@ class TestMoveTaskToColumn:
         assert result is False
 
     @pytest.mark.asyncio
+    async def test_noop_move_treated_as_success(self, kanban):
+        """A task already sitting in the target column counts as success.
+
+        Kanboard's TaskPositionModel::movePosition() returns false both on
+        real failures AND when the task is already in the requested
+        column/position (a no-op). Treating that false as failure made
+        repeated 'move to In Progress' calls report failure after the first
+        one and skip the closed/open flag sync.
+        """
+        kanban._client = AsyncMock()
+        kanban._column_map = {"in progress": 2, "done": 3}
+        kanban._column_status_map = {2: TaskStatus.IN_PROGRESS, 3: TaskStatus.DONE}
+        # moveTaskPosition → False; getTask shows column_id already 2;
+        # openTask → True.
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response(False),
+                _rpc_response(_make_raw_task(task_id=5, column_id=2)),
+                _rpc_response(True),
+            ]
+        )
+        result = await kanban.move_task_to_column("5", "In Progress")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_real_move_failure_still_returns_false(self, kanban):
+        """moveTaskPosition=false with the task NOT in the target column is
+        a genuine failure and must stay False."""
+        kanban._client = AsyncMock()
+        kanban._column_map = {"in progress": 2}
+        kanban._column_status_map = {2: TaskStatus.IN_PROGRESS}
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response(False),
+                _rpc_response(_make_raw_task(task_id=5, column_id=1)),
+            ]
+        )
+        result = await kanban.move_task_to_column("5", "In Progress")
+        assert result is False
+
+    @pytest.mark.asyncio
     async def test_raises_if_not_connected(self, kanban):
         """move_task_to_column() raises RuntimeError when client is None."""
         with pytest.raises(RuntimeError, match="connect()"):
             await kanban.move_task_to_column("1", "Done")
+
+
+# ---------------------------------------------------------------------------
+# download_attachment tests
+# ---------------------------------------------------------------------------
+
+
+class TestDownloadAttachment:
+    """Test download_attachment()."""
+
+    @pytest.mark.asyncio
+    async def test_downloads_via_downloadTaskFile_rpc(self, kanban):
+        """Content comes from the downloadTaskFile RPC, already base64.
+
+        Kanboard's getTaskFile 'path' is an object-storage key (e.g.
+        'tasks/123/<sha1>' under DATA_DIR/files), NOT a web route — the
+        old implementation HTTP-GETting {base}/{path} could never fetch
+        real file content. TaskFileProcedure::downloadTaskFile(file_id)
+        returns the file's bytes base64-encoded in one call.
+        """
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response({"id": 9, "name": "spec.pdf", "path": "tasks/5/abc"}),
+                _rpc_response("aGVsbG8="),  # base64("hello")
+            ]
+        )
+        result = await kanban.download_attachment("9", "fallback.pdf", task_id="5")
+        assert result["success"] is True
+        assert result["data"]["content"] == "aGVsbG8="
+        assert result["data"]["filename"] == "spec.pdf"
+        second_call_body = kanban._client.post.call_args_list[1].kwargs.get(
+            "json"
+        ) or kanban._client.post.call_args_list[1].args[1]
+        assert second_call_body["method"] == "downloadTaskFile"
+        assert second_call_body["params"] == {"file_id": 9}
+
+    @pytest.mark.asyncio
+    async def test_missing_file_returns_failure(self, kanban):
+        """A file id Kanboard doesn't know returns success=False, no raise."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(return_value=_rpc_response(None))
+        result = await kanban.download_attachment("404", "x.txt")
+        assert result["success"] is False
+
+    @pytest.mark.asyncio
+    async def test_empty_content_returns_failure(self, kanban):
+        """downloadTaskFile returning empty/false yields success=False."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response({"id": 9, "name": "spec.pdf"}),
+                _rpc_response(False),
+            ]
+        )
+        result = await kanban.download_attachment("9", "spec.pdf")
+        assert result["success"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -899,10 +1031,13 @@ class TestClassifyTaskLinks:
         ],
     )
     def test_label_classification(self, label, group):
+        """Each link label lands in its direction group, reading the real
+        Kanboard payload key ``task_id`` (the opposite task's id, aliased
+        by TaskLinkModel::getAll — never ``opposite_task_id``)."""
         raw = [
             {
                 "label": label,
-                "opposite_task_id": 7,
+                "task_id": 7,
                 "title": "Other ticket",
                 "column_title": "Todo",
             }
@@ -916,12 +1051,13 @@ class TestClassifyTaskLinks:
         }
 
     def test_label_matching_is_case_insensitive(self):
-        raw = [{"label": "BLOCKS", "opposite_task_id": 1, "title": "x", "column_title": "y"}]
+        """Label matching lower-cases before comparing against the label sets."""
+        raw = [{"label": "BLOCKS", "task_id": 1, "title": "x", "column_title": "y"}]
         result = classify_task_links(raw)
         assert len(result["blocks"]) == 1
 
     def test_missing_fields_default_safely(self):
-        """A link entry missing opposite_task_id/title/column_title must not
+        """A link entry missing task_id/title/column_title must not
         raise — fields default to empty rather than crashing."""
         result = classify_task_links([{"label": "blocks"}])
         assert result["blocks"] == [{"task_id": "", "title": "", "column": ""}]

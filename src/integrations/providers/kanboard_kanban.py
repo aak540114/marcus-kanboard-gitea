@@ -20,6 +20,7 @@ KanboardKanban
 
 import base64
 import logging
+import mimetypes
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
 
@@ -278,7 +279,8 @@ class KanboardKanban(KanbanInterface):
         ----------
         task_data : Dict[str, Any]
             Expected keys: ``name`` (required), ``description``,
-            ``priority``, ``labels``, ``estimated_hours``.
+            ``priority``, ``estimated_hours`` (in hours — Kanboard's
+            native ``time_estimated`` unit).
 
         Returns
         -------
@@ -290,7 +292,9 @@ class KanboardKanban(KanbanInterface):
 
         priority_str = task_data.get("priority", "medium")
         kb_priority = _marcus_priority_to_kb(priority_str)
-        estimated_seconds = int(float(task_data.get("estimated_hours", 0)) * 3600)
+        # Kanboard's time_estimated is in HOURS, stored raw (its UI renders
+        # the value with an "hours" suffix) — do NOT convert to seconds.
+        estimated_hours = float(task_data.get("estimated_hours", 0))
 
         task_id = await self._rpc(
             "createTask",
@@ -298,7 +302,7 @@ class KanboardKanban(KanbanInterface):
             title=task_data.get("name", ""),
             description=task_data.get("description", ""),
             priority=kb_priority,
-            time_estimated=estimated_seconds,
+            time_estimated=estimated_hours,
         )
         if not task_id:
             raise RuntimeError("Kanboard createTask returned no task ID")
@@ -336,7 +340,8 @@ class KanboardKanban(KanbanInterface):
         if "priority" in updates:
             kb_updates["priority"] = _marcus_priority_to_kb(updates["priority"])
         if "estimated_hours" in updates:
-            kb_updates["time_estimated"] = int(float(updates["estimated_hours"]) * 3600)
+            # Hours, not seconds — see create_task.
+            kb_updates["time_estimated"] = float(updates["estimated_hours"])
 
         success = await self._rpc("updateTask", **kb_updates)
         if not success:
@@ -419,15 +424,24 @@ class KanboardKanban(KanbanInterface):
             swimlane_id=0,
         )
 
-        # moveTaskPosition returns True/False or a boolean-like value
-        if result:
-            # Update closed/open flag based on target column status
-            target_status = self._column_status_map.get(column_id)
-            if target_status == TaskStatus.DONE:
-                await self._rpc("closeTask", task_id=int(task_id))
-            else:
-                await self._rpc("openTask", task_id=int(task_id))
-        return bool(result)
+        if not result:
+            # Kanboard's TaskPositionModel::movePosition() returns false
+            # both on genuine failures AND when the task is already in the
+            # requested column/position (a no-op move). Distinguish the two:
+            # a task already sitting in the target column is success — the
+            # board is in exactly the requested state — and must still get
+            # the closed/open flag sync below.
+            raw = await self._rpc("getTask", task_id=int(task_id))
+            if not raw or int(raw.get("column_id") or 0) != column_id:
+                return False
+
+        # Update closed/open flag based on target column status
+        target_status = self._column_status_map.get(column_id)
+        if target_status == TaskStatus.DONE:
+            await self._rpc("closeTask", task_id=int(task_id))
+        else:
+            await self._rpc("openTask", task_id=int(task_id))
+        return True
 
     async def add_comment(self, task_id: str, comment: str) -> bool:
         """
@@ -523,7 +537,12 @@ class KanboardKanban(KanbanInterface):
         if self._client is None:
             raise RuntimeError("Call connect() before get_task_links()")
         try:
-            raw_links = await self._rpc("getTaskLinks", task_id=int(task_id))
+            # getAllTaskLinks is the real method name (Kanboard v1.2.52
+            # TaskLinkProcedure) — a previous "getTaskLinks" spelling does
+            # not exist in Kanboard's API, so every call hit the JSON-RPC
+            # "Method not found" error and this soft-fail path silently
+            # returned empty link data forever.
+            raw_links = await self._rpc("getAllTaskLinks", task_id=int(task_id))
         except Exception as exc:
             logger.warning("get_task_links failed for task %s: %s", task_id, exc)
             return empty
@@ -779,29 +798,34 @@ class KanboardKanban(KanbanInterface):
         if self._client is None:
             raise RuntimeError("Call connect() before download_attachment()")
         try:
-            # Kanboard's JSON-RPC getTaskFile returns metadata, not content.
-            # Content is served via HTTP from /projects/.../files/...
-            # We build that URL and fetch it with our authenticated client.
             meta = await self._rpc("getTaskFile", file_id=int(attachment_id))
             if not meta:
                 return {"success": False, "error": "File not found"}
 
-            file_path = meta.get("path", "")
-            if not file_path:
-                return {"success": False, "error": "No download path available"}
+            # downloadTaskFile is Kanboard's purpose-built API method: it
+            # returns the file's bytes already base64-encoded. The 'path'
+            # in getTaskFile metadata is an object-storage key under
+            # Kanboard's DATA_DIR (e.g. "tasks/123/<sha1>"), NOT a web
+            # route — an earlier version HTTP-GET'd {base_url}/{path},
+            # which can never return real file content (and the web UI's
+            # download route needs a session the jsonrpc token doesn't
+            # provide anyway).
+            encoded = await self._rpc(
+                "downloadTaskFile", file_id=int(attachment_id)
+            )
+            if not encoded:
+                return {"success": False, "error": "File content unavailable"}
 
-            # file_path is relative to the Kanboard base URL
-            base = self._jsonrpc_url.replace("/jsonrpc.php", "")
-            download_url = f"{base}/{file_path.lstrip('/')}"
-            response = await self._client.get(download_url)
-            response.raise_for_status()
-            encoded = base64.b64encode(response.content).decode("ascii")
-            ct = response.headers.get("content-type", "application/octet-stream")
+            resolved_name = meta.get("name", filename)
+            ct = (
+                mimetypes.guess_type(resolved_name)[0]
+                or "application/octet-stream"
+            )
             return {
                 "success": True,
                 "data": {
                     "content": encoded,
-                    "filename": meta.get("name", filename),
+                    "filename": resolved_name,
                     "content_type": ct,
                 },
             }
@@ -991,9 +1015,9 @@ class KanboardKanban(KanbanInterface):
         updated_at = _parse_kanboard_ts(raw.get("date_modification")) or now
         due_date = _parse_kanboard_ts(raw.get("date_due"))
 
-        # time_estimated is stored in seconds by Kanboard
-        estimated_seconds = int(raw.get("time_estimated") or 0)
-        estimated_hours = estimated_seconds / 3600.0 if estimated_seconds else 0.0
+        # time_estimated is stored in HOURS by Kanboard (raw value, its UI
+        # appends an "hours" suffix) — pass through, no unit conversion.
+        estimated_hours = float(raw.get("time_estimated") or 0)
 
         assignee = raw.get("owner_id")
         assigned_to = str(assignee) if assignee and int(assignee) != 0 else None
@@ -1067,7 +1091,11 @@ def classify_task_links(
     for link in raw_links:
         label = (link.get("label") or "").lower().strip()
         entry = {
-            "task_id": str(link.get("opposite_task_id", "")),
+            # Kanboard aliases the linked task's id to "task_id"
+            # (TaskLinkModel::getAll: `opposite_task_id AS task_id`) —
+            # despite the name, this is the OTHER task's id, and no
+            # "opposite_task_id" key exists in the response.
+            "task_id": str(link.get("task_id", "")),
             "title": link.get("title", ""),
             "column": link.get("column_title", ""),
         }
