@@ -264,17 +264,36 @@ class KanboardWebhookReceiver:
         event_data: Dict[str, Any],
         task: Dict[str, Any],
     ) -> None:
-        """Emit ``ticket.status_changed`` from a column-move event."""
-        task_data = event_data.get("task", task)
-        column_name: str = (task_data.get("column_name") or "").lower().strip()
+        """Emit ``ticket.status_changed`` from a column-move event.
 
-        changes = event_data.get("changes", {})
-        old_column: str = str(
-            changes.get("old_column_name", changes.get("column_name", ""))
+        Kanboard's real webhook payload names the column on the task hash
+        ``column_title``, not ``column_name`` — confirmed directly against
+        Kanboard's source: ``TaskEventBuilder::buildEvent()`` populates the
+        ``task`` key via ``TaskFinderModel::getDetails()``, whose query
+        aliases the joined column as ``ColumnModel::TABLE.'.title AS
+        column_title'``, and Kanboard's own ``buildTitleWithAuthor()``
+        reads that same ``$eventData['task']['column_title']`` key. The
+        JSON-RPC polling API used by ``KanboardKanban`` is a separate code
+        path that does return ``column_name`` — different endpoint,
+        different field name — which is why polling ever worked while the
+        webhook path silently fell back to "todo" on every move. Both keys
+        are accepted defensively in case that ever changes.
+
+        The ``changes`` dict for a column-move event only ever carries
+        column *IDs* (``column_id``, ``src_column_id``, ``dst_column_id``
+        — see Kanboard's ``TaskPositionModel::fireEvents()``), never a
+        prior column's display name, so there is no reliable way to
+        resolve the previous status from this payload alone. ``old_status``
+        is left ``None`` — nothing downstream reads it today — rather than
+        defaulting to a real status value like "todo", which would look
+        like a genuine prior state instead of "unknown".
+        """
+        task_data = event_data.get("task", task)
+        column_name: str = (
+            task_data.get("column_title") or task_data.get("column_name") or ""
         ).lower().strip()
 
         new_status = _COLUMN_STATUS_MAP.get(column_name, "todo")
-        old_status = _COLUMN_STATUS_MAP.get(old_column, "todo")
 
         await self._events.publish(
             "ticket.status_changed",
@@ -282,15 +301,14 @@ class KanboardWebhookReceiver:
             data={
                 "ticket_id": ticket_id,
                 "provider": self._provider,
-                "old_status": old_status,
+                "old_status": None,
                 "new_status": new_status,
                 "task": task_data,
             },
         )
         logger.info(
-            "Webhook → ticket.status_changed  (ticket=%s, %s→%s)",
+            "Webhook → ticket.status_changed  (ticket=%s, → %s)",
             ticket_id,
-            old_status,
             new_status,
         )
 

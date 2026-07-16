@@ -120,16 +120,26 @@ class TestMalformedInput:
 
 
 class TestMoveColumn:
-    """Test column-move event translation."""
+    """Test column-move event translation.
+
+    Kanboard's real webhook payload names the column ``column_title`` on
+    the task hash (from ``TaskFinderModel::getDetails()`` — confirmed
+    against Kanboard's own source), not ``column_name``. These fixtures
+    use ``column_title`` to match what Kanboard actually sends; a prior
+    version of this test suite used ``column_name``, which happened to
+    match the receiver's (buggy) implementation but never matched a real
+    webhook payload — every column move silently fell back to "todo" in
+    production despite this test suite passing.
+    """
 
     @pytest.mark.asyncio
     async def test_move_column_emits_status_changed(self, receiver, mock_events):
-        """Test that task.move.column emits ticket.status_changed with mapped statuses."""
+        """Test that task.move.column emits ticket.status_changed with the mapped status."""
         body = _body(
             "task.move.column",
             {
-                "task": {"id": 42, "column_name": "In Progress"},
-                "changes": {"old_column_name": "Ready"},
+                "task": {"id": 42, "column_title": "In Progress"},
+                "changes": {"column_id": "3", "src_column_id": "2", "dst_column_id": "3"},
             },
         )
         result = await receiver.handle_request(body)
@@ -141,8 +151,41 @@ class TestMoveColumn:
         data = call_kwargs[1]["data"]
         assert data["ticket_id"] == "42"
         assert data["new_status"] == "in_progress"
-        assert data["old_status"] == "ready"
+        assert data["old_status"] is None
         assert data["provider"] == "kanboard"
+
+    @pytest.mark.asyncio
+    async def test_move_to_ready_column_emits_ready_status(self, receiver, mock_events):
+        """Test that moving a task to the 'Ready' column emits new_status='ready'.
+
+        Regression test: the receiver previously read a 'column_name' key
+        that real Kanboard webhook payloads never populate, so this exact
+        scenario (dragging a card to Ready) always emitted 'todo' instead.
+        """
+        body = _body(
+            "task.move.column",
+            {
+                "task": {"id": 1, "column_title": "Ready"},
+                "changes": {"column_id": "2", "src_column_id": "1", "dst_column_id": "2"},
+            },
+        )
+        await receiver.handle_request(body)
+        data = mock_events.publish.call_args[1]["data"]
+        assert data["new_status"] == "ready"
+
+    @pytest.mark.asyncio
+    async def test_column_name_accepted_as_fallback(self, receiver, mock_events):
+        """Test that 'column_name' is still accepted if a payload happens to carry it."""
+        body = _body(
+            "task.move.column",
+            {
+                "task": {"id": 43, "column_name": "Ready"},
+                "changes": {},
+            },
+        )
+        await receiver.handle_request(body)
+        data = mock_events.publish.call_args[1]["data"]
+        assert data["new_status"] == "ready"
 
     @pytest.mark.asyncio
     async def test_unknown_column_defaults_to_todo(self, receiver, mock_events):
@@ -150,7 +193,7 @@ class TestMoveColumn:
         body = _body(
             "task.move.column",
             {
-                "task": {"id": 7, "column_name": "Someday/Maybe"},
+                "task": {"id": 7, "column_title": "Someday/Maybe"},
                 "changes": {},
             },
         )
@@ -293,7 +336,7 @@ class TestTaskUpdate:
         body = _body(
             "task.update",
             {
-                "task": {"id": 8, "column_name": "Done"},
+                "task": {"id": 8, "column_title": "Done"},
                 "changes": {"column_id": "5"},
             },
         )
