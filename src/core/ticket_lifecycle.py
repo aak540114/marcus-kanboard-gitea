@@ -6,12 +6,16 @@ Every ticket processed by Marcus moves through a defined set of states.
 Assignment rules
 ----------------
 - A ticket is **assigned to a human** when Kanboard's ``owner_id`` is
-  non-zero.  While a human holds the ticket, AI stays out.
-- A ticket is **unassigned** (``owner_id == 0``) when AI should work.
+  non-zero.  The assignment is the human's "please work on this" signal:
+  AI works only on ASSIGNED tickets (the assignee is who AI reports to).
+- A ticket that is **unassigned** (``owner_id == 0``) is not worked on;
+  unassigning a claimed ticket releases the AI claim and stops work
+  (see ``HumanGatedWorkflow._on_ticket_unassigned``).
 - Humans can set **any state except** ``waiting_for_human`` (that state is
   AI-only — it signals "I finished; please review").
-- AI should work on a ticket whenever its status is ``ready`` or
-  ``in_progress`` **and** the ticket is unassigned.
+- AI starts work on a ticket when its status is ``ready`` or
+  ``in_progress`` **and** a human is assigned — in either order (assign
+  then move, or move then assign).
 
 Anti-duplication
 ----------------

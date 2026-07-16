@@ -217,6 +217,40 @@ class HumanGatedWorkflow:
                     ticket_id, self._provider, existing_ac.raw_text, new_hash
                 )
 
+        # First-sight recovery: BoardWatcher emits ONLY ticket.new for a
+        # ticket it has never seen — including one that was assigned and
+        # moved to Ready while Marcus was down (its assignment and column
+        # state get absorbed into the watcher's baseline snapshot, so no
+        # ticket.assigned / ticket.status_changed diff ever fires later).
+        # Reconcile against the board state carried in the event itself:
+        # already assigned + already in a workable column → start now.
+        # The Kanboard task.create webhook payload has neither a "status"
+        # nor an "assignee" key (raw Kanboard fields instead), so this
+        # never triggers for genuinely fresh webhook tickets — they are in
+        # the first column at creation anyway.
+        board_status = task.get("status") or ""
+        board_assignee = task.get("assignee") or ""
+        if board_assignee and board_assignee != "0" and board_status in (
+            TaskStatus.READY.value,
+            TaskStatus.IN_PROGRESS.value,
+        ):
+            try:
+                self._lifecycle.set_assignee(
+                    ticket_id, self._provider, board_assignee
+                )
+            except KeyError:
+                pass
+            record = self._lifecycle.get(ticket_id, self._provider) or record
+            if record.ai_agent_id is None:
+                logger.info(
+                    "Ticket %s first seen already assigned (%s) and %s — "
+                    "starting AI work (restart recovery)",
+                    ticket_id,
+                    board_assignee,
+                    board_status,
+                )
+                await self._start_ai_work(ticket_id, record)
+
     async def _on_ticket_assigned(self, event: Any) -> None:
         """Handle a ticket being assigned to a human.
 
@@ -318,7 +352,27 @@ class HumanGatedWorkflow:
                 else:
                     # Status changed to a workable state with a human owner → start.
                     await self._start_ai_work(ticket_id, record)
-            # else: no human owner → AI does not work on unassigned tickets.
+            else:
+                # No human owner → AI does not start work on unassigned
+                # tickets — but the lifecycle record must still mirror the
+                # board. _on_ticket_assigned gates its "start now" decision
+                # on ``record.state != TODO``, so without this sync the
+                # "move to Ready first, assign second" ordering never
+                # starts AI work: the record silently stays TODO while the
+                # board shows Ready, and the later assignment is ignored.
+                if record.state == TicketState.TODO:
+                    try:
+                        self._lifecycle.human_transition(
+                            ticket_id,
+                            self._provider,
+                            TicketState.READY,
+                            reason=(
+                                "Human moved unassigned ticket to a workable "
+                                "column; AI waits for assignment"
+                            ),
+                        )
+                    except (InvalidTransitionError, KeyError):
+                        pass
 
         elif new_status == TaskStatus.TODO.value:
             # Human reset the ticket to todo.
@@ -1138,10 +1192,11 @@ class HumanGatedWorkflow:
     ) -> None:
         """Claim the ticket, create branch, set in-progress, and notify AI.
 
-        Called whenever both conditions are met: the ticket is unassigned
-        (``owner_id == 0`` on Kanboard) **and** the lifecycle state is
-        ``READY`` or ``IN_PROGRESS`` (or the kanban column just changed
-        to one of those states).
+        Called whenever both conditions are met: the ticket IS assigned to
+        a human (the assignment is the "please work on this" signal — see
+        ``_on_ticket_assigned``) **and** the kanban column is ``READY`` or
+        ``IN_PROGRESS`` (or just changed to one of those states). Callers
+        enforce both conditions; this method assumes them.
 
         The claim gate ensures at most one Marcus instance starts work on
         the same ticket concurrently.

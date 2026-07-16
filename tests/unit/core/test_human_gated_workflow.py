@@ -245,7 +245,7 @@ class TestStatusChangedTrigger:
     async def test_ready_without_assignee_does_not_start_ai(
         self, workflow, lifecycle, mock_kanban
     ):
-        """Status → ready with NO human assigned → AI does nothing."""
+        """Status → ready with NO human assigned → AI does not start work."""
         lifecycle.get_or_create("21", "kanboard")
 
         event = _make_event(
@@ -258,6 +258,63 @@ class TestStatusChangedTrigger:
         assert rec is not None
         assert rec.ai_agent_id is None
         mock_kanban.move_task_to_column.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ready_without_assignee_syncs_lifecycle_state(
+        self, workflow, lifecycle
+    ):
+        """Status → ready while unassigned still syncs the record to READY.
+
+        Without this sync, the "move to Ready first, assign second" order
+        never starts AI work: _on_ticket_assigned gates on
+        ``record.state != TODO``, but nothing had ever advanced the record
+        past TODO — the board column and the lifecycle record silently
+        disagreed forever.
+        """
+        lifecycle.get_or_create("26", "kanboard")
+
+        event = _make_event(
+            {"ticket_id": "26", "new_status": "ready", "old_status": "todo",
+             "provider": "kanboard"}
+        )
+        await workflow._on_status_changed(event)
+
+        rec = lifecycle.get("26", "kanboard")
+        assert rec is not None
+        assert rec.state == TicketState.READY
+        assert rec.ai_agent_id is None  # still not started — no assignee yet
+
+    @pytest.mark.asyncio
+    async def test_move_to_ready_then_assign_starts_ai(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Human moves the card to Ready FIRST, assigns SECOND → AI starts.
+
+        The mirror image of test_ready_with_assignee_starts_ai (assign
+        first, move second) — both orderings must start work.
+        """
+        lifecycle.get_or_create("27", "kanboard")
+
+        move_event = _make_event(
+            {"ticket_id": "27", "new_status": "ready", "old_status": "todo",
+             "provider": "kanboard"}
+        )
+        await workflow._on_status_changed(move_event)
+
+        assign_event = _make_event(
+            {"ticket_id": "27", "assignee": "alice", "provider": "kanboard"}
+        )
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            return_value="ticket/kanboard/27",
+        ):
+            await workflow._on_ticket_assigned(assign_event)
+
+        rec = lifecycle.get("27", "kanboard")
+        assert rec is not None
+        assert rec.ai_agent_id is not None
+        assert rec.state == TicketState.IN_PROGRESS
+        mock_kanban.move_task_to_column.assert_called_with("27", "in progress")
 
     @pytest.mark.asyncio
     async def test_in_progress_with_assignee_starts_ai(
@@ -341,6 +398,130 @@ class TestStatusChangedTrigger:
         assert rec.state == TicketState.IN_PROGRESS
         # Branch creation not called — AI is resuming, not starting fresh.
         mock_kanban.move_task_to_column.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Trigger: ticket seen for the first time already assigned + workable
+# ---------------------------------------------------------------------------
+
+
+class TestFirstSightRecovery:
+    """A ticket first seen already assigned and in Ready must start AI work.
+
+    BoardWatcher emits only ``ticket.new`` the first time it sees a ticket
+    — including one that was assigned and moved to Ready while Marcus was
+    down (or while now-fixed webhook bugs were dropping those events). The
+    assignment and column state get absorbed into the watcher's baseline
+    snapshot, so no ``ticket.assigned``/``ticket.status_changed`` diff ever
+    fires afterwards. ``_on_ticket_new`` must therefore reconcile against
+    the board state carried in the event itself, or such tickets stay
+    unworked forever with no log trace.
+    """
+
+    @pytest.mark.asyncio
+    async def test_new_ticket_assigned_and_ready_starts_ai(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """First sight of an assigned ticket in Ready → AI claims and starts."""
+        event = _make_event(
+            {
+                "ticket_id": "30",
+                "provider": "kanboard",
+                "task": {
+                    "id": "30",
+                    "title": "Stuck ticket",
+                    "description": "something",
+                    "status": "ready",
+                    "assignee": "alice",
+                },
+            }
+        )
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            return_value="ticket/kanboard/30",
+        ):
+            await workflow._on_ticket_new(event)
+
+        rec = lifecycle.get("30", "kanboard")
+        assert rec is not None
+        assert rec.assignee == "alice"
+        assert rec.ai_agent_id is not None
+        assert rec.state == TicketState.IN_PROGRESS
+        mock_kanban.move_task_to_column.assert_called_with("30", "in progress")
+
+    @pytest.mark.asyncio
+    async def test_new_ticket_assigned_but_todo_does_not_start_ai(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """First sight of an assigned ticket still in todo → AI waits."""
+        event = _make_event(
+            {
+                "ticket_id": "31",
+                "provider": "kanboard",
+                "task": {
+                    "id": "31",
+                    "title": "Fresh ticket",
+                    "description": "",
+                    "status": "todo",
+                    "assignee": "bob",
+                },
+            }
+        )
+        await workflow._on_ticket_new(event)
+
+        rec = lifecycle.get("31", "kanboard")
+        assert rec is not None
+        assert rec.ai_agent_id is None
+        mock_kanban.move_task_to_column.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_new_ticket_ready_but_unassigned_does_not_start_ai(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """First sight of an unassigned Ready ticket → AI does not start."""
+        event = _make_event(
+            {
+                "ticket_id": "32",
+                "provider": "kanboard",
+                "task": {
+                    "id": "32",
+                    "title": "Unowned ticket",
+                    "description": "",
+                    "status": "ready",
+                },
+            }
+        )
+        await workflow._on_ticket_new(event)
+
+        rec = lifecycle.get("32", "kanboard")
+        assert rec is not None
+        assert rec.ai_agent_id is None
+        mock_kanban.move_task_to_column.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_webhook_shaped_payload_without_status_is_harmless(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """The Kanboard task.create webhook payload (no 'status'/'assignee'
+        keys, raw Kanboard fields instead) must not trigger recovery."""
+        event = _make_event(
+            {
+                "ticket_id": "33",
+                "provider": "kanboard",
+                "task": {
+                    "id": 33,
+                    "title": "Webhook ticket",
+                    "description": "",
+                    "owner_id": "5",
+                    "column_title": "Todo",
+                },
+            }
+        )
+        await workflow._on_ticket_new(event)
+
+        rec = lifecycle.get("33", "kanboard")
+        assert rec is not None
+        assert rec.ai_agent_id is None
 
 
 # ---------------------------------------------------------------------------

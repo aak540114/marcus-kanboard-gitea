@@ -369,6 +369,11 @@ class BoardWatcher:
                 "title": getattr(task, "name", getattr(task, "title", task.id)),
                 "status": task.status.value,
                 "description": task.description or "",
+                # Needed by HumanGatedWorkflow._on_ticket_new's first-sight
+                # recovery: a ticket first seen already assigned + workable
+                # produces no assignment/status diff events afterwards, so
+                # the assignment state must travel with ticket.new itself.
+                "assignee": self._extract_assignee(task) or "",
             },
         }
         data.update(extra)
