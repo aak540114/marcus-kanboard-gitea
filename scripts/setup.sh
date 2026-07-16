@@ -507,10 +507,24 @@ fi
 #    of building a container for it.
 # ---------------------------------------------------------------------
 
+# Set below when native mode should auto-launch Marcus as this script's
+# very last action (after the summary prints) — see the bottom of this
+# file. Deferred rather than launched here because run_marcus_native.sh
+# exec's into a long-running server that never returns, which would skip
+# the summary entirely if we jumped to it this early.
+NATIVE_LAUNCH_PENDING="false"
+
 if [ "$(env_get MARCUS_RUN_MODE)" = "native" ]; then
     log "Marcus run mode is 'native' — skipping the marcus container build."
-    log "Kanboard, Gitea, and every token/webhook they need are provisioned; start Marcus with:"
-    log "  ./scripts/run_marcus_native.sh"
+    NATIVE_PID_FILE="$REPO_ROOT/.marcus_native.pid"
+    if [ -f "$NATIVE_PID_FILE" ] && kill -0 "$(cat "$NATIVE_PID_FILE" 2>/dev/null)" 2>/dev/null; then
+        log "A native Marcus process is already running (PID $(cat "$NATIVE_PID_FILE")) — leaving it running."
+        log "Stop it first with ./scripts/teardown.sh if you want this run to (re)start it."
+    else
+        NATIVE_LAUNCH_PENDING="true"
+        log "Kanboard, Gitea, and every token/webhook they need are provisioned. Marcus starts"
+        log "automatically at the end of this script (./scripts/run_marcus_native.sh)."
+    fi
 else
     log "Building and starting Marcus..."
     # Start marcus (always) plus caddy (only when the TLS overlay is active —
@@ -552,7 +566,11 @@ else
 fi
 echo " Gitea:     http://localhost:3000   (root / $(env_get GITEA_ADMIN_PASSWORD))"
 if [ "$(env_get MARCUS_RUN_MODE)" = "native" ]; then
-    echo " Marcus:    NOT STARTED YET — run ./scripts/run_marcus_native.sh (will listen on http://localhost:${host_port}/mcp)"
+    if [ "$NATIVE_LAUNCH_PENDING" = "true" ]; then
+        echo " Marcus:    starting now (this script exec's into ./scripts/run_marcus_native.sh below) — will listen on http://localhost:${host_port}/mcp"
+    else
+        echo " Marcus:    already running natively — http://localhost:${host_port}/mcp"
+    fi
 else
     echo " Marcus:    http://localhost:${host_port}/mcp"
 fi
@@ -567,14 +585,15 @@ else
     echo " Agent auth: none (localhost-only). Set MARCUS_AGENT_TOKEN before exposing remotely."
 fi
 echo
-if [ "$(env_get MARCUS_RUN_MODE)" = "native" ]; then
-    echo " Start Marcus, then connect an AI agent from this machine:"
-    echo "   ./scripts/run_marcus_native.sh &"
-    echo "   claude mcp add --transport http marcus http://localhost:${host_port}/mcp${auth_flag}"
+if [ "$NATIVE_LAUNCH_PENDING" = "true" ]; then
+    echo " This terminal is about to become Marcus's own log output (./scripts/run_marcus_native.sh, in the"
+    echo " foreground) — Ctrl-C stops it, or run ./scripts/teardown.sh from elsewhere."
+    echo
+    echo " Connect an AI agent from a DIFFERENT terminal/tab:"
 else
     echo " Connect an AI agent from this machine:"
-    echo "   claude mcp add --transport http marcus http://localhost:${host_port}/mcp${auth_flag}"
 fi
+echo "   claude mcp add --transport http marcus http://localhost:${host_port}/mcp${auth_flag}"
 echo
 
 bind_host="$(env_get MARCUS_BIND_HOST)"
@@ -632,3 +651,17 @@ if [ -n "$agent_token" ]; then
     echo " The agent token is stored in .env (git-ignored). Anyone with it can drive the board."
 fi
 echo "======================================================================"
+
+# ---------------------------------------------------------------------
+# 9. Native mode: hand off to run_marcus_native.sh as this script's very
+#    last action, so `./scripts/setup.sh` alone is enough to end with
+#    Marcus actually running — no separate command needed. Deliberately
+#    last: everything above (summary, credentials, connect command) must
+#    already be on screen, since run_marcus_native.sh exec's into a
+#    long-running server that never returns control here.
+# ---------------------------------------------------------------------
+
+if [ "$NATIVE_LAUNCH_PENDING" = "true" ]; then
+    echo
+    exec "$SCRIPT_DIR/run_marcus_native.sh"
+fi

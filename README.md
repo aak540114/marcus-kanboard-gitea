@@ -114,7 +114,7 @@ Agents do talk to **Gitea** directly, but only for `git clone`/`fetch`/`push` on
 ./scripts/setup.sh
 ```
 
-This one command does everything the individually-numbered steps below used to require by hand: asks how Marcus itself should run (in Docker, or natively on this host — see [Hybrid mode: Marcus outside Docker](#hybrid-mode-marcus-outside-docker)), starts Kanboard and Gitea, creates the Kanboard project and its six required columns, sets the Kanboard API token and webhook, creates the Gitea admin account and access token, picks and wires up an AI provider for Marcus's own decomposition/analysis calls (see [AI provider](#ai-provider) — no API key prompt), then builds and starts Marcus itself (Docker mode) or prints the command to start it (native mode).
+This one command does everything the individually-numbered steps below used to require by hand: asks how Marcus itself should run (in Docker, or natively on this host — see [Hybrid mode: Marcus outside Docker](#hybrid-mode-marcus-outside-docker)), starts Kanboard and Gitea, creates the Kanboard project and its six required columns, sets the Kanboard API token and webhook, creates the Gitea admin account and access token, picks and wires up an AI provider for Marcus's own decomposition/analysis calls (see [AI provider](#ai-provider) — no API key prompt), then starts Marcus itself either way — builds and starts its container (Docker mode), or `exec`'s into `./scripts/run_marcus_native.sh` as its own last step (native mode) — so `./scripts/setup.sh` alone is enough to end with Marcus actually running, no second command needed.
 
 It's safe to re-run — every step checks live state before creating or changing anything, so running it again after `docker compose down` is a fast no-op, and running it after `docker compose down -v` (which wipes volumes) re-provisions everything from scratch.
 
@@ -133,7 +133,7 @@ When it finishes it prints the Kanboard/Gitea/Marcus URLs, the Gitea admin passw
 | Gitea access token | Generated non-interactively | `docker compose exec -u git gitea gitea admin user generate-access-token ...` |
 | AI provider | `claude_subscription` if this machine has an authenticated `claude` CLI; `anthropic` if `CLAUDE_API_KEY` is already in `.env`; otherwise the script fails with instructions instead of prompting | See [AI provider](#ai-provider) |
 | Network access | Asks once: allow AI agents on other machines to connect to Marcus, or localhost-only? Defaults to localhost-only if there's no terminal to ask | See [Network access](#network-access) |
-| Marcus | Docker mode: built and started once everything above has produced the values it needs. Native mode: skipped — the script prints the command to start it yourself | `docker compose --profile docker-marcus up -d --build marcus`, or `./scripts/run_marcus_native.sh` |
+| Marcus | Docker mode: built and started once everything above has produced the values it needs. Native mode: no container is built — the script `exec`'s into `run_marcus_native.sh` as its own last step instead, so Marcus ends up running either way with one command | `docker compose --profile docker-marcus up -d --build marcus`, or `exec ./scripts/run_marcus_native.sh` |
 
 </details>
 
@@ -273,16 +273,16 @@ Kanboard and Gitea always run in Docker (`docker-compose.yml`), but Marcus itsel
 - Marcus runs as a normal process on your host: `./scripts/run_marcus_native.sh`.
 - They talk to each other over `localhost` ports instead of Docker's internal service names — Marcus reaches Kanboard at `http://localhost:8080/jsonrpc.php` and Gitea at `http://localhost:3000` (the same host-published ports a human's browser already uses), and Kanboard/Gitea reach back OUT to Marcus at `http://host.docker.internal:4298/...` for their webhooks (the standard Docker mechanism for a container to reach a process on its host).
 
-**Setup:**
+**Setup — one command, same as Docker mode:**
 ```bash
 ./scripts/setup.sh
 # → "How should Marcus run?" → choose 2 (native)
 ```
-This provisions Kanboard, Gitea, every token, and the webhooks exactly like Docker mode — it just skips building a container for Marcus and prints the next command instead:
-```bash
-./scripts/run_marcus_native.sh
-```
-Requires Python 3.11+ and Marcus's dependencies installed on the host (`pip install -r requirements.txt && pip install --no-deps -e .`) — `run_marcus_native.sh` checks for this and tells you the exact commands if they're missing. If you're using `claude_subscription`, it also checks that `claude login` is active on this host before starting.
+This provisions Kanboard, Gitea, and every token/webhook exactly like Docker mode, then **automatically starts Marcus itself** as the script's last step (it `exec`'s into `./scripts/run_marcus_native.sh` right after printing the summary) — no separate command to run afterward. That terminal becomes Marcus's own log output; run the printed `claude mcp add` command from a different terminal/tab, and stop Marcus with Ctrl-C or `./scripts/teardown.sh`.
+
+Requires Python 3.11+ and Marcus's dependencies installed on the host (`pip install -r requirements.txt && pip install --no-deps -e .`) *before* running setup — `run_marcus_native.sh` checks for this and exits with the exact commands if they're missing (setup.sh's own provisioning of Kanboard/Gitea still completes either way; only the final Marcus launch fails). If you're using `claude_subscription`, it also checks that `claude login` is active on this host before starting.
+
+To start Marcus again later without re-provisioning anything (e.g. after a reboot), run `./scripts/run_marcus_native.sh` directly — re-running the full `./scripts/setup.sh` also works and is safe (it detects an already-running native Marcus and leaves it alone rather than trying to start a second one on the same port).
 
 **What's different from Docker mode:**
 - Marcus's own state (`~/.marcus/costs.db`, ticket lifecycle, etc.) lives under the repo's `./data/` directory either way (both modes resolve these as paths relative to Marcus's own working directory, which `run_marcus_native.sh` sets to the repo root) — so switching modes doesn't lose anything, but the two modes don't share `~/.marcus/costs.db` outside that (Docker's copy is bind-mounted from `./data/.marcus`; native mode's is wherever `~/.marcus` really is on your host — usually the same place, but worth knowing if they ever diverge).
