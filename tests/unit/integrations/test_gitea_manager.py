@@ -402,3 +402,70 @@ class TestInitWithReadme:
         readme = tmp_path / "my-app" / "README.md"
         assert readme.exists()
         assert "My App" in readme.read_text()
+
+    @pytest.mark.asyncio
+    async def test_fresh_init_commits_staged_readme(self, tmp_path):
+        """A genuinely fresh init (staged changes present) commits them."""
+        mgr = GiteaManager("http://localhost:3000", "tok")
+        mgr._username = "root"
+
+        run_calls = []
+
+        async def fake_run_git(args, cwd):
+            run_calls.append(args)
+            if args[:4] == ["git", "diff", "--cached", "--quiet"]:
+                # Non-zero exit = staged changes exist.
+                raise RuntimeError("git diff --cached --quiet failed (rc 1)")
+
+        local_path = str(tmp_path / "my-app")
+        with patch(
+            "src.integrations.gitea_manager._run_git", side_effect=fake_run_git
+        ):
+            await mgr.init_with_readme(
+                "http://localhost:3000/root/my-app.git", local_path
+            )
+
+        assert any(c[:2] == ["git", "commit"] for c in run_calls)
+
+    @pytest.mark.asyncio
+    async def test_retry_over_partial_prior_attempt_succeeds(self, tmp_path):
+        """Re-running over a half-completed earlier attempt must not raise.
+
+        Regression: init_with_readme was not idempotent — after a first
+        attempt that committed but failed on the network push, every retry
+        died on `git commit` ("nothing to commit") and then `git remote
+        add` ("remote origin already exists"), so ensure_repo() failed
+        permanently for that project after ONE transient failure. A retry
+        now skips the empty commit and updates the existing remote's URL
+        instead of re-adding it, then reaches the push.
+        """
+        mgr = GiteaManager("http://localhost:3000", "tok")
+        mgr._username = "root"
+
+        run_calls = []
+
+        async def fake_run_git(args, cwd):
+            run_calls.append(args)
+            # Clean staged tree (diff --cached exits 0 → no exception),
+            # committed by the earlier attempt.
+            if args[:3] == ["git", "remote", "add"]:
+                raise RuntimeError("fatal: remote origin already exists.")
+
+        local_path = str(tmp_path / "my-app")
+        (tmp_path / "my-app").mkdir()
+        (tmp_path / "my-app" / "README.md").write_text("# My App\n")
+
+        with patch(
+            "src.integrations.gitea_manager._run_git", side_effect=fake_run_git
+        ):
+            await mgr.init_with_readme(
+                "http://localhost:3000/root/my-app.git", local_path
+            )
+
+        # No empty re-commit.
+        assert not any(c[:2] == ["git", "commit"] for c in run_calls)
+        # Existing remote gets its URL refreshed (also covers rotated tokens).
+        set_url = next(c for c in run_calls if c[:3] == ["git", "remote", "set-url"])
+        assert set_url[-1] == "http://root:tok@localhost:3000/root/my-app.git"
+        # And the push is finally reached.
+        assert ["git", "push", "-u", "origin", "main"] in run_calls

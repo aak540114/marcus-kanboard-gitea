@@ -401,6 +401,88 @@ class TestStatusChangedTrigger:
 
 
 # ---------------------------------------------------------------------------
+# Review-signal ordering: no state change before the comment lands
+# ---------------------------------------------------------------------------
+
+
+class TestReviewSignalOrdering:
+    """State must not advance until the human-facing signal is delivered.
+
+    The old order transitioned to WAITING_FOR_HUMAN and released the AI
+    claim BEFORE posting the review comment and moving the column. A brief
+    Kanboard outage at that moment lost the human's only "please review"
+    signal, and a retry was impossible forever: the record was already
+    WAITING_FOR_HUMAN, so the transition raised InvalidTransitionError and
+    the tool returned False on every subsequent call — a permanently
+    stranded ticket.
+    """
+
+    def _in_progress_ticket(self, workflow, lifecycle, tid="60"):
+        lifecycle.get_or_create(tid, "kanboard")
+        lifecycle.transition(tid, "kanboard", TicketState.READY)
+        lifecycle.transition(tid, "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.set_assignee(tid, "kanboard", "alice")
+        lifecycle.claim_ticket(tid, "kanboard", workflow._agent_id)
+        return lifecycle.get(tid, "kanboard")
+
+    @pytest.mark.asyncio
+    async def test_failed_comment_leaves_state_recoverable(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Comment post fails → still IN_PROGRESS, still claimed, False."""
+        self._in_progress_ticket(workflow, lifecycle)
+        mock_kanban.add_comment = AsyncMock(side_effect=RuntimeError("kanboard down"))
+
+        result = await workflow.signal_ready_for_review("60")
+
+        assert result is False
+        rec = lifecycle.get("60", "kanboard")
+        assert rec.state == TicketState.IN_PROGRESS
+        assert rec.ai_agent_id is not None
+        mock_kanban.move_task_to_column.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_retry_after_recovery_succeeds(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """A retry once Kanboard is back completes the review handoff."""
+        self._in_progress_ticket(workflow, lifecycle, tid="61")
+        mock_kanban.add_comment = AsyncMock(side_effect=RuntimeError("down"))
+        assert await workflow.signal_ready_for_review("61") is False
+
+        mock_kanban.add_comment = AsyncMock(return_value=1)
+        result = await workflow.signal_ready_for_review("61")
+
+        assert result is True
+        rec = lifecycle.get("61", "kanboard")
+        assert rec.state == TicketState.WAITING_FOR_HUMAN
+        assert rec.ai_agent_id is None
+        mock_kanban.move_task_to_column.assert_called_with(
+            "61", "waiting for human"
+        )
+
+    @pytest.mark.asyncio
+    async def test_set_waiting_for_human_same_ordering(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """set_waiting_for_human gets the same recoverability guarantee."""
+        self._in_progress_ticket(workflow, lifecycle, tid="62")
+        mock_kanban.add_comment = AsyncMock(side_effect=RuntimeError("down"))
+
+        result = await workflow.set_waiting_for_human("62", "need input")
+
+        assert result is False
+        rec = lifecycle.get("62", "kanboard")
+        assert rec.state == TicketState.IN_PROGRESS
+        assert rec.ai_agent_id is not None
+
+        mock_kanban.add_comment = AsyncMock(return_value=1)
+        assert await workflow.set_waiting_for_human("62", "need input") is True
+        rec = lifecycle.get("62", "kanboard")
+        assert rec.state == TicketState.WAITING_FOR_HUMAN
+
+
+# ---------------------------------------------------------------------------
 # Claim-release gaps: todo reset and restart ghosts
 # ---------------------------------------------------------------------------
 

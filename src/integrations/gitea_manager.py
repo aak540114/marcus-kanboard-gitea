@@ -317,13 +317,43 @@ class GiteaManager:
                 f.write(f"# {project_name}\n\nManaged by Marcus.\n")
 
         await _run_git(["git", "add", "README.md"], cwd=local_path)
-        await _run_git(
-            ["git", "commit", "-m", "init: initial commit from Marcus"],
-            cwd=local_path,
-        )
-        await _run_git(
-            ["git", "remote", "add", "origin", push_url], cwd=local_path
-        )
+
+        # Idempotency matters here: ensure_repo() deliberately does not
+        # persist a mapping on failure and RETRIES this whole method on the
+        # next lookup. A first attempt that committed but died on the
+        # network push leaves a directory where a naive re-run fails
+        # forever — `git commit` exits non-zero with "nothing to commit"
+        # and `git remote add` with "remote origin already exists" — which
+        # turned ONE transient failure into permanently broken repo
+        # provisioning for that project. So: commit only when something is
+        # staged, and update the remote's URL when it already exists
+        # (which also picks up a rotated GITEA_TOKEN).
+        try:
+            # Exits 0 when the staged tree is clean, non-zero when there
+            # are staged changes to commit.
+            await _run_git(
+                ["git", "diff", "--cached", "--quiet"], cwd=local_path
+            )
+            has_staged_changes = False
+        except RuntimeError:
+            has_staged_changes = True
+
+        if has_staged_changes:
+            await _run_git(
+                ["git", "commit", "-m", "init: initial commit from Marcus"],
+                cwd=local_path,
+            )
+
+        try:
+            await _run_git(
+                ["git", "remote", "add", "origin", push_url], cwd=local_path
+            )
+        except RuntimeError:
+            await _run_git(
+                ["git", "remote", "set-url", "origin", push_url],
+                cwd=local_path,
+            )
+
         await _run_git(
             ["git", "push", "-u", "origin", "main"], cwd=local_path
         )

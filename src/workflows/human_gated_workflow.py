@@ -729,6 +729,37 @@ class HumanGatedWorkflow:
             return await self._autocomplete_ticket(ticket_id, record)
 
         # ── Human gate: wait for human review ──────────────────────────
+        # Ordering is deliberate: the review comment — the human's only
+        # "please review" signal — is posted BEFORE any state changes.
+        # The old order transitioned to WAITING_FOR_HUMAN and released
+        # the claim first; a brief Kanboard outage then lost the comment
+        # and column move, and a retry was impossible forever (the record
+        # was already WAITING_FOR_HUMAN, so the transition raised
+        # InvalidTransitionError on every subsequent call). A failed post
+        # now leaves the ticket IN_PROGRESS and claimed — the agent's
+        # tool call returns False and can simply be retried.
+        dev_info = self._dev_env.get_info(ticket_id, self._provider)
+        dev_url = dev_info.url if dev_info else None
+
+        branch_mgr = await self._branch_for_ticket(ticket_id)
+        commits = await branch_mgr.get_branch_commits(record.branch_name)
+        ac_items = self._get_ac_items(record)
+        comment = CommentFormatter.ready_for_review(
+            ticket_id=ticket_id,
+            branch_name=record.branch_name,
+            ac_items=ac_items,
+            dev_env_url=dev_url,
+            commit_count=len(commits),
+        )
+        posted = await self._post_comment(ticket_id, comment)
+        if not posted:
+            logger.error(
+                "Ticket %s: review comment could not be posted — leaving "
+                "IN_PROGRESS and claimed so the agent can retry",
+                ticket_id,
+            )
+            return False
+
         try:
             self._lifecycle.transition(
                 ticket_id,
@@ -747,28 +778,13 @@ class HumanGatedWorkflow:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not update kanban column: %s", exc)
 
-        dev_info = self._dev_env.get_info(ticket_id, self._provider)
-        dev_url = dev_info.url if dev_info else None
-
-        branch_mgr = await self._branch_for_ticket(ticket_id)
-        commits = await branch_mgr.get_branch_commits(record.branch_name)
-        ac_items = self._get_ac_items(record)
-        comment = CommentFormatter.ready_for_review(
-            ticket_id=ticket_id,
-            branch_name=record.branch_name,
-            ac_items=ac_items,
-            dev_env_url=dev_url,
-            commit_count=len(commits),
-        )
-        posted = await self._post_comment(ticket_id, comment)
-
         try:
             self._lifecycle.release_ticket(ticket_id, self._provider)
         except KeyError:
             pass
         await self._pickup_next_ticket()
 
-        return posted
+        return True
 
     async def set_waiting_for_human(
         self,
@@ -822,6 +838,23 @@ class HumanGatedWorkflow:
             return await self._post_comment(ticket_id, note)
 
         # ── Human gate: block until human responds ─────────────────────
+        # Comment first, state second — same recoverability guarantee as
+        # signal_ready_for_review (see the comment there): a failed post
+        # leaves the ticket IN_PROGRESS and claimed for a clean retry.
+        comment = CommentFormatter.revision_requested(
+            ticket_id=ticket_id,
+            human_comment="",
+            ai_understanding=reason,
+        )
+        posted = await self._post_comment(ticket_id, comment)
+        if not posted:
+            logger.error(
+                "Ticket %s: waiting-for-human comment could not be posted — "
+                "leaving IN_PROGRESS and claimed so the agent can retry",
+                ticket_id,
+            )
+            return False
+
         try:
             self._lifecycle.transition(
                 ticket_id,
@@ -838,20 +871,13 @@ class HumanGatedWorkflow:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not update kanban column: %s", exc)
 
-        comment = CommentFormatter.revision_requested(
-            ticket_id=ticket_id,
-            human_comment="",
-            ai_understanding=reason,
-        )
-        posted = await self._post_comment(ticket_id, comment)
-
         try:
             self._lifecycle.release_ticket(ticket_id, self._provider)
         except KeyError:
             pass
         await self._pickup_next_ticket()
 
-        return posted
+        return True
 
     async def set_blocked(
         self,
