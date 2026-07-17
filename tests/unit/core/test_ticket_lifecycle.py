@@ -400,3 +400,49 @@ class TestClaimRelease:
         assert rec.ai_agent_id == "agent-gamma"
         # Second manager cannot steal the claim.
         assert m2.claim_ticket("C-7", "jira", "agent-delta") is False
+
+
+class TestReleaseStaleClaims:
+    """Tests for release_stale_claims() — explicit ghost-claim cleanup.
+
+    Claims are persisted (see TestClaimRelease above) but the workflow's
+    agent id is a fresh UUID every process, so after a restart every
+    persisted claim is held by a ghost no event can ever release — the
+    ticket would sit "in progress" on the board forever. The workflow
+    calls this at startup; it is deliberately NOT automatic at load time
+    so raw manager semantics (claims survive restart) stay intact.
+    """
+
+    def test_releases_all_held_claims_and_reports_them(self, manager):
+        """Every claimed ticket is released; unclaimed ones untouched."""
+        manager.get_or_create("S-1", "kanboard")
+        manager.claim_ticket("S-1", "kanboard", "dead-agent-1")
+        manager.get_or_create("S-2", "kanboard")
+        manager.claim_ticket("S-2", "kanboard", "dead-agent-2")
+        manager.get_or_create("S-3", "kanboard")  # never claimed
+
+        released = manager.release_stale_claims()
+
+        assert sorted(released) == ["kanboard:S-1", "kanboard:S-2"]
+        assert manager.get("S-1", "kanboard").ai_agent_id is None
+        assert manager.get("S-2", "kanboard").ai_agent_id is None
+        assert manager.get("S-3", "kanboard").ai_agent_id is None
+
+    def test_noop_when_nothing_claimed(self, manager):
+        """No claims → empty list, no error."""
+        manager.get_or_create("S-4", "kanboard")
+        assert manager.release_stale_claims() == []
+
+    def test_release_persists_across_reload(self, state_file):
+        """The cleanup is written to disk, not just in-memory."""
+        m1 = TicketLifecycleManager(state_file=state_file)
+        m1.get_or_create("S-5", "kanboard")
+        m1.claim_ticket("S-5", "kanboard", "dead-agent")
+        m1.release_stale_claims()
+
+        m2 = TicketLifecycleManager(state_file=state_file)
+        rec = m2.get("S-5", "kanboard")
+        assert rec is not None
+        assert rec.ai_agent_id is None
+        # A fresh agent can now claim it.
+        assert m2.claim_ticket("S-5", "kanboard", "agent-new") is True

@@ -665,6 +665,45 @@ class TicketLifecycleManager:
             )
         return record
 
+    def release_stale_claims(self) -> List[str]:
+        """Release every held AI claim; return the released record keys.
+
+        Claims are persisted to disk, but the workflow's agent id is a
+        fresh UUID each process — after a restart, every persisted claim
+        belongs to the dead process and no event can ever release it:
+        ``claim_ticket`` refuses new claimants, ``get_available_tickets``
+        skips claimed records, and first-sight recovery deliberately
+        leaves claimed tickets alone. Such a ticket sits "in progress"
+        on the board forever.
+
+        The workflow calls this once at startup, when it KNOWS any
+        existing claim is a ghost. It is deliberately not automatic at
+        load time, so the raw manager's claims-survive-restart semantics
+        (and any future multi-instance use of a shared state file) are
+        unchanged for other callers.
+
+        Returns
+        -------
+        List[str]
+            Record keys (``"{provider}:{ticket_id}"``) whose claims were
+            released. Empty if nothing was claimed.
+        """
+        released: List[str] = []
+        now = datetime.now(timezone.utc)
+        for key, record in self._records.items():
+            if record.ai_agent_id is not None:
+                logger.info(
+                    "Releasing stale claim on %s (held by dead agent %s)",
+                    key,
+                    record.ai_agent_id,
+                )
+                record.ai_agent_id = None
+                record.updated_at = now
+                released.append(key)
+        if released:
+            self._save()
+        return released
+
     def get_agent_ticket(self, agent_id: str) -> Optional[str]:
         """Return the ``ticket_id`` currently claimed by *agent_id*, or ``None``.
 

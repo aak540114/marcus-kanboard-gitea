@@ -401,6 +401,90 @@ class TestStatusChangedTrigger:
 
 
 # ---------------------------------------------------------------------------
+# Claim-release gaps: todo reset and restart ghosts
+# ---------------------------------------------------------------------------
+
+
+class TestClaimReleaseGaps:
+    """A held AI claim must be released whenever work legitimately stops.
+
+    Two previously-missed paths: (1) a human dragging an in-flight card
+    back to 'todo' reset the lifecycle state but left the claim held, so
+    the one-ticket-per-agent gate skipped every future ticket forever;
+    (2) after a restart, persisted claims belong to the dead process's
+    UUID (the agent id is regenerated every start), and no event could
+    ever release them — the first-sight recovery deliberately skips
+    claimed records, so those tickets stayed 'in progress' indefinitely.
+    """
+
+    @pytest.mark.asyncio
+    async def test_todo_reset_releases_claim(self, workflow, lifecycle):
+        """Human moves an AI-claimed card back to todo → claim released."""
+        lifecycle.get_or_create("50", "kanboard")
+        lifecycle.transition("50", "kanboard", TicketState.READY)
+        lifecycle.transition("50", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.set_assignee("50", "kanboard", "alice")
+        lifecycle.claim_ticket("50", "kanboard", workflow._agent_id)
+
+        event = _make_event(
+            {"ticket_id": "50", "new_status": "todo",
+             "old_status": "in_progress", "provider": "kanboard"}
+        )
+        await workflow._on_status_changed(event)
+
+        rec = lifecycle.get("50", "kanboard")
+        assert rec is not None
+        assert rec.state == TicketState.TODO
+        assert rec.ai_agent_id is None
+
+    @pytest.mark.asyncio
+    async def test_todo_reset_unblocks_other_tickets(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """After a todo reset, the agent can start work on another ticket."""
+        lifecycle.get_or_create("51", "kanboard")
+        lifecycle.transition("51", "kanboard", TicketState.READY)
+        lifecycle.claim_ticket("51", "kanboard", workflow._agent_id)
+        event = _make_event(
+            {"ticket_id": "51", "new_status": "todo",
+             "old_status": "ready", "provider": "kanboard"}
+        )
+        await workflow._on_status_changed(event)
+
+        # A different assigned+ready ticket must now be startable.
+        lifecycle.get_or_create("52", "kanboard")
+        lifecycle.set_assignee("52", "kanboard", "bob")
+        move = _make_event(
+            {"ticket_id": "52", "new_status": "ready",
+             "old_status": "todo", "provider": "kanboard"}
+        )
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            return_value="ticket/kanboard/52",
+        ):
+            await workflow._on_status_changed(move)
+
+        rec = lifecycle.get("52", "kanboard")
+        assert rec is not None
+        assert rec.ai_agent_id is not None
+
+    @pytest.mark.asyncio
+    async def test_start_releases_ghost_claims(self, workflow, lifecycle):
+        """workflow.start() releases claims persisted by a dead process."""
+        lifecycle.get_or_create("53", "kanboard")
+        lifecycle.transition("53", "kanboard", TicketState.READY)
+        lifecycle.transition("53", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.claim_ticket("53", "kanboard", "marcus-deadbeef")
+
+        workflow._watcher.start = AsyncMock()
+        await workflow.start()
+
+        rec = lifecycle.get("53", "kanboard")
+        assert rec is not None
+        assert rec.ai_agent_id is None
+
+
+# ---------------------------------------------------------------------------
 # Per-project branch manager resolution
 # ---------------------------------------------------------------------------
 

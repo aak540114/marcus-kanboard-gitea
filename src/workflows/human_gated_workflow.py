@@ -166,6 +166,19 @@ class HumanGatedWorkflow:
         if not self._subscribed:
             self._subscribe_events()
             self._subscribed = True
+        # Persisted claims are ghosts after a restart: this instance's
+        # agent id is a fresh UUID, so no event could ever release a claim
+        # held under the previous process's id — the ticket would sit
+        # "in progress" on the board forever (first-sight recovery
+        # deliberately skips claimed records). Release them all before the
+        # watcher's first poll so recovery can re-claim and resume work.
+        stale = self._lifecycle.release_stale_claims()
+        if stale:
+            logger.info(
+                "Released %d stale AI claim(s) from a previous run: %s",
+                len(stale),
+                ", ".join(stale),
+            )
         await self._watcher.start()
         logger.info("HumanGatedWorkflow started for provider=%s", self._provider)
 
@@ -389,6 +402,15 @@ class HumanGatedWorkflow:
                     reason="Human moved ticket to todo",
                 )
             except (InvalidTransitionError, KeyError):
+                pass
+            # Release any AI claim: a todo reset means "stop working on
+            # this". Without this, the claim stayed held and the
+            # one-ticket-per-agent gate then skipped EVERY future ticket
+            # ("already working on ticket X") until this specific ticket
+            # was unassigned — a full workflow deadlock.
+            try:
+                self._lifecycle.release_ticket(ticket_id, self._provider)
+            except KeyError:
                 pass
 
         elif new_status == TaskStatus.BLOCKED.value:
