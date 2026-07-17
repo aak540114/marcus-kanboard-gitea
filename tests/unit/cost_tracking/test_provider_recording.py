@@ -85,6 +85,7 @@ class TestAnthropicProviderRecords:
             result = await provider._call_claude("hi", operation="parse_prd")
 
         assert result == "ok"
+        recorder.flush()
         row = store.conn.execute(
             "SELECT input_tokens, cache_creation_tokens, cache_read_tokens, "
             "output_tokens, operation, provider, request_id "
@@ -123,6 +124,7 @@ class TestLocalProviderRecords:
             result = await provider._call_local_llm("hi")
 
         assert result == "ok"
+        recorder.flush()
         row = store.conn.execute(
             "SELECT input_tokens, output_tokens, provider FROM token_events"
         ).fetchone()
@@ -167,6 +169,7 @@ class TestOpenAIProviderRecords:
             result = await provider._call_openai([{"role": "user", "content": "hi"}])
 
         assert result == "ok"
+        recorder.flush()
         row = store.conn.execute(
             "SELECT input_tokens, output_tokens, provider, model, request_id "
             "FROM token_events"
@@ -203,6 +206,7 @@ class TestCloudProviderRecords:
             result = await provider._call_cloud_llm("hi")
 
         assert result == "ok"
+        recorder.flush()
         row = store.conn.execute(
             "SELECT input_tokens, output_tokens, provider FROM token_events"
         ).fetchone()

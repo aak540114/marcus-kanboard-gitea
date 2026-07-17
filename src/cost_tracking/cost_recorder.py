@@ -18,11 +18,13 @@ The recorder is intentionally:
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Iterator, List, Optional
+from typing import Callable, Iterator, List, Optional
 
 from src.cost_tracking.cost_store import CostStore, TokenEvent
 
@@ -149,6 +151,17 @@ class CostRecorder:
     def __init__(self, store: CostStore, enabled: bool = True) -> None:
         self.store = store
         self.enabled = enabled
+        # Single worker: serializes all store writes (CostStore's own
+        # contract requires callers to serialize) while keeping them OFF
+        # the event loop. The store's sqlite connection is synchronous
+        # with busy_timeout=5000 and a documented cross-process contender
+        # (Cato sweeps the same DB every 30 s) — a write issued directly
+        # from async provider code can spin inside the busy-timeout for
+        # up to 5 s per statement, freezing every coroutine in the
+        # server. See _submit_write.
+        self._write_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="cost-store-write"
+        )
         # Process-lifetime cache of (project_id, name) pairs already
         # snapshotted into project_names. Lets planner_context() skip
         # the SQL upsert on every push when the name hasn't changed —
@@ -169,6 +182,41 @@ class CostRecorder:
         # operation-taxonomy PR.
         self._unregistered_operations_warned: set[str] = set()
 
+    # -- write offloading ---------------------------------------------------
+
+    def _submit_write(self, fn: Callable[[], None]) -> None:
+        """Run a store write off the event loop; inline when no loop runs.
+
+        Sync callers (CLI ingesters, scripts, tests without a loop) keep
+        the old synchronous write-then-return behavior. Async callers get
+        the write queued to the single write worker and return
+        immediately — ordering is preserved (one worker), and each
+        wrapped ``fn`` swallows and logs its own errors, matching the
+        recorder's side-effect-only contract.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            fn()
+            return
+        try:
+            self._write_executor.submit(fn)
+        except RuntimeError:  # pragma: no cover - interpreter shutdown
+            fn()
+
+    def flush(self, timeout: float = 5.0) -> None:
+        """Block until every queued write has completed.
+
+        Test and shutdown aid — a no-op marker is queued behind all
+        pending writes and waited on.
+
+        Parameters
+        ----------
+        timeout : float
+            Seconds to wait before giving up.
+        """
+        self._write_executor.submit(lambda: None).result(timeout=timeout)
+
     # -- context management -----------------------------------------------
 
     @contextmanager
@@ -188,13 +236,21 @@ class CostRecorder:
         if self.enabled and ctx.project_name and ctx.project_id != "unassigned":
             pair = (ctx.project_id, ctx.project_name)
             if pair not in self._snapshotted_names:
-                try:
-                    self.store.upsert_project_name(ctx.project_id, ctx.project_name)
-                    self._snapshotted_names.add(pair)
-                except Exception:  # pragma: no cover - logged, never raised
-                    logger.exception(
-                        "upsert_project_name failed for %s", ctx.project_id
-                    )
+                # Cache optimistically: the upsert is idempotent, so a
+                # failed offloaded write just means the snapshot lands on
+                # a later process instead — never worth re-blocking on.
+                self._snapshotted_names.add(pair)
+                project_id, project_name = ctx.project_id, ctx.project_name
+
+                def _upsert() -> None:
+                    try:
+                        self.store.upsert_project_name(project_id, project_name)
+                    except Exception:  # pragma: no cover - logged, never raised
+                        logger.exception(
+                            "upsert_project_name failed for %s", project_id
+                        )
+
+                self._submit_write(_upsert)
 
         stack = list(_context_stack.get())
         stack.append(ctx)
@@ -412,10 +468,13 @@ class CostRecorder:
             was_retry=was_retry,
             retry_reason=retry_reason,
         )
-        try:
-            self.store.record_event(event)
-        except Exception as exc:  # pragma: no cover - logged, swallowed
-            logger.warning("cost recorder swallowed store error: %s", exc)
+        def _write() -> None:
+            try:
+                self.store.record_event(event)
+            except Exception as exc:  # pragma: no cover - logged, swallowed
+                logger.warning("cost recorder swallowed store error: %s", exc)
+
+        self._submit_write(_write)
 
 
 # ---------------------------------------------------------------------------

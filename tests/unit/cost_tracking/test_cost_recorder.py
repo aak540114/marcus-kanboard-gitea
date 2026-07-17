@@ -567,3 +567,79 @@ class TestSingleton:
         assert get_recorder() is recorder
         # Reset for downstream tests
         set_recorder(None)
+
+
+class TestEventLoopOffload:
+    """Store writes must never run on a live event loop's thread.
+
+    CostStore's sqlite connection is synchronous with busy_timeout=5000
+    and a documented cross-process contender (Cato's 30 s sweeps of the
+    same DB) — a write issued directly from async provider code can spin
+    inside the busy-timeout for up to 5 s per statement, freezing every
+    coroutine in the server. Writes made while a loop is running are
+    therefore offloaded to the recorder's single write worker (one
+    worker = the serialization CostStore's contract demands); calls from
+    plain sync code (CLI ingesters, tests) still write inline.
+    """
+
+    @pytest.mark.asyncio
+    async def test_write_offloaded_off_event_loop_thread(
+        self, recorder: CostRecorder, store: CostStore
+    ) -> None:
+        """Inside a running loop, record_event runs on another thread."""
+        import threading
+
+        loop_thread = threading.get_ident()
+        write_threads: list[int] = []
+        original = store.record_event
+
+        def spying_record_event(event):  # noqa: ANN001
+            write_threads.append(threading.get_ident())
+            return original(event)
+
+        store.record_event = spying_record_event  # type: ignore[method-assign]
+
+        recorder.record_planner_call(
+            operation="parse_prd",
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+            input_tokens=10,
+            output_tokens=5,
+        )
+        recorder.flush()
+
+        assert len(write_threads) == 1
+        assert write_threads[0] != loop_thread
+        row = store.conn.execute("SELECT operation FROM token_events").fetchone()
+        assert row == ("parse_prd",)
+
+    def test_sync_context_still_writes_inline(
+        self, recorder: CostRecorder, store: CostStore
+    ) -> None:
+        """No running loop → the write happens synchronously, no flush needed."""
+        recorder.record_planner_call(
+            operation="parse_prd",
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+            input_tokens=10,
+            output_tokens=5,
+        )
+        row = store.conn.execute("SELECT operation FROM token_events").fetchone()
+        assert row == ("parse_prd",)
+
+    @pytest.mark.asyncio
+    async def test_flush_drains_pending_writes(
+        self, recorder: CostRecorder, store: CostStore
+    ) -> None:
+        """flush() blocks until queued writes are durable in the store."""
+        for i in range(5):
+            recorder.record_planner_call(
+                operation="parse_prd",
+                provider="anthropic",
+                model="claude-sonnet-4-6",
+                input_tokens=i,
+                output_tokens=1,
+            )
+        recorder.flush()
+        count = store.conn.execute("SELECT COUNT(*) FROM token_events").fetchone()
+        assert count == (5,)
