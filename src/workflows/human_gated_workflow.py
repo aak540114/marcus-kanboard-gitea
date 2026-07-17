@@ -179,6 +179,15 @@ class HumanGatedWorkflow:
                 len(stale),
                 ", ".join(stale),
             )
+        # Same restart hygiene for dev-env containers: the registry is
+        # in-memory, so containers from a previous run are unreachable
+        # orphans (held ports, docker name collisions on restart).
+        reconcile = getattr(self._dev_env, "reconcile_orphans", None)
+        if reconcile is not None:
+            try:
+                await reconcile()
+            except Exception as exc:  # noqa: BLE001 - never block startup
+                logger.warning("Dev-env orphan reconciliation failed: %s", exc)
         await self._watcher.start()
         logger.info("HumanGatedWorkflow started for provider=%s", self._provider)
 

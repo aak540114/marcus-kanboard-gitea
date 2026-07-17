@@ -820,3 +820,84 @@ class TestDockerCommandTimeouts:
             ok = await docker_manager.refresh("T-43", "kanboard")
 
         assert ok is False
+
+
+class TestReconcileOrphans:
+    """Startup reconciliation of marcus-dev-* containers from a dead run.
+
+    _envs is in-memory only: after a Marcus crash/restart, containers
+    started by the previous process are orphaned forever — no idle
+    timeout reaps them, their ports stay held, and the next start() for
+    the same ticket dies on a docker name conflict with a misleading
+    "check that Docker is running" comment. reconcile_orphans() removes
+    every marcus-dev-* container not currently registered; called at
+    workflow startup, when the registry is empty and any such container
+    is by definition an orphan.
+    """
+
+    @pytest.fixture
+    def docker_manager(self, tmp_path):
+        from src.core.dev_environment import DevEnvironmentConfig
+
+        return DevEnvironmentManager(
+            config=DevEnvironmentConfig(
+                repo_path=str(tmp_path), use_docker=True
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_removes_unregistered_containers(self, docker_manager):
+        """Orphaned marcus-dev-* containers are force-removed."""
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            result = MagicMock()
+            result.returncode = 0
+            if cmd[:2] == ["docker", "ps"]:
+                result.stdout = "abc123\ndef456\n"
+            else:
+                result.stdout = ""
+            return result
+
+        with patch(
+            "src.core.dev_environment.subprocess.run", side_effect=fake_run
+        ):
+            removed = await docker_manager.reconcile_orphans()
+
+        assert removed == 2
+        rm_call = next(c for c in calls if c[:2] == ["docker", "rm"])
+        assert "-f" in rm_call
+        assert "abc123" in rm_call and "def456" in rm_call
+
+    @pytest.mark.asyncio
+    async def test_no_orphans_is_a_noop(self, docker_manager):
+        """No matching containers → nothing removed, no rm call."""
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ""
+            return result
+
+        with patch(
+            "src.core.dev_environment.subprocess.run", side_effect=fake_run
+        ):
+            removed = await docker_manager.reconcile_orphans()
+
+        assert removed == 0
+        assert not any(c[:2] == ["docker", "rm"] for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_docker_failure_degrades_to_noop(self, docker_manager):
+        """A docker error (daemon down) returns 0 instead of raising."""
+        with patch(
+            "src.core.dev_environment.subprocess.run",
+            side_effect=OSError("docker not found"),
+        ):
+            removed = await docker_manager.reconcile_orphans()
+        assert removed == 0

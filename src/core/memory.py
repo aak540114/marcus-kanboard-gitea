@@ -183,11 +183,49 @@ class Memory:
         self.learning_rate = 0.1
         self.memory_decay = 0.95  # How much to weight recent vs old experiences
 
+        # Set once _load_persisted_memory has fully run; lets
+        # ensure_loaded() be an idempotent no-op afterwards.
+        self._persisted_loaded = False
+        #: Strong reference to the startup load task (asyncio keeps only
+        #: weak refs — an unreferenced task can be GC'd mid-flight), and
+        #: the handle ensure_loaded() uses to detect a load stranded on
+        #: an abandoned loop.
+        self._load_task: Optional["asyncio.Task[None]"] = None
+
         # Load persisted memory if available.
         # Skip in test mode to avoid fire-and-forget tasks that
         # outlive the test's event loop (same fix as server.py).
         if self.persistence and not os.environ.get("MARCUS_TEST_MODE"):
-            asyncio.create_task(self._load_persisted_memory())
+            self._load_task = asyncio.create_task(self._load_persisted_memory())
+
+    async def ensure_loaded(self) -> None:
+        """Make sure the persisted-memory load has actually completed.
+
+        ``__init__`` schedules the load on whatever loop is running at
+        construction time. In HTTP mode ``MarcusServer()`` is constructed
+        inside ``setup_http_server()`` on a throwaway setup loop that is
+        abandoned before serving starts — a load still pending at that
+        point would be frozen forever and persisted memory silently never
+        loaded (the same throwaway-loop trap server.py documents for
+        HumanGatedWorkflow). The server's lifespan awaits this on the
+        real serving loop: awaiting the stranded task raises
+        ``RuntimeError`` ("attached to a different loop"), which is the
+        signal to simply re-run the load here. Idempotent — a completed
+        load makes this a no-op.
+        """
+        if not self.persistence or self._persisted_loaded:
+            return
+        task = self._load_task
+        if task is not None:
+            try:
+                await task
+                return
+            except RuntimeError:
+                logger.info(
+                    "Persisted-memory load was stranded on an abandoned "
+                    "startup loop — re-running on the serving loop"
+                )
+        await self._load_persisted_memory()
 
     async def _load_persisted_memory(self) -> None:
         """Load memory from persistence."""
@@ -253,6 +291,10 @@ class Memory:
 
         except Exception as e:
             logger.error(f"Failed to load persisted memory: {e}")
+        finally:
+            # One attempt per process either way — a persistent
+            # persistence failure is logged above, not retried in a loop.
+            self._persisted_loaded = True
 
     async def record_task_start(self, agent_id: str, task: Task) -> None:
         """Record that an agent started a task."""

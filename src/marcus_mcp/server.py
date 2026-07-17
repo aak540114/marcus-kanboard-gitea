@@ -4377,6 +4377,19 @@ function save() {{
             """
             async with mcp_app.router.lifespan_context(mcp_app):
                 await _wire_human_gated_workflow(server)
+                # Persisted-memory load: __init__ scheduled it on the
+                # throwaway setup loop (the same trap documented above for
+                # HumanGatedWorkflow) — if it hadn't finished by the time
+                # that loop was abandoned, it would stay frozen forever.
+                # ensure_loaded() re-runs a stranded load on this loop.
+                memory = getattr(server, "memory", None)
+                if memory is not None and hasattr(memory, "ensure_loaded"):
+                    try:
+                        await memory.ensure_loaded()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "Persisted-memory load failed: %s", exc
+                        )
                 try:
                     yield
                 finally:

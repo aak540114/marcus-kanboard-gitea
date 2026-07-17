@@ -678,6 +678,96 @@ class DevEnvironmentManager:
             provider, ticket_id = key.split(":", 1)
             await self.stop(ticket_id, provider)
 
+    async def reconcile_orphans(self) -> int:
+        """Remove ``marcus-dev-*`` containers left over from a dead run.
+
+        The environment registry (``_envs``) is in-memory only: after a
+        Marcus crash or restart, containers started by the previous
+        process are orphaned — no idle timeout reaps them, their ports
+        stay held, and the next ``start()`` for the same ticket dies on
+        a docker name collision with a misleading "check that Docker is
+        running" error comment. Called at workflow startup (when the
+        registry is empty, so every matching container is by definition
+        an orphan); containers belonging to a currently registered env
+        are left alone, making the call safe at any time.
+
+        Returns
+        -------
+        int
+            Number of containers removed. ``0`` on any docker failure —
+            reconciliation is best-effort and must never block startup.
+        """
+        loop = asyncio.get_event_loop()
+        try:
+            result = await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    ["docker", "ps", "-aq", "--filter", "name=marcus-dev-"],
+                    capture_output=True,
+                    text=True,
+                    timeout=_DOCKER_CMD_TIMEOUT,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - daemon down, binary missing
+            logger.warning("Dev-env orphan scan failed: %s", exc)
+            return 0
+        if result.returncode != 0 or not result.stdout.strip():
+            return 0
+
+        container_ids = [
+            line.strip() for line in result.stdout.splitlines() if line.strip()
+        ]
+        known_names = {
+            info.container_name for info in self._envs.values()
+        }
+        if known_names:
+            # Resolve ids → names so registered (live) envs are spared.
+            try:
+                inspect = await loop.run_in_executor(
+                    None,
+                    lambda: subprocess.run(
+                        ["docker", "inspect", "--format", "{{.Name}}"]
+                        + container_ids,
+                        capture_output=True,
+                        text=True,
+                        timeout=_DOCKER_CMD_TIMEOUT,
+                    ),
+                )
+                names = [
+                    n.strip().lstrip("/")
+                    for n in inspect.stdout.splitlines()
+                    if n.strip()
+                ]
+                container_ids = [
+                    cid
+                    for cid, name in zip(container_ids, names)
+                    if name not in known_names
+                ]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Dev-env orphan inspect failed: %s", exc)
+                return 0
+        if not container_ids:
+            return 0
+
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    ["docker", "rm", "-f"] + container_ids,
+                    capture_output=True,
+                    timeout=_DOCKER_CMD_TIMEOUT,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dev-env orphan removal failed: %s", exc)
+            return 0
+        logger.info(
+            "Removed %d orphaned dev-environment container(s): %s",
+            len(container_ids),
+            ", ".join(container_ids),
+        )
+        return len(container_ids)
+
     # ------------------------------------------------------------------
     # Docker implementation
     # ------------------------------------------------------------------

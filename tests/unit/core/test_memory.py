@@ -4,7 +4,7 @@ Unit tests for the Memory system
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -527,3 +527,93 @@ class TestMemory:
 
         # Median of [1, 2, 3, 4] = (2 + 3) / 2 = 2.5
         assert median == 2.5
+
+
+class TestEnsureLoaded:
+    """ensure_loaded() must survive the HTTP-mode throwaway startup loop.
+
+    Memory.__init__ schedules _load_persisted_memory() via create_task on
+    whatever loop is running at construction time. In HTTP mode,
+    MarcusServer() is constructed inside setup_http_server() on a setup
+    loop that is later abandoned — a load still pending at that point was
+    frozen forever and persisted memory silently never loaded. The
+    server's lifespan now awaits ensure_loaded() on the real serving
+    loop; awaiting a task bound to the dead loop raises RuntimeError and
+    the load re-runs cleanly.
+    """
+
+    def _mock_persistence(self):
+        p = MagicMock()
+        p.query = AsyncMock(return_value=[])
+        return p
+
+    @pytest.mark.asyncio
+    async def test_reruns_load_from_abandoned_loop(self, monkeypatch):
+        """A load stranded on a dead setup loop is re-run on the live loop.
+
+        The throwaway setup loop runs in its own thread (an async test
+        cannot nest run_until_complete on its own thread); the first
+        persistence.query call blocks forever there, so the load task is
+        still pending when the thread — and its loop — are abandoned.
+        """
+        import asyncio as aio
+        import threading
+
+        monkeypatch.delenv("MARCUS_TEST_MODE", raising=False)
+
+        call_count = {"n": 0}
+
+        async def query(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                await aio.sleep(3600)  # strand the setup-loop load
+            return []
+
+        persistence = MagicMock()
+        persistence.query = query
+
+        holder = {}
+
+        def build_on_throwaway_loop():
+            loop = aio.new_event_loop()
+            aio.set_event_loop(loop)
+
+            async def construct():
+                m = Memory(persistence=persistence)
+                await aio.sleep(0)  # let the load task start and block
+                return m
+
+            holder["memory"] = loop.run_until_complete(construct())
+            # Loop deliberately abandoned with the load still pending —
+            # exactly what happens to setup_http_server's loop.
+
+        thread = threading.Thread(target=build_on_throwaway_loop)
+        thread.start()
+        thread.join()
+        memory = holder["memory"]
+
+        await memory.ensure_loaded()
+
+        assert memory._persisted_loaded is True
+        assert call_count["n"] >= 2  # re-run queried on the live loop
+
+    @pytest.mark.asyncio
+    async def test_same_loop_load_not_duplicated(self, monkeypatch):
+        """When the original load completed, ensure_loaded doesn't re-query."""
+        monkeypatch.delenv("MARCUS_TEST_MODE", raising=False)
+        persistence = self._mock_persistence()
+
+        memory = Memory(persistence=persistence)
+        await memory.ensure_loaded()
+        first_count = persistence.query.await_count
+
+        await memory.ensure_loaded()
+
+        assert persistence.query.await_count == first_count
+
+    @pytest.mark.asyncio
+    async def test_no_persistence_is_noop(self):
+        """Without persistence there is nothing to load."""
+        memory = Memory()
+        await memory.ensure_loaded()
+        assert memory._persisted_loaded is False
