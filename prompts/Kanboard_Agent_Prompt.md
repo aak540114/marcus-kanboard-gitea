@@ -22,19 +22,35 @@ then signal completion via Marcus.
 
 ## 2. Connect to Marcus
 
-Marcus runs an MCP server.  Register it with your MCP client once:
+Marcus runs an MCP server over **streamable HTTP**.  Register it with your MCP
+client once.
 
 ```
-MCP server URL: http://localhost:4298/mcp
+MCP server URL: http://<HOST>:4298/mcp
 ```
 
-**For Claude Code:**
+`<HOST>` is `localhost` if Marcus runs on your machine, or the server's
+address/domain if it is remote.  The port (`4298`) and path (`/mcp`) are the
+defaults; a custom deployment may differ.
+
+**Authentication.** If Marcus was set up for remote access (`scripts/setup.sh`
+does this automatically), it requires a bearer token — every request without it
+gets `401`.  Pass it with `-H`:
+
+**For Claude Code (with token):**
+```bash
+claude mcp add --transport http marcus http://<HOST>:4298/mcp \
+  -H "Authorization: Bearer <MARCUS_AGENT_TOKEN>"
+```
+
+**For Claude Code (localhost, no token set — auth is off):**
 ```bash
 claude mcp add --transport http marcus http://localhost:4298/mcp
 ```
 
-**For any other MCP-compatible agent:**
-Point your agent's MCP configuration at `http://localhost:4298/mcp`.
+`<MARCUS_AGENT_TOKEN>` is the value from Marcus's `.env` (or ask whoever runs
+the server).  For any other MCP-compatible agent, point its MCP config at the
+same URL and add the same `Authorization` header.
 
 ---
 
@@ -71,6 +87,8 @@ The response contains:
 | `links` | `{depends_on, blocks, relates_to}` — other tickets this one is connected to. Check `depends_on` before starting: those tickets should be done first |
 | `recent_comments` | Up to the last 10 comments on the ticket, oldest first — `{content, author, date}`. **Read this if the ticket was ever sent to `signal_waiting_for_human`** — a human's reply here is the only place their clarification text appears |
 | `mcp_server_url` | MCP endpoint (already connected) |
+| `gate_mode` | `"human"` or `"ai"` — how completion is handled (see §5) |
+| `already_claimed_by` | An **internal** Marcus slot id (e.g. `marcus-ab12cd34-1`). Marcus claims a ticket internally the moment work starts, so this is **always set** for an in-progress ticket. It does **not** mean another external agent owns it — if you were handed this `ticket_id`, it is yours. Ignore it. |
 | `instructions` | Step-by-step checklist |
 
 If you need more than per-ticket context — the project's tech stack, install/dev-server commands, or architecture notes — call `get_project_description` with the same `ticket_id`/`provider`:
@@ -86,6 +104,14 @@ If you need more than per-ticket context — the project's tech stack, install/d
 ```
 
 It returns `{project_id, description, stack}`, where `stack` is `{language, framework, install_cmd, dev_cmd}` (or `null` if the project description doesn't have enough structure to parse yet).
+
+> **Working in parallel with other agents.** Marcus can run several tickets
+> `In Progress` at once (one per agent). You only ever act on the **one
+> `ticket_id` you were given** — Marcus has already reserved it for you, so
+> `already_claimed_by` being set is normal and not a signal that someone else
+> owns your ticket. Do not pick up other tickets on your own; a human assigns
+> work by handing you an ID. If you want to see what else is in flight,
+> `get_pending_tickets` with `state: "in_progress"` lists them (read-only).
 
 ---
 
@@ -147,12 +173,26 @@ git push origin <branch_name>
 }
 ```
 
-Marcus will:
-1. Move the Kanboard column to `Waiting for Human`
-2. Post a "Ready for Review" comment on the ticket listing the branch and AC checklist
+**What happens next depends on `gate_mode`** (from `get_work_context`):
 
-The human reviews your branch in Gitea, and if satisfied, moves the Kanboard
-card to `Done`.  Marcus then merges your branch to `main` automatically.
+- **`gate_mode: "human"` (default).** Marcus moves the column to
+  `Waiting for Human` and posts a "Ready for Review" comment. The human reviews
+  your branch in Gitea and, if satisfied, moves the card to `Done`; Marcus then
+  merges your branch to `main` automatically.
+- **`gate_mode: "ai"`.** There is no human review step — `signal_ready_for_review`
+  auto-merges your branch to `main` and marks the ticket `Done`. Be sure your
+  work is actually complete before you call it.
+  - If the project has **AI verification rounds** configured, `signal_ready_for_review`
+    instead runs a review pass. If it finds problems, the call returns
+    `success: false`, the ticket bounces back to `In Progress`, and the findings
+    are posted as a ticket comment. **Read that comment, fix the issues, push,
+    and call `signal_ready_for_review` again.** Repeat until it merges.
+
+**Check the return value.** `signal_ready_for_review` (and the other signal
+tools) return `success: false` when the action did not take effect — a transient
+Kanboard error, a verification round that failed, or a duplicate call. On
+`success: false`, read any new ticket comment and retry rather than assuming you
+are done.
 
 ---
 
@@ -252,7 +292,11 @@ Push frequently — do not batch all commits to the end.
 
 ```bash
 # 1. One-time: register the MCP server
+#    Local, no auth:
 claude mcp add --transport http marcus http://localhost:4298/mcp
+#    Remote / auth on — add the bearer token:
+#    claude mcp add --transport http marcus http://<HOST>:4298/mcp \
+#      -H "Authorization: Bearer <MARCUS_AGENT_TOKEN>"
 
 # 2. Open the repo directory
 cd ./repos/my-app
