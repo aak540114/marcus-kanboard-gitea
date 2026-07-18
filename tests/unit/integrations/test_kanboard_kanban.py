@@ -1061,3 +1061,105 @@ class TestClassifyTaskLinks:
         raise — fields default to empty rather than crashing."""
         result = classify_task_links([{"label": "blocks"}])
         assert result["blocks"] == [{"task_id": "", "title": "", "column": ""}]
+
+
+class TestEnsureColumns:
+    """ensure_columns reconciles a project to Marcus's column layout."""
+
+    @pytest.mark.asyncio
+    async def test_fresh_project_gets_marcus_columns_in_order(self, kanban):
+        """Kanboard defaults are renamed + missing columns added + ordered."""
+        kanban._client = AsyncMock()
+        # Kanboard's default new-project columns.
+        defaults = [
+            {"id": 1, "title": "Backlog", "position": 1},
+            {"id": 2, "title": "Ready", "position": 2},
+            {"id": 3, "title": "Work in progress", "position": 3},
+            {"id": 4, "title": "Done", "position": 4},
+        ]
+
+        async def fake_rpc(method, **params):
+            if method == "getColumns":
+                return defaults
+            if method == "addColumn":
+                # Blocked -> 5, Waiting for Human -> 6
+                return 5 if params["title"] == "Blocked" else 6
+            return True
+
+        kanban._rpc = AsyncMock(side_effect=fake_rpc)
+
+        result = await kanban.ensure_columns(7)
+
+        assert result is True
+        calls = kanban._rpc.call_args_list
+        # Renames: Backlog->Todo, Work in progress->In Progress
+        renamed = {
+            c.kwargs["title"]
+            for c in calls
+            if c.args and c.args[0] == "updateColumn"
+        }
+        assert renamed == {"Todo", "In Progress"}
+        # Added the two truly-missing columns
+        added = {
+            c.kwargs["title"]
+            for c in calls
+            if c.args and c.args[0] == "addColumn"
+        }
+        assert added == {"Blocked", "Waiting for Human"}
+        # Repositioned all six into the desired order (positions 1..6)
+        repos = [
+            c for c in calls if c.args and c.args[0] == "changeColumnPosition"
+        ]
+        assert len(repos) == 6
+        assert [c.kwargs["position"] for c in repos] == [1, 2, 3, 4, 5, 6]
+
+    @pytest.mark.asyncio
+    async def test_idempotent_when_already_correct(self, kanban):
+        """Already-Marcus columns → no rename, no add (only repositions)."""
+        kanban._client = AsyncMock()
+        existing = [
+            {"id": i + 1, "title": t, "position": i + 1}
+            for i, t in enumerate(
+                ["Todo", "Ready", "In Progress", "Blocked", "Waiting for Human", "Done"]
+            )
+        ]
+
+        async def fake_rpc(method, **params):
+            return existing if method == "getColumns" else True
+
+        kanban._rpc = AsyncMock(side_effect=fake_rpc)
+
+        await kanban.ensure_columns(7)
+
+        methods = [c.args[0] for c in kanban._rpc.call_args_list]
+        assert "updateColumn" not in methods
+        assert "addColumn" not in methods
+
+    @pytest.mark.asyncio
+    async def test_never_removes_extra_columns(self, kanban):
+        """A human-added extra column is left alone (no removeColumn)."""
+        kanban._client = AsyncMock()
+        existing = [
+            {"id": 1, "title": "Todo", "position": 1},
+            {"id": 2, "title": "Ready", "position": 2},
+            {"id": 3, "title": "In Progress", "position": 3},
+            {"id": 4, "title": "QA", "position": 4},  # human extra
+            {"id": 5, "title": "Blocked", "position": 5},
+            {"id": 6, "title": "Waiting for Human", "position": 6},
+            {"id": 7, "title": "Done", "position": 7},
+        ]
+
+        async def fake_rpc(method, **params):
+            return existing if method == "getColumns" else True
+
+        kanban._rpc = AsyncMock(side_effect=fake_rpc)
+
+        await kanban.ensure_columns(7)
+
+        methods = [c.args[0] for c in kanban._rpc.call_args_list]
+        assert "removeColumn" not in methods
+
+    @pytest.mark.asyncio
+    async def test_raises_if_not_connected(self, kanban):
+        with pytest.raises(RuntimeError, match="connect()"):
+            await kanban.ensure_columns(7)

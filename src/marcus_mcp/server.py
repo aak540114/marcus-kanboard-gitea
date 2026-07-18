@@ -3456,47 +3456,6 @@ async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
             )
             project_sync.subscribe()
             server._gitea_manager = gitea_mgr  # type: ignore[attr-defined]
-
-            # Auto-create a Gitea repo for EVERY Kanboard project, not just
-            # on-demand when an agent first works a ticket. ProjectWatcher
-            # polls Kanboard's getAllProjects and emits project.created for
-            # any project it hasn't seen — which project_sync.subscribe()
-            # above turns into ensure_repo (idempotent). On the first poll
-            # its known-set is empty, so it emits for every EXISTING
-            # project too, giving each one a repo. Previously this watcher
-            # was never started, so repos only ever appeared lazily and a
-            # project no agent had touched had none.
-            kb_url = os.environ.get("KANBOARD_URL")
-            kb_token = os.environ.get("KANBOARD_API_TOKEN")
-            if kb_url and kb_token:
-                from src.core.project_watcher import ProjectWatcher
-
-                watcher = ProjectWatcher(
-                    kanboard_url=kb_url,
-                    api_token=kb_token,
-                    events=server.events,
-                    state_path="./data/known_projects.json",
-                    # Re-emit until the repo actually exists (mapping is the
-                    # source of truth), so a project whose repo creation
-                    # FAILED once — e.g. a bad Gitea token scope 403'd — is
-                    # retried on later polls instead of being marked "seen"
-                    # and skipped forever.
-                    is_provisioned=lambda pid: project_sync.get_repo_for_project(
-                        pid
-                    )
-                    is not None,
-                )
-                await watcher.start()
-                server._project_watcher = watcher  # type: ignore[attr-defined]
-                logger.info(
-                    "ProjectWatcher started — Kanboard projects will "
-                    "auto-provision Gitea repos"
-                )
-            else:
-                logger.warning(
-                    "KANBOARD_URL/KANBOARD_API_TOKEN not set — project→repo "
-                    "auto-creation disabled (repos still created on-demand)"
-                )
         else:
             logger.warning(
                 "GiteaManager could not connect to %s — dev-environment "
@@ -3506,6 +3465,75 @@ async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
     else:
         logger.info(
             "GITEA_URL/GITEA_TOKEN not set — dev-environment repo sync disabled"
+        )
+
+    # ProjectWatcher: poll Kanboard's getAllProjects and, for each project,
+    # fire project.created. Two subscribers act on it — ProjectSyncWorkflow
+    # (auto-create the Gitea repo, when Gitea is configured) and the column
+    # reconciler below (give every project Marcus's board layout). Started
+    # whenever Kanboard is reachable, INDEPENDENT of Gitea: a human creating
+    # a project in the Kanboard UI should get Marcus's columns even with no
+    # Gitea. On the first poll its known-set is empty, so it emits for every
+    # EXISTING project too, back-filling repos + columns that were created
+    # before this ran.
+    kb_url = os.environ.get("KANBOARD_URL")
+    kb_token = os.environ.get("KANBOARD_API_TOKEN")
+    if kb_url and kb_token:
+        from src.core.project_watcher import ProjectWatcher
+
+        # Column reconciliation: bring each new project onto Marcus's
+        # todo→ready→in progress→blocked→waiting for human→done layout.
+        # Guarded to run once per project id this process (idempotent
+        # anyway, but project.created can re-fire while a repo retries).
+        reconciled_cols: set[int] = set()
+
+        async def _reconcile_project_columns(event: Any) -> None:
+            pid = int(event.data.get("kanboard_project_id", 0))
+            if not pid or pid in reconciled_cols:
+                return
+            ensure_cols = getattr(server.kanban_client, "ensure_columns", None)
+            if ensure_cols is None:
+                return
+            try:
+                await ensure_cols(pid)
+                reconciled_cols.add(pid)
+            except Exception as exc:  # noqa: BLE001 - never break the poll
+                logger.warning(
+                    "Could not reconcile columns for project %d: %s", pid, exc
+                )
+
+        server.events.subscribe("project.created", _reconcile_project_columns)
+
+        # Repo mapping is the source of truth for the Gitea side: re-emit
+        # until the repo exists so a project whose repo creation FAILED once
+        # (e.g. a bad Gitea token scope 403'd) is retried instead of being
+        # marked "seen" and skipped forever. Without Gitea, project_sync is
+        # None and the watcher falls back to emit-once-per-id (columns still
+        # get reconciled on that single emit).
+        is_provisioned = None
+        if project_sync is not None:
+
+            def is_provisioned(pid: int) -> bool:
+                return project_sync.get_repo_for_project(pid) is not None
+
+        watcher = ProjectWatcher(
+            kanboard_url=kb_url,
+            api_token=kb_token,
+            events=server.events,
+            state_path="./data/known_projects.json",
+            is_provisioned=is_provisioned,
+        )
+        await watcher.start()
+        server._project_watcher = watcher  # type: ignore[attr-defined]
+        logger.info(
+            "ProjectWatcher started — Kanboard projects auto-provision "
+            "columns%s",
+            " + Gitea repos" if project_sync is not None else "",
+        )
+    else:
+        logger.warning(
+            "KANBOARD_URL/KANBOARD_API_TOKEN not set — project auto-"
+            "provisioning (columns/repos) disabled"
         )
 
     dev_env_mgr = getattr(server, "_dev_env_manager", None)

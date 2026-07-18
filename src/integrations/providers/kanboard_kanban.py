@@ -83,6 +83,29 @@ _PRIORITY_MAP: Dict[int, Priority] = {
     3: Priority.URGENT,
 }
 
+# The board columns Marcus expects, in order. One column per lifecycle
+# state a human drags a ticket through (each maps into _COLUMN_STATUS_MAP
+# above). Used to reconcile any project — the one setup.sh provisions and
+# every project a human later creates in the Kanboard UI — onto the same
+# layout via ensure_columns().
+MARCUS_DEFAULT_COLUMNS: List[str] = [
+    "Todo",
+    "Ready",
+    "In Progress",
+    "Blocked",
+    "Waiting for Human",
+    "Done",
+]
+
+# Kanboard seeds a fresh project with these columns
+# (app/Model/BoardModel.php::getDefaultColumns). Rename the two that have a
+# Marcus equivalent — rather than delete+recreate — so their position and
+# any tasks already on them are preserved. Keyed by lower-cased title.
+_KANBOARD_DEFAULT_RENAMES: Dict[str, str] = {
+    "backlog": "Todo",
+    "work in progress": "In Progress",
+}
+
 
 class KanboardKanban(KanbanInterface):
     """
@@ -441,6 +464,91 @@ class KanboardKanban(KanbanInterface):
             await self._rpc("closeTask", task_id=int(task_id))
         else:
             await self._rpc("openTask", task_id=int(task_id))
+        return True
+
+    async def ensure_columns(
+        self,
+        project_id: int,
+        desired: Optional[List[str]] = None,
+    ) -> bool:
+        """Reconcile a project's board columns to Marcus's layout.
+
+        Makes ``project_id`` have exactly the ``desired`` columns (default
+        :data:`MARCUS_DEFAULT_COLUMNS`) in that order. Used to give every
+        Kanboard project — including ones a human creates in the UI, which
+        otherwise get Kanboard's own defaults — the todo→ready→in progress
+        →blocked→waiting for human→done layout the workflow drives on.
+
+        Idempotent, and deliberately NON-destructive: it renames the two
+        Kanboard defaults that have a Marcus equivalent (Backlog→Todo,
+        Work in progress→In Progress) to preserve their tasks, adds any
+        missing desired columns, and repositions all desired columns into
+        order. It never removes columns — a human-added extra column (and
+        any tasks on it) is left untouched, since removing a column
+        deletes its cards.
+
+        Parameters
+        ----------
+        project_id : int
+            Kanboard project id to reconcile.
+        desired : Optional[List[str]]
+            Column titles in the wanted order; defaults to
+            :data:`MARCUS_DEFAULT_COLUMNS`.
+
+        Returns
+        -------
+        bool
+            ``True`` once reconciled.
+        """
+        if self._client is None:
+            raise RuntimeError("Call connect() before ensure_columns()")
+        wanted = list(desired or MARCUS_DEFAULT_COLUMNS)
+        pid = int(project_id)
+
+        columns = await self._rpc("getColumns", project_id=pid) or []
+        by_title: Dict[str, Dict[str, Any]] = {
+            str(c.get("title", "")).strip().lower(): c for c in columns
+        }
+        wanted_lower = {w.lower() for w in wanted}
+
+        # 1. Rename Kanboard defaults onto their Marcus names (preserves
+        #    position + existing tasks) when the Marcus name isn't already
+        #    a separate column.
+        for kb_default, marcus_name in _KANBOARD_DEFAULT_RENAMES.items():
+            if (
+                kb_default in by_title
+                and marcus_name.lower() in wanted_lower
+                and marcus_name.lower() not in by_title
+            ):
+                col = by_title.pop(kb_default)
+                await self._rpc(
+                    "updateColumn",
+                    column_id=int(col["id"]),
+                    title=marcus_name,
+                )
+                col = {**col, "title": marcus_name}
+                by_title[marcus_name.lower()] = col
+
+        # 2. Add any desired column that still doesn't exist.
+        for name in wanted:
+            if name.lower() not in by_title:
+                new_id = await self._rpc(
+                    "addColumn", project_id=pid, title=name
+                )
+                by_title[name.lower()] = {"id": new_id, "title": name}
+
+        # 3. Reposition the desired columns into order (1-based). Extra,
+        #    human-added columns keep their relative spots after these.
+        for position, name in enumerate(wanted, start=1):
+            target = by_title.get(name.lower())
+            if target is not None:
+                await self._rpc(
+                    "changeColumnPosition",
+                    project_id=pid,
+                    column_id=int(target["id"]),
+                    position=position,
+                )
+        logger.info("Reconciled columns for Kanboard project %d", pid)
         return True
 
     async def add_comment(self, task_id: str, comment: str) -> bool:

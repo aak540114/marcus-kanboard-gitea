@@ -45,8 +45,8 @@ REQUIRED_COLUMNS = [
     "Todo",
     "Ready",
     "In Progress",
-    "Waiting for Human",
     "Blocked",
+    "Waiting for Human",
     "Done",
 ]
 

@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from src.core.events import Events
 from src.marcus_mcp.server import (
     _get_dev_env_settings_mgr,
     _get_gate_settings_mgr,
@@ -628,9 +629,35 @@ class TestProjectWatcherAutoRepo:
         assert server._project_watcher is mock_watcher
 
     @pytest.mark.asyncio
-    async def test_no_watcher_without_gitea(self, monkeypatch):
-        """No Gitea → no repo target → no watcher started."""
+    async def test_watcher_starts_without_gitea_for_columns(self, monkeypatch):
+        """Watcher decoupled from Gitea: with Kanboard configured but no
+        Gitea, it still starts (for column reconciliation) and passes
+        is_provisioned=None (no repo mapping to gate on)."""
         monkeypatch.delenv("GITEA_URL", raising=False)
+        monkeypatch.setenv("KANBOARD_URL", "http://kb/jsonrpc.php")
+        monkeypatch.setenv("KANBOARD_API_TOKEN", "t")
+        server = _make_server()
+        mock_watcher = AsyncMock()
+
+        with (
+            patch("src.workflows.human_gated_workflow.HumanGatedWorkflow", return_value=AsyncMock()),
+            patch("src.marcus_mcp.tools.human_gated.register_workflow"),
+            patch(
+                "src.core.project_watcher.ProjectWatcher", return_value=mock_watcher
+            ) as watcher_cls,
+        ):
+            await _wire_human_gated_workflow(server)
+
+        watcher_cls.assert_called_once()
+        assert watcher_cls.call_args.kwargs["is_provisioned"] is None
+        mock_watcher.start.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_watcher_without_kanboard_creds(self, monkeypatch):
+        """No KANBOARD_URL/API_TOKEN → nothing to poll → no watcher."""
+        monkeypatch.delenv("GITEA_URL", raising=False)
+        monkeypatch.delenv("KANBOARD_URL", raising=False)
+        monkeypatch.delenv("KANBOARD_API_TOKEN", raising=False)
         server = _make_server()
 
         with (
@@ -642,3 +669,69 @@ class TestProjectWatcherAutoRepo:
 
         watcher_cls.assert_not_called()
         assert not hasattr(server, "_project_watcher")
+
+
+class TestColumnAutoReconcile:
+    """Every new Kanboard project gets Marcus's columns, Gitea or not."""
+
+    @pytest.mark.asyncio
+    async def test_project_created_triggers_ensure_columns(self, monkeypatch):
+        monkeypatch.setenv("KANBOARD_URL", "http://kb/jsonrpc.php")
+        monkeypatch.setenv("KANBOARD_API_TOKEN", "t")
+        monkeypatch.delenv("GITEA_URL", raising=False)  # no Gitea → still runs
+
+        events = Events()
+        kanban = MagicMock()
+        kanban.ensure_columns = AsyncMock()
+        server = SimpleNamespace(
+            events=events, kanban_client=kanban, provider="kanboard"
+        )
+
+        with (
+            patch(
+                "src.workflows.human_gated_workflow.HumanGatedWorkflow",
+                return_value=AsyncMock(),
+            ),
+            patch("src.marcus_mcp.tools.human_gated.register_workflow"),
+            patch(
+                "src.core.project_watcher.ProjectWatcher", return_value=AsyncMock()
+            ),
+        ):
+            await _wire_human_gated_workflow(server)
+
+        await events.publish(
+            "project.created", source="test", data={"kanboard_project_id": 5}
+        )
+        kanban.ensure_columns.assert_awaited_once_with(5)
+
+    @pytest.mark.asyncio
+    async def test_reconcile_is_once_per_project(self, monkeypatch):
+        """Re-fired project.created (repo retry) doesn't re-reconcile columns."""
+        monkeypatch.setenv("KANBOARD_URL", "http://kb/jsonrpc.php")
+        monkeypatch.setenv("KANBOARD_API_TOKEN", "t")
+        monkeypatch.delenv("GITEA_URL", raising=False)
+
+        events = Events()
+        kanban = MagicMock()
+        kanban.ensure_columns = AsyncMock()
+        server = SimpleNamespace(
+            events=events, kanban_client=kanban, provider="kanboard"
+        )
+        with (
+            patch(
+                "src.workflows.human_gated_workflow.HumanGatedWorkflow",
+                return_value=AsyncMock(),
+            ),
+            patch("src.marcus_mcp.tools.human_gated.register_workflow"),
+            patch(
+                "src.core.project_watcher.ProjectWatcher", return_value=AsyncMock()
+            ),
+        ):
+            await _wire_human_gated_workflow(server)
+
+        for _ in range(3):
+            await events.publish(
+                "project.created", source="test",
+                data={"kanboard_project_id": 5},
+            )
+        kanban.ensure_columns.assert_awaited_once_with(5)
