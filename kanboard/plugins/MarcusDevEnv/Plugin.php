@@ -25,6 +25,45 @@ class Plugin extends Base
      */
     public function initialize(): void
     {
+        // Relax Kanboard's Content-Security-Policy so this plugin's
+        // browser code can actually run. Kanboard's default CSP
+        // (app/ServiceProvider/ClassProvider.php) is:
+        //   default-src 'self'; style-src 'self' 'unsafe-inline'; img-src * data:
+        // There is NO script-src, so it falls back to default-src 'self' —
+        // which blocks BOTH the inline <script> in the header/sidebar
+        // templates AND the inline onclick= handlers on the gate/verify/
+        // dev-env buttons. Symptom: the agent badge renders (styles are
+        // allowed) but stays on "checking…" forever because updateAgents()
+        // never executes; the gate toggle appears inert.
+        //
+        // Two directives are needed:
+        //   script-src 'self' 'unsafe-inline'  → run the inline JS + handlers
+        //   connect-src 'self' <marcus-origin> → allow the cross-origin
+        //       fetch() to Marcus (a different port = a different origin;
+        //       connect-src otherwise falls back to default-src 'self').
+        //
+        // setContentSecurityPolicy() is Kanboard's documented plugin hook
+        // for this (Core\Plugin\Base). Acceptable on this single-admin
+        // local/demo stack; 'unsafe-inline' for scripts does weaken the
+        // app-wide CSP, so on a hardened multi-user deployment prefer
+        // moving the template JS to an external asset instead.
+        $marcusUrl = getenv('MARCUS_URL') ?: 'http://localhost:4298';
+        $parts = parse_url($marcusUrl);
+        $marcusOrigin = '';
+        if (is_array($parts) && !empty($parts['scheme']) && !empty($parts['host'])) {
+            $marcusOrigin = $parts['scheme'] . '://' . $parts['host'];
+            if (!empty($parts['port'])) {
+                $marcusOrigin .= ':' . $parts['port'];
+            }
+        }
+        $this->setContentSecurityPolicy(array(
+            'default-src' => "'self'",
+            'style-src'   => "'self' 'unsafe-inline'",
+            'script-src'  => "'self' 'unsafe-inline'",
+            'connect-src' => trim("'self' " . $marcusOrigin),
+            'img-src'     => '* data:',
+        ));
+
         $this->template->hook->attach(
             'template:task:sidebar:information',
             'MarcusDevEnv:task/sidebar'
