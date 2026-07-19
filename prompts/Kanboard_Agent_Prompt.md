@@ -248,6 +248,7 @@ will receive the updated context on your next poll.
 |---|---|
 | `get_work_context` | **First call.** Get ticket + repo + branch context |
 | `get_project_description` | Project-wide tech stack / context, if the ticket alone isn't enough |
+| `update_project_description` | Correct/enrich that document when you learn the real stack (skipped if a human already edited it) |
 | `post_ticket_progress` | At 25 / 50 / 75 / 100 % completion |
 | `signal_ready_for_review` | Implementation complete, push done |
 | `signal_waiting_for_human` | Need human input to continue |

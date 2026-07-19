@@ -11,8 +11,13 @@ import pytest
 from pathlib import Path
 
 from src.core.project_description import (
+    ProjectDescriptionInferrer,
     ProjectDescriptionManager,
     ProjectStack,
+    SOURCE_ABSENT,
+    SOURCE_HUMAN,
+    SOURCE_INFERRED,
+    SOURCE_TEMPLATE,
     _TEMPLATE,
     _WAITING_COMMENT,
     parse_stack_from_text,
@@ -321,3 +326,96 @@ class TestConstants:
     def test_template_contains_language_placeholder(self):
         """_TEMPLATE has a Language placeholder for the human to fill in."""
         assert "Language" in _TEMPLATE
+
+
+# ---------------------------------------------------------------------------
+# Provenance: human edits lock out automated overwrites
+# ---------------------------------------------------------------------------
+
+
+class TestProvenance:
+    """get_source / can_auto_update gate automated description writes."""
+
+    def _mgr(self, tmp_path):
+        return ProjectDescriptionManager(data_dir=tmp_path)
+
+    def test_absent_when_no_description(self, tmp_path):
+        """No file yet → SOURCE_ABSENT and auto-updatable."""
+        mgr = self._mgr(tmp_path)
+        assert mgr.get_source(7) == SOURCE_ABSENT
+        assert mgr.can_auto_update(7) is True
+
+    def test_seed_marks_template_and_stays_auto_updatable(self, tmp_path):
+        """A seeded blank template is still auto-updatable."""
+        mgr = self._mgr(tmp_path)
+        mgr.seed_if_missing(7, "My Project")
+        assert mgr.get_source(7) == SOURCE_TEMPLATE
+        assert mgr.can_auto_update(7) is True
+
+    def test_inferred_write_is_auto_updatable(self, tmp_path):
+        """An inferred description can be refined again by automation."""
+        mgr = self._mgr(tmp_path)
+        mgr.update_description(7, "# X\n", source=SOURCE_INFERRED)
+        assert mgr.get_source(7) == SOURCE_INFERRED
+        assert mgr.can_auto_update(7) is True
+
+    def test_human_edit_locks_out_automation(self, tmp_path):
+        """A human edit (default source) blocks further auto-updates."""
+        mgr = self._mgr(tmp_path)
+        mgr.update_description(7, "# Human wrote this\n")  # default = human
+        assert mgr.get_source(7) == SOURCE_HUMAN
+        assert mgr.can_auto_update(7) is False
+
+    def test_legacy_file_without_sidecar_treated_as_template(self, tmp_path):
+        """A description written before provenance existed is auto-updatable."""
+        mgr = self._mgr(tmp_path)
+        # Simulate a legacy file: write the .md directly, no .source sidecar.
+        (tmp_path / "9.md").write_text("# Legacy\n", encoding="utf-8")
+        assert mgr.get_source(9) == SOURCE_TEMPLATE
+        assert mgr.can_auto_update(9) is True
+
+
+# ---------------------------------------------------------------------------
+# ProjectDescriptionInferrer
+# ---------------------------------------------------------------------------
+
+
+class TestProjectDescriptionInferrer:
+    """Infers a description from a ticket, LLM-first with heuristic fallback."""
+
+    @pytest.mark.asyncio
+    async def test_uses_llm_output_when_parseable(self):
+        """A usable LLM description (has a stack) is returned verbatim."""
+        llm_out = (
+            "# Shop\n\n## Tech Stack\n- **Language**: Python\n"
+            "- **Dev server command**: uvicorn main:app --port 3000\n"
+        )
+
+        async def fake_llm(prompt):
+            return llm_out
+
+        inf = ProjectDescriptionInferrer(llm_generate=fake_llm)
+        result = await inf.infer("Shop", "Add checkout API", "FastAPI endpoint")
+        assert result == llm_out.strip()
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_heuristic_when_llm_fails(self):
+        """LLM error → keyword heuristic fills the template from ticket text."""
+
+        async def boom(prompt):
+            raise RuntimeError("model down")
+
+        inf = ProjectDescriptionInferrer(llm_generate=boom)
+        result = await inf.infer(
+            "Shop", "Build a Python FastAPI service", "expose /orders"
+        )
+        assert result is not None
+        assert parse_stack_from_text(result) is not None  # has a usable stack
+        assert "Python" in result
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_language_detectable(self):
+        """No LLM and no detectable language → None (caller asks the human)."""
+        inf = ProjectDescriptionInferrer(llm_generate=None)
+        result = await inf.infer("Shop", "Make it nicer", "look prettier")
+        assert result is None

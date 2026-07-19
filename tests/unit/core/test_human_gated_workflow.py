@@ -2421,6 +2421,71 @@ class TestReviewFixes:
         assert lifecycle.get("70", "kanboard").state == TicketState.WAITING_FOR_HUMAN
 
     @pytest.mark.asyncio
+    async def test_stack_check_infers_description_instead_of_blocking(
+        self, workflow, lifecycle, mock_kanban, tmp_path, monkeypatch
+    ):
+        """A thin project description is inferred so the ticket proceeds."""
+        from src.core import project_description as pd
+
+        # Point the manager at a temp dir so the test is isolated.
+        monkeypatch.setattr(pd, "_DEFAULT_DATA_DIR", tmp_path)
+
+        # An inferrer that returns a description WITH a parseable stack.
+        inferrer = MagicMock()
+        inferrer.infer = AsyncMock(
+            return_value=(
+                "# Shop\n\n## Tech Stack\n- **Language**: Python\n"
+                "- **Dev server command**: uvicorn main:app --port 3000\n"
+            )
+        )
+        workflow._desc_inferrer = inferrer
+
+        task = MagicMock()
+        task.name = "Add checkout"
+        task.description = "A FastAPI service"
+        task.source_context = {"kanboard_task": {"project_id": 42}}
+        mock_kanban.get_task_by_id = AsyncMock(return_value=task)
+        mock_kanban.get_project_name = AsyncMock(return_value="Shop")
+
+        ok = await workflow._check_project_stack("5")
+
+        assert ok is True  # proceeded, did NOT pause on the human
+        inferrer.infer.assert_awaited_once()
+        # Description was stored as inferred (auto-updatable), stack parses.
+        mgr = pd.ProjectDescriptionManager(data_dir=tmp_path)
+        assert mgr.get_source(42) == pd.SOURCE_INFERRED
+        assert mgr.get_stack(42) is not None
+
+    @pytest.mark.asyncio
+    async def test_stack_check_does_not_overwrite_human_description(
+        self, workflow, lifecycle, mock_kanban, tmp_path, monkeypatch
+    ):
+        """A human-edited description is never overwritten by inference."""
+        from src.core import project_description as pd
+
+        monkeypatch.setattr(pd, "_DEFAULT_DATA_DIR", tmp_path)
+        mgr = pd.ProjectDescriptionManager(data_dir=tmp_path)
+        # Human wrote a description with NO parseable stack, and it's locked.
+        mgr.update_description(42, "# Shop\n\nSome prose, no stack.\n")
+        assert mgr.get_source(42) == pd.SOURCE_HUMAN
+
+        inferrer = MagicMock()
+        inferrer.infer = AsyncMock(return_value="# inferred\n")
+        workflow._desc_inferrer = inferrer
+
+        task = MagicMock()
+        task.name = "t"
+        task.description = ""
+        task.source_context = {"kanboard_task": {"project_id": 42}}
+        mock_kanban.get_task_by_id = AsyncMock(return_value=task)
+
+        ok = await workflow._check_project_stack("5")
+
+        assert ok is False  # blocked (human must fix), no overwrite
+        inferrer.infer.assert_not_called()
+        assert mgr.get_description(42) == "# Shop\n\nSome prose, no stack.\n"
+
+    @pytest.mark.asyncio
     async def test_stack_check_failure_parks_ticket_out_of_available_pool(
         self, workflow, lifecycle, mock_kanban
     ):

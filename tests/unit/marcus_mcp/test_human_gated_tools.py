@@ -19,6 +19,7 @@ from src.marcus_mcp.tools.human_gated import (
     signal_ready_for_review,
     signal_waiting_for_human,
     start_ticket_dev_environment,
+    update_project_description,
 )
 
 
@@ -199,3 +200,47 @@ class TestPostProgressPercentage:
         assert result["success"] is True
         assert result["result"]["percentage"] == 100
         wf.report_progress.assert_awaited_once_with("42", 100, "Work in progress.")
+
+
+class TestUpdateProjectDescription:
+    """update_project_description propagates the workflow's updated flag."""
+
+    @pytest.mark.asyncio
+    async def test_missing_description_returns_error(self):
+        wf = MagicMock()
+        register_workflow(wf)
+        result = await update_project_description(
+            {"ticket_id": "42", "provider": "kanboard", "description": "  "}
+        )
+        assert result["success"] is False
+        assert "description" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_successful_update_reports_true(self):
+        wf = MagicMock()
+        wf.apply_agent_project_description = AsyncMock(
+            return_value={"updated": True, "project_id": 3}
+        )
+        register_workflow(wf)
+        result = await update_project_description(
+            {"ticket_id": "42", "provider": "kanboard", "description": "# Docs\n"}
+        )
+        assert result["success"] is True
+        assert result["result"]["project_id"] == 3
+
+    @pytest.mark.asyncio
+    async def test_human_lock_reports_false_with_reason(self):
+        wf = MagicMock()
+        wf.apply_agent_project_description = AsyncMock(
+            return_value={
+                "updated": False,
+                "project_id": 3,
+                "reason": "a human has edited this description; not overwriting",
+            }
+        )
+        register_workflow(wf)
+        result = await update_project_description(
+            {"ticket_id": "42", "provider": "kanboard", "description": "# Docs\n"}
+        )
+        assert result["success"] is False
+        assert "human" in result["result"]["reason"]

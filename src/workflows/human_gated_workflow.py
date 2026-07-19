@@ -133,6 +133,7 @@ class HumanGatedWorkflow:
         ac_generator: Optional[ACGenerator] = None,
         gate_settings: Optional[GateSettingManager] = None,
         ai_verifier: Optional[AIVerifier] = None,
+        desc_inferrer: Optional[Any] = None,
         max_parallel_agents: int = 1,
         poll_interval: float = 30.0,
     ) -> None:
@@ -151,6 +152,11 @@ class HumanGatedWorkflow:
         self._ac_gen = ac_generator or ACGenerator()
         self._gate = gate_settings or GateSettingManager()
         self._verifier = ai_verifier or AIVerifier()
+        # Optional ProjectDescriptionInferrer — when set, a ticket whose
+        # project has no usable tech stack gets one inferred from the ticket
+        # instead of immediately pausing on the human (see
+        # _infer_project_description).
+        self._desc_inferrer = desc_inferrer
         self._project_sync = project_sync  # Optional ProjectSyncWorkflow
         self._watcher = BoardWatcher(
             kanban=kanban,
@@ -2020,6 +2026,52 @@ class HumanGatedWorkflow:
             "branch_web_url": urls["branch_web_url"],
         }
 
+    async def apply_agent_project_description(
+        self, ticket_id: str, text: str
+    ) -> Dict[str, Any]:
+        """Store an agent-supplied project description, unless a human locked it.
+
+        Written with ``SOURCE_AGENT`` (still auto-updatable), so a human's
+        later correction wins. Refuses if a human has already edited the
+        description.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Any ticket in the target project.
+        text : str
+            Full markdown description to store.
+
+        Returns
+        -------
+        Dict[str, Any]
+            ``{updated: bool, project_id?: int, reason?: str}``.
+        """
+        from src.core.project_description import (
+            SOURCE_AGENT,
+            ProjectDescriptionManager,
+        )
+
+        project_id = await self._resolve_kanboard_project_id(ticket_id)
+        if project_id is None:
+            return {"updated": False, "reason": "could not resolve a project"}
+        mgr = ProjectDescriptionManager()
+        if not mgr.can_auto_update(project_id):
+            return {
+                "updated": False,
+                "project_id": project_id,
+                "reason": "a human has edited this description; not overwriting",
+            }
+        try:
+            mgr.update_description(project_id, text, source=SOURCE_AGENT)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "updated": False,
+                "project_id": project_id,
+                "reason": f"could not write description: {exc}",
+            }
+        return {"updated": True, "project_id": project_id}
+
     def get_project_repo_url(self, project_id: int) -> Optional[str]:
         """Return the browser URL of a project's Gitea repo, or ``None``.
 
@@ -2490,6 +2542,98 @@ class HumanGatedWorkflow:
             return 0
         return self._gate.get_effective_verify_count(ticket_id, project_id)
 
+    async def _infer_project_description(
+        self,
+        ticket_id: str,
+        project_id: int,
+        mgr: Any,
+    ) -> bool:
+        """Infer + store a project description from this ticket.
+
+        Returns ``True`` only if the inferred description now yields a
+        parseable tech stack (so ``_check_project_stack`` can proceed
+        instead of pausing on the human). The write is stamped
+        :data:`SOURCE_INFERRED`, so a human's later edit still wins, and a
+        comment tells the human where to correct it.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Kanboard task id whose content drives the inference.
+        project_id : int
+            The ticket's project.
+        mgr : ProjectDescriptionManager
+            Already-constructed manager (shares the data dir).
+
+        Returns
+        -------
+        bool
+            ``True`` if a usable description was inferred and stored.
+        """
+        from src.core.project_description import SOURCE_INFERRED
+
+        if self._desc_inferrer is None:
+            return False
+
+        # Gather ticket content + a project name for the inference prompt.
+        title = ticket_id
+        description = ""
+        project_name = f"Project {project_id}"
+        try:
+            task = await self._kanban.get_task_by_id(ticket_id)
+            if task:
+                title = task.name or title
+                description = task.description or ""
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Infer: could not fetch ticket %s: %s", ticket_id, exc)
+        get_project_name = getattr(self._kanban, "get_project_name", None)
+        if get_project_name is not None:
+            try:
+                name = await get_project_name(project_id)
+                if name:
+                    project_name = name
+            except Exception:  # noqa: BLE001
+                pass
+
+        record = self._lifecycle.get(ticket_id, self._provider)
+        ac = record.acceptance_criteria if record else ""
+
+        try:
+            inferred = await self._desc_inferrer.infer(
+                project_name, title, description, ac
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Project description inference failed: %s", exc)
+            return False
+
+        if not inferred:
+            return False
+
+        try:
+            mgr.update_description(project_id, inferred, source=SOURCE_INFERRED)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not store inferred description: %s", exc)
+            return False
+
+        if mgr.get_stack(project_id) is None:
+            # Inference produced text but still no usable stack — don't
+            # pretend it's ready; let the caller pause on the human.
+            return False
+
+        logger.info(
+            "Inferred project description for project %d from ticket %s",
+            project_id,
+            ticket_id,
+        )
+        await self._post_comment(
+            ticket_id,
+            "🧭 **Marcus inferred this project's tech stack** from the ticket "
+            "so work can start now. If it's wrong, open the **Project "
+            "Description** page (button in the board header) and correct it — "
+            "your edit takes over from Marcus's guess.",
+        )
+        return True
+
     async def _check_project_stack(self, ticket_id: str) -> bool:
         """Verify the project description has enough stack info to start work.
 
@@ -2534,7 +2678,16 @@ class HumanGatedWorkflow:
             if stack is not None:
                 return True  # description is complete — proceed normally
 
-            # Stack missing: ask the human and pause.
+            # Stack missing. Before pausing on the human, try to INFER the
+            # project description from this ticket — but never over a
+            # description a human has already edited (that correction wins).
+            if self._desc_inferrer is not None and mgr.can_auto_update(project_id):
+                if await self._infer_project_description(
+                    ticket_id, project_id, mgr
+                ):
+                    return True
+
+            # Stack still unknown: ask the human and pause.
             await self._post_comment(ticket_id, _WAITING_COMMENT)
             try:
                 await self._kanban.move_task_to_column(ticket_id, "waiting for human")

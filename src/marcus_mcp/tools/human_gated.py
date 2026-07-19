@@ -39,6 +39,9 @@ Tool list
 ``get_project_description``
     Return the project-wide tech-stack/context document for a ticket's
     project — the same document a human edits at ``/project-description``.
+``update_project_description``
+    Update that document from what the agent learned (skipped if a human
+    has already edited it — their version wins).
 """
 
 import logging
@@ -750,4 +753,54 @@ async def get_project_description(
         return {"success": True, "result": result}
     except Exception as exc:  # noqa: BLE001
         logger.error("get_project_description failed: %s", exc)
+        return {"success": False, "error": str(exc)}
+
+
+async def update_project_description(
+    arguments: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Update a project's description from what the agent learned.
+
+    Lets a coding agent correct or enrich the project-wide tech-stack/context
+    document (same markdown structure ``get_project_description`` returns).
+    Marcus refuses the write if a human has already edited the description —
+    the human's version is authoritative.
+
+    Parameters
+    ----------
+    arguments : Dict[str, Any]
+        Required:
+            ``ticket_id`` — Any ticket in the project.
+            ``provider``  — Kanban provider name (e.g. ``"kanboard"``).
+            ``description`` — Full markdown description to store.
+
+    Returns
+    -------
+    Dict[str, Any]
+        ``{success, result: {updated, project_id, reason?}}`` or
+        ``{success: False, error}``. ``updated`` is ``False`` (with a
+        ``reason``) when a human edit blocks the overwrite.
+    """
+    ticket_id = arguments.get("ticket_id", "")
+    provider = arguments.get("provider", "")
+    description = arguments.get("description", "")
+
+    if not ticket_id or not provider:
+        return {"success": False, "error": "ticket_id and provider are required"}
+    if not description or not str(description).strip():
+        return {"success": False, "error": "description must be non-empty"}
+
+    wf = _workflow()
+    if wf is None:
+        return {"success": False, "error": "HumanGatedWorkflow not initialised"}
+
+    try:
+        result = await wf.apply_agent_project_description(
+            ticket_id, str(description)
+        )
+        # success reflects whether the write actually happened (a human lock
+        # or unresolved project makes updated=False).
+        return {"success": bool(result.get("updated")), "result": result}
+    except Exception as exc:  # noqa: BLE001
+        logger.error("update_project_description failed: %s", exc)
         return {"success": False, "error": str(exc)}

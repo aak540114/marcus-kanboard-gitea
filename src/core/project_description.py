@@ -27,7 +27,16 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Awaitable, Callable, List, Optional
+
+#: Provenance values stamped alongside a description (see
+#: ProjectDescriptionManager.get_source). Only ``"human"`` locks a
+#: description against automated (Marcus/agent) overwrites.
+SOURCE_ABSENT = "absent"
+SOURCE_TEMPLATE = "template"
+SOURCE_INFERRED = "inferred"
+SOURCE_AGENT = "agent"
+SOURCE_HUMAN = "human"
 
 logger = logging.getLogger(__name__)
 
@@ -320,6 +329,52 @@ class ProjectDescriptionManager:
     def _path(self, project_id: int) -> Path:
         return self._dir / f"{project_id}.md"
 
+    def _source_path(self, project_id: int) -> Path:
+        return self._dir / f"{project_id}.source"
+
+    def get_source(self, project_id: int) -> str:
+        """Return who last wrote a project's description.
+
+        One of :data:`SOURCE_ABSENT` (no description yet),
+        :data:`SOURCE_TEMPLATE` (blank seed), :data:`SOURCE_INFERRED`
+        (Marcus), :data:`SOURCE_AGENT` (a coding agent), or
+        :data:`SOURCE_HUMAN`. A description file with no provenance sidecar
+        (written before this feature existed) is assumed to be a
+        ``template`` — automated inference only ever replaces a description
+        with NO parseable stack, so a genuinely human-authored legacy
+        description with a real stack is never at risk.
+
+        Parameters
+        ----------
+        project_id : int
+            Kanboard project ID.
+
+        Returns
+        -------
+        str
+            The provenance marker.
+        """
+        if not self._path(project_id).exists():
+            return SOURCE_ABSENT
+        sp = self._source_path(project_id)
+        if sp.exists():
+            try:
+                val = sp.read_text(encoding="utf-8").strip()
+                if val:
+                    return val
+            except OSError:
+                pass
+        return SOURCE_TEMPLATE
+
+    def can_auto_update(self, project_id: int) -> bool:
+        """Return ``True`` unless a human has edited this description.
+
+        Marcus and agents may (re)write an absent, templated, or
+        previously auto-generated description, but must NOT overwrite one a
+        human corrected — that correction is authoritative.
+        """
+        return self.get_source(project_id) != SOURCE_HUMAN
+
     def get_description(self, project_id: int) -> Optional[str]:
         """Return the raw markdown description for a project.
 
@@ -342,8 +397,10 @@ class ProjectDescriptionManager:
             logger.warning("Could not read project description %s: %s", p, exc)
             return None
 
-    def update_description(self, project_id: int, text: str) -> None:
-        """Overwrite the description for a project.
+    def update_description(
+        self, project_id: int, text: str, source: str = SOURCE_HUMAN
+    ) -> None:
+        """Overwrite the description for a project and stamp its provenance.
 
         Parameters
         ----------
@@ -351,11 +408,23 @@ class ProjectDescriptionManager:
             Kanboard project ID.
         text : str
             New markdown content.
+        source : str
+            Who is writing — one of the ``SOURCE_*`` constants. Defaults to
+            :data:`SOURCE_HUMAN` so any caller that does not opt out (e.g.
+            the human edit route) locks the description against later
+            automated overwrites. Automated callers pass
+            :data:`SOURCE_INFERRED` / :data:`SOURCE_AGENT` /
+            :data:`SOURCE_TEMPLATE`.
         """
         p = self._path(project_id)
         try:
             p.write_text(text, encoding="utf-8")
-            logger.info("Updated project description for project %d", project_id)
+            self._source_path(project_id).write_text(source, encoding="utf-8")
+            logger.info(
+                "Updated project description for project %d (source=%s)",
+                project_id,
+                source,
+            )
         except OSError as exc:
             logger.error("Could not write project description %s: %s", p, exc)
             raise
@@ -372,7 +441,9 @@ class ProjectDescriptionManager:
         """
         if not self._path(project_id).exists():
             self.update_description(
-                project_id, _TEMPLATE.format(name=project_name)
+                project_id,
+                _TEMPLATE.format(name=project_name),
+                source=SOURCE_TEMPLATE,
             )
             logger.info(
                 "Seeded blank description for project %d (%s)", project_id, project_name
@@ -396,3 +467,144 @@ class ProjectDescriptionManager:
         if text is None:
             return None
         return parse_stack_from_text(text)
+
+
+# ---------------------------------------------------------------------------
+# Inference
+# ---------------------------------------------------------------------------
+
+
+def _build_inference_prompt(
+    project_name: str,
+    ticket_title: str,
+    ticket_description: str,
+    acceptance_criteria: str,
+) -> str:
+    """Build the LLM prompt that infers a project description from a ticket."""
+    return (
+        "You are documenting a software project so that autonomous coding "
+        "agents can set up a dev environment and work on it.\n\n"
+        f"Project name: {project_name}\n\n"
+        "You are given ONE ticket from this project. Infer the project's most "
+        "likely tech stack and a short overview from it. Prefer widely-used "
+        "defaults when the ticket is ambiguous (e.g. a web API → Python + "
+        "FastAPI, or Node.js + Express). It is fine to be a best guess — a "
+        "human will correct it.\n\n"
+        f"Ticket title: {ticket_title}\n"
+        f"Ticket description:\n{ticket_description}\n\n"
+        f"Acceptance criteria:\n{acceptance_criteria}\n\n"
+        "Respond with ONLY a markdown document in EXACTLY this structure "
+        "(fill every field; the Language and Dev server command lines are "
+        "REQUIRED):\n\n"
+        f"# {project_name}\n\n"
+        "## Overview\n<2-3 sentence plain-English description>\n\n"
+        "## Tech Stack\n"
+        "- **Language**: <one of: Python, Node.js, Go, Rust, Ruby, Java, PHP>\n"
+        "- **Framework**: <e.g. FastAPI, Express, Gin, Rails, or 'none'>\n"
+        "- **Database**: <e.g. PostgreSQL, SQLite, or 'none'>\n"
+        "- **Dev server command**: <command that starts the app on port 3000>\n"
+        "- **Install command**: <command that installs dependencies>\n\n"
+        "## Architecture Notes\n<key modules / API shape, best guess>\n\n"
+        "## Open Questions\n<anything a human should confirm>\n"
+    )
+
+
+def _heuristic_description(
+    project_name: str,
+    ticket_title: str,
+    ticket_description: str,
+    acceptance_criteria: str,
+) -> Optional[str]:
+    """Fill the description template from keyword-detected stack, or ``None``.
+
+    Used when no LLM is available. Returns ``None`` when the ticket text
+    gives no detectable language, so the caller falls back to asking the
+    human rather than guessing blindly.
+    """
+    blob = "\n".join(
+        [ticket_title or "", ticket_description or "", acceptance_criteria or ""]
+    )
+    stack = parse_stack_from_text(blob)
+    if stack is None:
+        return None
+    lang_display = {
+        "nodejs": "Node.js",
+        "python": "Python",
+        "go": "Go",
+        "rust": "Rust",
+        "ruby": "Ruby",
+        "java": "Java",
+        "php": "PHP",
+    }.get(stack.language, stack.language)
+    overview = (ticket_title or project_name).strip()
+    return (
+        f"# {project_name}\n\n"
+        "## Overview\n"
+        f"{overview}. (Inferred by Marcus from an early ticket — please "
+        "review and correct.)\n\n"
+        "## Tech Stack\n"
+        f"- **Language**: {lang_display}\n"
+        f"- **Framework**: {stack.framework or 'none'}\n"
+        "- **Database**: none\n"
+        f"- **Dev server command**: {stack.dev_cmd}\n"
+        f"- **Install command**: {stack.install_cmd or 'none'}\n\n"
+        "## Architecture Notes\n<!-- Inferred from a single ticket; refine as needed. -->\n\n"
+        "## Open Questions\n<!-- Confirm the tech stack above is correct. -->\n"
+    )
+
+
+class ProjectDescriptionInferrer:
+    """Infers a project description from ticket content.
+
+    Marcus uses this to auto-populate a project's description the first time
+    an agent needs the tech stack, instead of blocking on the human. The
+    result is written with :data:`SOURCE_INFERRED`, so a human's later edit
+    (which locks the description) always wins.
+
+    Parameters
+    ----------
+    llm_generate : Optional[Callable[[str], Awaitable[str]]]
+        Async callable returning freeform text for a prompt (e.g.
+        ``AIAnalysisEngine.generate_text``). When ``None`` (or a call
+        fails), a keyword-based heuristic is used, which returns ``None``
+        if it cannot even detect a language.
+    """
+
+    def __init__(
+        self,
+        llm_generate: Optional[Callable[[str], Awaitable[str]]] = None,
+    ) -> None:
+        """Initialise the inferrer."""
+        self._llm = llm_generate
+
+    async def infer(
+        self,
+        project_name: str,
+        ticket_title: str,
+        ticket_description: str,
+        acceptance_criteria: str = "",
+    ) -> Optional[str]:
+        """Return an inferred description markdown, or ``None`` if impossible.
+
+        Tries the LLM first; on any failure or empty result, falls back to
+        the keyword heuristic. Returns ``None`` only when neither can
+        produce something with a usable tech stack.
+        """
+        if self._llm is not None:
+            prompt = _build_inference_prompt(
+                project_name, ticket_title, ticket_description, acceptance_criteria
+            )
+            try:
+                out = await self._llm(prompt)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Project description inference LLM failed: %s", exc)
+                out = ""
+            if out and out.strip() and parse_stack_from_text(out) is not None:
+                return out.strip()
+            logger.info(
+                "LLM description inference unusable (no parseable stack); "
+                "falling back to heuristic"
+            )
+        return _heuristic_description(
+            project_name, ticket_title, ticket_description, acceptance_criteria
+        )

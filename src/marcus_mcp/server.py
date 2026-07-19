@@ -3551,11 +3551,25 @@ async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
     # freeform markdown (no JSON extraction). Falls back to the heuristic
     # per-call if the engine is in fallback mode (no LLM backend).
     ac_generator = None
+    desc_inferrer = None
     ai_engine = getattr(server, "ai_engine", None)
     if ai_engine is not None and hasattr(ai_engine, "generate_text"):
         from src.core.acceptance_criteria import ACGenerator
+        from src.core.project_description import ProjectDescriptionInferrer
 
         ac_generator = ACGenerator(llm_generate=ai_engine.generate_text)
+        # Lets Marcus infer a project's tech stack from a ticket instead of
+        # blocking the ticket on the human when the description is thin.
+        desc_inferrer = ProjectDescriptionInferrer(
+            llm_generate=ai_engine.generate_text
+        )
+    else:
+        # Even with no LLM backend, the inferrer's keyword heuristic can fill
+        # a description when the ticket names a language — better than always
+        # pausing on the human.
+        from src.core.project_description import ProjectDescriptionInferrer
+
+        desc_inferrer = ProjectDescriptionInferrer(llm_generate=None)
 
     # How many tickets the human-gated workflow may keep in progress at once
     # (the "how many agents work in parallel" ceiling). Read from the
@@ -3586,6 +3600,7 @@ async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
         # switched the project back to human-gated in the UI.
         gate_settings=_get_gate_settings_mgr(server),
         ac_generator=ac_generator,
+        desc_inferrer=desc_inferrer,
     )
     register_workflow(workflow)
     await workflow.start()
