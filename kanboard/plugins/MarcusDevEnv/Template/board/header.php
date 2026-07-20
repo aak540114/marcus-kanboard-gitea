@@ -37,7 +37,8 @@ $descUrl          = $marcusUrl . '/project-description?project_id=' . urlencode(
 $gateApiBase      = $marcusUrl . '/api/gate-setting';
 $devEnvSettingUrl = $marcusUrl . '/api/dev-env-setting';
 $projectRepoUrl   = $marcusUrl . '/api/project-repo?project_id=' . urlencode((string) $projectId);
-$boardActivityUrl = $marcusUrl . '/api/board-activity?project_id=' . urlencode((string) $projectId);
+$eventsStreamUrl  = $marcusUrl . '/api/events/stream'
+    . ($marcusToken !== '' ? '?token=' . urlencode($marcusToken) : '');
 ?>
 <style>
 /* ── Active agents badge ──────────────────────────────────────────────── */
@@ -248,7 +249,7 @@ $boardActivityUrl = $marcusUrl . '/api/board-activity?project_id=' . urlencode((
     var GATE_URL         = <?= json_encode($gateApiBase) ?>;
     var DEV_ENV_SETTING_URL = <?= json_encode($devEnvSettingUrl) ?>;
     var PROJECT_REPO_URL = <?= json_encode($projectRepoUrl) ?>;
-    var BOARD_ACTIVITY_URL = <?= json_encode($boardActivityUrl) ?>;
+    var EVENTS_STREAM_URL = <?= json_encode($eventsStreamUrl) ?>;
     var PROJECT_ID       = <?= json_encode((int) $projectId) ?>;
     var MARCUS_TOKEN     = <?= json_encode($marcusToken) ?>;
     var INTERVAL         = 15000;
@@ -261,40 +262,36 @@ $boardActivityUrl = $marcusUrl . '/api/board-activity?project_id=' . urlencode((
         return h;
     }
 
-    /* ── Live board refresh ──────────────────────────────────────────── */
-    // Poll Marcus for a board fingerprint; when it changes (an agent/Marcus
-    // moved a card or edited a task), reload the page so the change appears
-    // without a manual refresh. Never reloads while you're typing (e.g.
-    // writing a comment) or while a Kanboard popover/form is open.
+    /* ── Live board refresh (push, no polling) ───────────────────────── */
+    // Hold ONE Server-Sent Events connection to Marcus. Marcus pushes a
+    // "refresh" the instant it changes anything (comment, card move, state),
+    // so the board updates with zero delay. Never reloads while you're
+    // typing or a Kanboard form is open — that reload is deferred until you
+    // stop (a purely local check; it never polls the server).
     (function () {
-        if (!BOARD_ACTIVITY_URL || !PROJECT_ID) { return; }
-        var baseline = null;
+        if (!EVENTS_STREAM_URL || typeof EventSource === 'undefined') { return; }
+        var pending = false;
 
         function userIsBusy() {
             var el = document.activeElement;
             if (el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT'
                        || el.isContentEditable)) { return true; }
-            // A Kanboard modal/popover open → don't yank it out from under.
             if (document.querySelector('#popover-container, .modal-box')) {
                 return true;
             }
             return false;
         }
-
-        function poll() {
-            fetch(BOARD_ACTIVITY_URL, { cache: 'no-store', headers: marcusHeaders() })
-                .then(function (r) { return r.json(); })
-                .then(function (d) {
-                    if (!d || !d.version) { return; }
-                    if (baseline === null) { baseline = d.version; return; }
-                    if (d.version !== baseline && !userIsBusy()) {
-                        window.location.reload();
-                    }
-                })
-                .catch(function () { /* transient — try again next tick */ });
+        function doRefresh() {
+            if (userIsBusy()) { pending = true; return; }
+            window.location.reload();
         }
-        setInterval(poll, 7000);
-        poll();
+        // EventSource auto-reconnects (server sends `retry:`); no polling here.
+        var es = new EventSource(EVENTS_STREAM_URL);
+        es.addEventListener('refresh', doRefresh);
+        // Local-only: once you stop typing, apply any refresh that arrived.
+        setInterval(function () {
+            if (pending && !userIsBusy()) { pending = false; window.location.reload(); }
+        }, 1000);
     }());
 
     /* ── Gitea repository link ───────────────────────────────────────── */

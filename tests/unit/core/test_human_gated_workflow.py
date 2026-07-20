@@ -2525,6 +2525,24 @@ class TestReviewFixes:
         mock_branch.merge_to_main.assert_awaited()
         assert lifecycle.get("31", "kanboard").state == TicketState.DONE
 
+    @pytest.mark.asyncio
+    async def test_post_comment_emits_ui_refresh(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Every posted comment publishes ui.refresh (drives the SSE push)."""
+        received = []
+
+        async def _capture(event):
+            received.append(event)
+
+        workflow._events.subscribe("ui.refresh", _capture)
+
+        lifecycle.get_or_create("40", "kanboard")
+        await workflow._post_comment("40", "hello")
+
+        assert len(received) == 1
+        assert received[0].data["ticket_id"] == "40"
+
     def test_is_approval_comment_recognizes_and_rejects(self, workflow):
         """Approval matcher: accepts approvals, rejects negated/conditional."""
         assert workflow._is_approval_comment("approved. merge to main") is True

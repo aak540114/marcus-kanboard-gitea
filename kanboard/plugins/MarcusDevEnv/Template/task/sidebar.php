@@ -57,9 +57,8 @@ $linksUrl = $marcusUrl
     . '/api/ticket-links'
     . '?ticket_id=' . urlencode((string) $ticketId);
 
-$activityUrl = $marcusUrl
-    . '/api/ticket-activity'
-    . '?ticket_id=' . urlencode((string) $ticketId);
+$eventsStreamUrl = $marcusUrl . '/api/events/stream'
+    . ($marcusToken !== '' ? '?token=' . urlencode($marcusToken) : '');
 
 $gateApiBase = $marcusUrl . '/api/gate-setting';
 ?>
@@ -330,7 +329,7 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
     var STOP_URL     = <?= json_encode($stopUrl) ?>;
     var STATUS_URL   = <?= json_encode($statusUrl) ?>;
     var LINKS_URL    = <?= json_encode($linksUrl) ?>;
-    var ACTIVITY_URL = <?= json_encode($activityUrl) ?>;
+    var EVENTS_STREAM_URL = <?= json_encode($eventsStreamUrl) ?>;
     var GATE_URL     = <?= json_encode($gateApiBase) ?>;
     var TICKET_ID    = <?= json_encode((string) $ticketId) ?>;
     var PROJECT_ID   = <?= json_encode((int) $projectId) ?>;
@@ -344,14 +343,14 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
         return h;
     }
 
-    /* ── Live task refresh ───────────────────────────────────────────── */
-    // Poll Marcus for a ticket fingerprint (comment count + column + state);
-    // when it changes — an agent/Marcus posted a comment or moved the card —
-    // reload so it appears without a manual refresh. Never reloads while
-    // you're typing (e.g. writing a comment) or a Kanboard form is open.
+    /* ── Live task refresh (push, no polling) ────────────────────────── */
+    // One Server-Sent Events connection to Marcus; it pushes a "refresh" the
+    // instant a comment is posted / the card moves / state changes, so the
+    // task view updates with zero delay. Never reloads while you're typing a
+    // comment; that reload is deferred (local check only, no server polling).
     (function () {
-        if (!ACTIVITY_URL) { return; }
-        var baseline = null;
+        if (!EVENTS_STREAM_URL || typeof EventSource === 'undefined') { return; }
+        var pending = false;
 
         function userIsBusy() {
             var el = document.activeElement;
@@ -362,21 +361,15 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
             }
             return false;
         }
-
-        function poll() {
-            fetch(ACTIVITY_URL, { cache: 'no-store', headers: marcusHeaders() })
-                .then(function (r) { return r.json(); })
-                .then(function (d) {
-                    if (!d || !d.version) { return; }
-                    if (baseline === null) { baseline = d.version; return; }
-                    if (d.version !== baseline && !userIsBusy()) {
-                        window.location.reload();
-                    }
-                })
-                .catch(function () { /* transient — retry next tick */ });
+        function doRefresh() {
+            if (userIsBusy()) { pending = true; return; }
+            window.location.reload();
         }
-        setInterval(poll, 7000);
-        poll();
+        var es = new EventSource(EVENTS_STREAM_URL);
+        es.addEventListener('refresh', doRefresh);
+        setInterval(function () {
+            if (pending && !userIsBusy()) { pending = false; window.location.reload(); }
+        }, 1000);
     }());
 
     /* ── Dev-environment panel ───────────────────────────────────── */

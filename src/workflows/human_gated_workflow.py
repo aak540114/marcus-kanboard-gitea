@@ -2809,13 +2809,31 @@ class HumanGatedWorkflow:
             return True
 
     async def _post_comment(self, ticket_id: str, body: str) -> bool:
-        """Post a comment via the kanban provider (best-effort)."""
+        """Post a comment via the kanban provider (best-effort).
+
+        Also emits ``ui.refresh`` so the SSE stream
+        (``/api/events/stream``) pushes an instant page refresh to open
+        Kanboard tabs — every Marcus/agent update posts a comment, so this
+        one hook covers them all with no polling and no delay.
+        """
         try:
             result = await self._kanban.add_comment(ticket_id, body)
+            await self._signal_ui_refresh(ticket_id)
             return bool(result)
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to post comment on %s: %s", ticket_id, exc)
             return False
+
+    async def _signal_ui_refresh(self, ticket_id: str) -> None:
+        """Publish ``ui.refresh`` so the SSE stream refreshes the Kanboard UI."""
+        try:
+            await self._events.publish(
+                "ui.refresh",
+                source="human_gated_workflow",
+                data={"ticket_id": ticket_id, "provider": self._provider},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Could not emit ui.refresh for %s: %s", ticket_id, exc)
 
     async def _post_error(self, ticket_id: str, error_summary: str) -> None:
         """Post an error comment on a ticket."""
