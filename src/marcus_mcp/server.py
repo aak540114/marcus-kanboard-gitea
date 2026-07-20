@@ -2741,6 +2741,207 @@ class MarcusServer:
                     state=server,
                 )
 
+        # ── Kanboard human-gated workflow tools ────────────────────────────
+        # These are in the endpoint allowlists (tool_groups.py) but, unlike
+        # the classic tools above, were never given a FastMCP wrapper — so
+        # they were invisible over the HTTP transport a coding agent connects
+        # to (get_work_context "doesn't exist"). Each wraps the arguments-dict
+        # impl in src/marcus_mcp/tools/human_gated.py.
+
+        if "get_work_context" in allowed_tools:
+
+            @app.tool()  # type: ignore[misc]
+            async def get_work_context(
+                ticket_id: str, provider: str = "kanboard"
+            ) -> Dict[str, Any]:
+                """Start here: full ticket context + a clone_url to begin work."""
+                from .tools.human_gated import get_work_context as impl
+
+                return await impl(
+                    {"ticket_id": ticket_id, "provider": provider}
+                )
+
+        if "get_project_description" in allowed_tools:
+
+            @app.tool()  # type: ignore[misc]
+            async def get_project_description(
+                ticket_id: str, provider: str = "kanboard"
+            ) -> Dict[str, Any]:
+                """Project-wide tech stack / architecture notes for a ticket."""
+                from .tools.human_gated import get_project_description as impl
+
+                return await impl(
+                    {"ticket_id": ticket_id, "provider": provider}
+                )
+
+        if "update_project_description" in allowed_tools:
+
+            @app.tool()  # type: ignore[misc]
+            async def update_project_description(
+                ticket_id: str, description: str, provider: str = "kanboard"
+            ) -> Dict[str, Any]:
+                """Correct/enrich the project description (human edits win)."""
+                from .tools.human_gated import update_project_description as impl
+
+                return await impl(
+                    {
+                        "ticket_id": ticket_id,
+                        "provider": provider,
+                        "description": description,
+                    }
+                )
+
+        if "generate_acceptance_criteria" in allowed_tools:
+
+            @app.tool()  # type: ignore[misc]
+            async def generate_acceptance_criteria(
+                ticket_id: str,
+                title: str,
+                description: str = "",
+                provider: str = "kanboard",
+            ) -> Dict[str, Any]:
+                """Generate + post an acceptance-criteria checklist for a ticket."""
+                from .tools.human_gated import (
+                    generate_acceptance_criteria as impl,
+                )
+
+                return await impl(
+                    {
+                        "ticket_id": ticket_id,
+                        "provider": provider,
+                        "title": title,
+                        "description": description,
+                    }
+                )
+
+        if "post_ticket_progress" in allowed_tools:
+
+            @app.tool()  # type: ignore[misc]
+            async def post_ticket_progress(
+                ticket_id: str,
+                percentage: int,
+                message: str = "Work in progress.",
+                provider: str = "kanboard",
+            ) -> Dict[str, Any]:
+                """Post a progress update comment (percentage + message)."""
+                from .tools.human_gated import post_ticket_progress as impl
+
+                return await impl(
+                    {
+                        "ticket_id": ticket_id,
+                        "provider": provider,
+                        "percentage": percentage,
+                        "message": message,
+                    }
+                )
+
+        if "signal_ready_for_review" in allowed_tools:
+
+            @app.tool()  # type: ignore[misc]
+            async def signal_ready_for_review(
+                ticket_id: str, provider: str = "kanboard"
+            ) -> Dict[str, Any]:
+                """Declare the work done (human review or auto-merge per gate)."""
+                from .tools.human_gated import signal_ready_for_review as impl
+
+                return await impl(
+                    {"ticket_id": ticket_id, "provider": provider}
+                )
+
+        if "signal_waiting_for_human" in allowed_tools:
+
+            @app.tool()  # type: ignore[misc]
+            async def signal_waiting_for_human(
+                ticket_id: str,
+                reason: str = "AI agent requires human input to continue.",
+                provider: str = "kanboard",
+            ) -> Dict[str, Any]:
+                """Pause the ticket for human input."""
+                from .tools.human_gated import signal_waiting_for_human as impl
+
+                return await impl(
+                    {
+                        "ticket_id": ticket_id,
+                        "provider": provider,
+                        "reason": reason,
+                    }
+                )
+
+        if "signal_blocked" in allowed_tools:
+
+            @app.tool()  # type: ignore[misc]
+            async def signal_blocked(
+                ticket_id: str,
+                blocked_by: str = "unspecified dependency",
+                provider: str = "kanboard",
+            ) -> Dict[str, Any]:
+                """Mark the ticket blocked by a dependency."""
+                from .tools.human_gated import signal_blocked as impl
+
+                return await impl(
+                    {
+                        "ticket_id": ticket_id,
+                        "provider": provider,
+                        "blocked_by": blocked_by,
+                    }
+                )
+
+        if "get_ticket_lifecycle_state" in allowed_tools:
+
+            @app.tool()  # type: ignore[misc]
+            async def get_ticket_lifecycle_state(
+                ticket_id: str, provider: str = "kanboard"
+            ) -> Dict[str, Any]:
+                """Current lifecycle state + metadata for a ticket."""
+                from .tools.human_gated import (
+                    get_ticket_lifecycle_state as impl,
+                )
+
+                return await impl(
+                    {"ticket_id": ticket_id, "provider": provider}
+                )
+
+        if "get_pending_tickets" in allowed_tools:
+
+            @app.tool()  # type: ignore[misc]
+            async def get_pending_tickets(
+                state: str = "ready", provider: str = "kanboard"
+            ) -> Dict[str, Any]:
+                """List tickets in a given lifecycle state."""
+                from .tools.human_gated import get_pending_tickets as impl
+
+                return await impl({"state": state, "provider": provider})
+
+        if "start_ticket_dev_environment" in allowed_tools:
+
+            @app.tool()  # type: ignore[misc]
+            async def start_ticket_dev_environment(
+                ticket_id: str, provider: str = "kanboard"
+            ) -> Dict[str, Any]:
+                """Start a hot-reload dev environment for the ticket branch."""
+                from .tools.human_gated import (
+                    start_ticket_dev_environment as impl,
+                )
+
+                return await impl(
+                    {"ticket_id": ticket_id, "provider": provider}
+                )
+
+        if "get_ticket_dev_environment_url" in allowed_tools:
+
+            @app.tool()  # type: ignore[misc]
+            async def get_ticket_dev_environment_url(
+                ticket_id: str, provider: str = "kanboard"
+            ) -> Dict[str, Any]:
+                """Return the running dev-environment URL for a ticket, if any."""
+                from .tools.human_gated import (
+                    get_ticket_dev_environment_url as impl,
+                )
+
+                return await impl(
+                    {"ticket_id": ticket_id, "provider": provider}
+                )
+
     async def run(self) -> None:
         """Run the MCP server."""
         try:
