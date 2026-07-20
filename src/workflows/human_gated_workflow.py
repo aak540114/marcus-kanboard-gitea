@@ -134,6 +134,7 @@ class HumanGatedWorkflow:
         gate_settings: Optional[GateSettingManager] = None,
         ai_verifier: Optional[AIVerifier] = None,
         desc_inferrer: Optional[Any] = None,
+        llm_generate: Optional[Any] = None,
         max_parallel_agents: int = 1,
         poll_interval: float = 30.0,
     ) -> None:
@@ -157,6 +158,9 @@ class HumanGatedWorkflow:
         # instead of immediately pausing on the human (see
         # _infer_project_description).
         self._desc_inferrer = desc_inferrer
+        # Optional async ``(prompt) -> str`` used to summarize a worker's raw
+        # progress report into a one-line ticket comment (orchestrate mode).
+        self._llm_generate = llm_generate
         self._project_sync = project_sync  # Optional ProjectSyncWorkflow
         self._watcher = BoardWatcher(
             kanban=kanban,
@@ -842,6 +846,227 @@ class HumanGatedWorkflow:
             )
             await self._post_comment(ticket_id, comment)
             logger.info("AC change detected on ticket %s — notified agent", ticket_id)
+
+    # ------------------------------------------------------------------
+    # Orchestrate mode — Marcus drives a "dumb worker" agent
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _worker_instructions() -> str:
+        """The step-by-step directive Marcus hands a worker each turn."""
+        return (
+            "You are a worker; Marcus is the manager. Do EXACTLY this:\n"
+            "1. `git clone` the `context.clone_url` into a new directory and "
+            "cd into it; `git checkout -B <context.branch_name> "
+            "origin/<context.branch_name>`.\n"
+            "2. Implement every item in `context.acceptance_criteria` — make "
+            "real code changes, commit, and push to that branch.\n"
+            "3. Every ~10 seconds, call `marcus_work` again with the SAME "
+            "`agent_id` and `ticket_id` and a `report` of the one thing you "
+            "just did (a short sentence).\n"
+            "4. When EVERY acceptance criterion is met, call `marcus_work` "
+            "with `report=\"DONE - <one-line summary>\"`. If you hit something "
+            "only a human can resolve, call with `report=\"BLOCKED - "
+            "<reason>\"`."
+        )
+
+    def _classify_report_intent(self, report: str) -> str:
+        """Classify a worker report by its leading keyword.
+
+        Marcus instructs the worker to prefix a finishing report with
+        ``DONE`` and a blocker with ``BLOCKED`` (see
+        :meth:`_worker_instructions`), so this simple, reliable prefix check
+        replaces brittle free-text intent detection.
+        """
+        head = report.strip().lower()
+        if head.startswith("done"):
+            return "done"
+        if head.startswith("blocked"):
+            return "blocked"
+        if head.startswith("waiting") or head.startswith("need human"):
+            return "waiting"
+        return "progress"
+
+    async def _summarize_report(self, report: str) -> str:
+        """Summarize a worker's raw report into one line for a ticket comment."""
+        text = report.strip()
+        if self._llm_generate is None:
+            return text[:280]
+        prompt = (
+            "Summarize this AI worker's progress update into ONE short, plain "
+            "sentence for a ticket comment. No preamble, no markdown.\n\n"
+            f"Update:\n{text}"
+        )
+        try:
+            out = (await self._llm_generate(prompt) or "").strip()
+            return out[:400] if out else text[:280]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Report summarization failed: %s", exc)
+            return text[:280]
+
+    def _next_worker_ticket(self) -> Optional[str]:
+        """Return the next unclaimed TODO/READY ticket id, or ``None``.
+
+        Autonomous selection: Marcus hands out the lowest-numbered ticket
+        that is not yet started and not held by any worker.
+        """
+        def _key(rec: TicketRecord) -> int:
+            try:
+                return int(rec.ticket_id)
+            except ValueError:
+                return abs(hash(rec.ticket_id))
+
+        candidates = [
+            r
+            for r in self._lifecycle.all_records()
+            if r.provider == self._provider
+            and r.state in (TicketState.TODO, TicketState.READY)
+            and r.ai_agent_id is None
+        ]
+        candidates.sort(key=_key)
+        return candidates[0].ticket_id if candidates else None
+
+    async def orchestrate_work(
+        self,
+        agent_id: Optional[str] = None,
+        report: Optional[str] = None,
+        ticket_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Single entry point a worker loops on — Marcus orchestrates it.
+
+        The worker connects and repeatedly calls this. Marcus assigns the
+        next available ticket, returns exact instructions, summarizes every
+        report onto the ticket as a comment, and completes the ticket
+        through the project's gate when the worker reports done.
+
+        Parameters
+        ----------
+        agent_id : Optional[str]
+            Stable worker id. Generated on the first call and echoed back for
+            the worker to reuse.
+        report : Optional[str]
+            The worker's natural-language update of what it just did.
+        ticket_id : Optional[str]
+            The ticket the worker is on (echoed from a prior response).
+
+        Returns
+        -------
+        Dict[str, Any]
+            ``{status, agent_id, ticket_id?, context?, message}`` where
+            ``status`` is one of ``assigned``/``working``/``continue``/
+            ``done``/``blocked``/``waiting``/``no_work``.
+        """
+        agent_id = (agent_id or "").strip() or f"worker-{uuid.uuid4().hex[:8]}"
+        active = (ticket_id or "").strip() or self._lifecycle.get_agent_ticket(
+            agent_id
+        )
+
+        # 1. A report on the worker's active ticket → summarize + act.
+        if report and report.strip() and active:
+            summary = await self._summarize_report(report)
+            await self._post_comment(active, f"🤖 **Worker progress:** {summary}")
+            intent = self._classify_report_intent(report)
+            if intent == "done":
+                await self.signal_ready_for_review(active)
+                gate = await self._get_effective_gate(active)
+                done_msg = (
+                    "Handed off for human review."
+                    if gate == "human"
+                    else "Verified and merged to main."
+                )
+                return {
+                    "status": "done",
+                    "agent_id": agent_id,
+                    "ticket_id": active,
+                    "message": (
+                        f"{done_msg} You're done with this ticket — call "
+                        "marcus_work again (no ticket_id) for your next task."
+                    ),
+                }
+            if intent == "blocked":
+                await self.set_blocked(active, blocked_by=report.strip()[:200])
+                return {
+                    "status": "blocked",
+                    "agent_id": agent_id,
+                    "ticket_id": active,
+                    "message": (
+                        "Marked blocked. Call marcus_work again (no ticket_id) "
+                        "for a different task."
+                    ),
+                }
+            if intent == "waiting":
+                await self.set_waiting_for_human(active, reason=report.strip()[:300])
+                return {
+                    "status": "waiting",
+                    "agent_id": agent_id,
+                    "ticket_id": active,
+                    "message": (
+                        "Paused for human input. Call marcus_work again (no "
+                        "ticket_id) for a different task."
+                    ),
+                }
+            return {
+                "status": "continue",
+                "agent_id": agent_id,
+                "ticket_id": active,
+                "message": (
+                    "Progress logged. Keep implementing the acceptance "
+                    "criteria and report back in ~10s. Reply "
+                    "'DONE - <summary>' when all criteria are met, or "
+                    "'BLOCKED - <reason>' if stuck."
+                ),
+            }
+
+        # 2. Worker already has a ticket → re-send its context.
+        if active:
+            ctx = await self.get_work_context(active)
+            return {
+                "status": "working",
+                "agent_id": agent_id,
+                "ticket_id": active,
+                "context": ctx,
+                "message": self._worker_instructions(),
+            }
+
+        # 3. No active ticket → assign the next available one.
+        next_id = self._next_worker_ticket()
+        if next_id is None:
+            return {
+                "status": "no_work",
+                "agent_id": agent_id,
+                "message": (
+                    "No tickets are ready right now. Call marcus_work again "
+                    "in ~10s."
+                ),
+            }
+        rec = self._lifecycle.get(next_id, self._provider)
+        if rec is not None:
+            try:
+                self._lifecycle.set_assignee(next_id, self._provider, agent_id)
+            except KeyError:
+                pass
+            rec = self._lifecycle.get(next_id, self._provider) or rec
+            await self._start_ai_work(next_id, rec, claim_as=agent_id)
+
+        if self._lifecycle.get_agent_ticket(agent_id) != next_id:
+            # Start bailed (e.g. missing project description → parked). Tell
+            # the worker to retry; the reason is on the ticket as a comment.
+            return {
+                "status": "no_work",
+                "agent_id": agent_id,
+                "message": (
+                    "Could not start the next ticket yet (see its comments). "
+                    "Call marcus_work again in ~10s."
+                ),
+            }
+        ctx = await self.get_work_context(next_id)
+        return {
+            "status": "assigned",
+            "agent_id": agent_id,
+            "ticket_id": next_id,
+            "context": ctx,
+            "message": self._worker_instructions(),
+        }
 
     # ------------------------------------------------------------------
     # Agent-facing helpers (called by MCP tools)
@@ -1733,8 +1958,16 @@ class HumanGatedWorkflow:
         self,
         ticket_id: str,
         record: TicketRecord,
+        *,
+        claim_as: Optional[str] = None,
     ) -> None:
         """Claim the ticket, create branch, set in-progress, and notify AI.
+
+        ``claim_as`` overrides the claim id: in orchestrate mode a specific
+        worker holds the claim under its OWN id (bypassing the internal slot
+        pool), so ``get_agent_ticket(worker_id)`` resolves the worker's
+        ticket. When ``None`` (the human-gated path), the next free parallel
+        slot is used as before.
 
         Called whenever both conditions are met: the ticket IS assigned to
         a human (the assignment is the "please work on this" signal — see
@@ -1767,29 +2000,35 @@ class HumanGatedWorkflow:
             )
             return
 
-        # Idempotency: if one of this workflow's slots already holds this
-        # ticket, there is nothing new to start (a re-entrant call).
-        if self._slot_holding(ticket_id) is not None:
-            logger.debug(
-                "Ticket %s already held by this workflow; skipping restart",
-                ticket_id,
-            )
-            return
+        if claim_as is not None:
+            # Orchestrate mode: the worker holds the claim under its own id.
+            if self._lifecycle.get_agent_ticket(claim_as) == ticket_id:
+                return  # this worker already started this ticket
+            slot_id = claim_as
+        else:
+            # Idempotency: if one of this workflow's slots already holds this
+            # ticket, there is nothing new to start (a re-entrant call).
+            if self._slot_holding(ticket_id) is not None:
+                logger.debug(
+                    "Ticket %s already held by this workflow; skipping restart",
+                    ticket_id,
+                )
+                return
 
-        # Parallel-agent cap: take the next FREE slot. When every slot is
-        # busy the ticket simply waits — it stays available and is picked up
-        # by _pickup_next_ticket the moment a slot frees. This is the
-        # "at most N agents in parallel" ceiling, and busy slots are never
-        # preempted, so in-flight work is never interrupted.
-        slot_id = self._free_slot_id()
-        if slot_id is None:
-            logger.info(
-                "All %d agent slot(s) busy (%s); ticket %s waits for a free slot",
-                self._max_parallel_agents,
-                ", ".join(self._busy_ticket_ids()) or "none",
-                ticket_id,
-            )
-            return
+            # Parallel-agent cap: take the next FREE slot. When every slot is
+            # busy the ticket simply waits — it stays available and is picked
+            # up by _pickup_next_ticket the moment a slot frees. Busy slots
+            # are never preempted, so in-flight work is never interrupted.
+            free = self._free_slot_id()
+            if free is None:
+                logger.info(
+                    "All %d agent slot(s) busy (%s); ticket %s waits for a slot",
+                    self._max_parallel_agents,
+                    ", ".join(self._busy_ticket_ids()) or "none",
+                    ticket_id,
+                )
+                return
+            slot_id = free
 
         # Atomically claim the ticket; abort if another agent already has it.
         claimed = self._lifecycle.claim_ticket(

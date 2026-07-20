@@ -753,6 +753,48 @@ async def get_project_description(
         return {"success": False, "error": str(exc)}
 
 
+async def marcus_work(
+    arguments: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Orchestration entry point — the ONLY tool a worker needs to call.
+
+    Marcus is the manager; the caller is a worker. Call this with no
+    arguments to get your first task, then call it again every ~10 seconds
+    with the ``agent_id`` and ``ticket_id`` Marcus returned plus a short
+    ``report`` of what you just did. Marcus assigns work, summarizes each
+    report onto the ticket, guides you, and completes the ticket when you
+    report ``DONE``.
+
+    Parameters
+    ----------
+    arguments : Dict[str, Any]
+        Optional:
+            ``agent_id`` — your worker id (echo back the one Marcus gave you).
+            ``ticket_id`` — the ticket you're on (echo it back).
+            ``report`` — one line on what you just did; prefix ``DONE`` when
+            all acceptance criteria are met, or ``BLOCKED`` if stuck.
+
+    Returns
+    -------
+    Dict[str, Any]
+        ``{success, result: {status, agent_id, ticket_id?, context?,
+        message}}``. Always read and follow ``message``.
+    """
+    wf = _workflow()
+    if wf is None:
+        return {"success": False, "error": "HumanGatedWorkflow not initialised"}
+    try:
+        result = await wf.orchestrate_work(
+            agent_id=arguments.get("agent_id"),
+            report=arguments.get("report"),
+            ticket_id=arguments.get("ticket_id"),
+        )
+        return {"success": True, "result": result}
+    except Exception as exc:  # noqa: BLE001
+        logger.error("marcus_work failed: %s", exc)
+        return {"success": False, "error": str(exc)}
+
+
 async def update_project_description(
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:

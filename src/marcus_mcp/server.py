@@ -2748,6 +2748,30 @@ class MarcusServer:
         # to (get_work_context "doesn't exist"). Each wraps the arguments-dict
         # impl in src/marcus_mcp/tools/human_gated.py.
 
+        if "marcus_work" in allowed_tools:
+
+            @app.tool()  # type: ignore[misc]
+            async def marcus_work(
+                agent_id: str = "",
+                ticket_id: str = "",
+                report: str = "",
+            ) -> Dict[str, Any]:
+                """The ONLY tool a worker needs: Marcus assigns + guides work.
+
+                Call with no args to get your first task; then call again
+                every ~10s with the returned agent_id + ticket_id and a short
+                report ('DONE - ...' when finished). Always follow `message`.
+                """
+                from .tools.human_gated import marcus_work as impl
+
+                return await impl(
+                    {
+                        "agent_id": agent_id,
+                        "ticket_id": ticket_id,
+                        "report": report,
+                    }
+                )
+
         if "get_work_context" in allowed_tools:
 
             @app.tool()  # type: ignore[misc]
@@ -3802,6 +3826,13 @@ async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
         gate_settings=_get_gate_settings_mgr(server),
         ac_generator=ac_generator,
         desc_inferrer=desc_inferrer,
+        # Summarizes worker reports into one-line ticket comments in
+        # orchestrate mode (marcus_work). None → falls back to truncation.
+        llm_generate=(
+            ai_engine.generate_text
+            if ai_engine is not None and hasattr(ai_engine, "generate_text")
+            else None
+        ),
     )
     register_workflow(workflow)
     await workflow.start()
@@ -4768,6 +4799,13 @@ function save() {{
                 "ticket.new",
             ]
             queue: "asyncio.Queue[int]" = asyncio.Queue()
+            bus = server.events
+            if bus is None:  # pragma: no cover - events bus always set at runtime
+                return StreamingResponse(
+                    iter([b": no event bus\n\n"]),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache"},
+                )
 
             async def _on_event(_event: Any) -> None:
                 try:
@@ -4776,7 +4814,7 @@ function save() {{
                     pass
 
             for _n in names:
-                server.events.subscribe(_n, _on_event)
+                bus.subscribe(_n, _on_event)
 
             async def _gen() -> AsyncIterator[bytes]:
                 try:
@@ -4795,7 +4833,7 @@ function save() {{
                 finally:
                     for _n in names:
                         try:
-                            server.events.unsubscribe(_n, _on_event)
+                            bus.unsubscribe(_n, _on_event)
                         except Exception:  # noqa: BLE001
                             pass
 

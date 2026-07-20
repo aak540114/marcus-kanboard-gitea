@@ -2593,3 +2593,71 @@ class TestReviewFixes:
             await workflow._pickup_next_ticket()
 
         assert lifecycle.get("90", "jira").ai_agent_id is None
+
+
+class TestOrchestrateWork:
+    """Marcus-as-orchestrator: the marcus_work single-tool loop."""
+
+    @pytest.mark.asyncio
+    async def test_first_call_assigns_next_ticket(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """No report/ticket → Marcus assigns the next TODO ticket to the worker."""
+        lifecycle.get_or_create("5", "kanboard")  # a TODO record
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            side_effect=lambda provider, tid: f"ticket/{provider}/{tid}",
+        ):
+            res = await workflow.orchestrate_work(agent_id="w1")
+
+        assert res["status"] == "assigned"
+        assert res["ticket_id"] == "5"
+        assert "context" in res and "message" in res
+        # The worker holds the claim under its own id, ticket is in progress.
+        assert lifecycle.get_agent_ticket("w1") == "5"
+        assert lifecycle.get("5", "kanboard").state == TicketState.IN_PROGRESS
+
+    @pytest.mark.asyncio
+    async def test_no_available_work(self, workflow, lifecycle, mock_kanban):
+        """Nothing TODO/READY → status no_work."""
+        res = await workflow.orchestrate_work(agent_id="w2")
+        assert res["status"] == "no_work"
+
+    @pytest.mark.asyncio
+    async def test_progress_report_summarized_to_comment(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """A progress report is posted as a comment; status continue."""
+        lifecycle.get_or_create("7", "kanboard")
+        lifecycle.transition("7", "kanboard", TicketState.READY)
+        lifecycle.claim_ticket("7", "kanboard", "w3")
+        lifecycle.transition("7", "kanboard", TicketState.IN_PROGRESS)
+
+        res = await workflow.orchestrate_work(
+            agent_id="w3", ticket_id="7", report="wrote the model layer"
+        )
+        assert res["status"] == "continue"
+        mock_kanban.add_comment.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_done_report_completes_ticket(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """A 'DONE' report hands the ticket off via the gate (human → WFH)."""
+        lifecycle.get_or_create("8", "kanboard")
+        lifecycle.transition("8", "kanboard", TicketState.READY)
+        lifecycle.claim_ticket("8", "kanboard", "w4")
+        lifecycle.transition("8", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.set_assignee("8", "kanboard", "w4")
+
+        res = await workflow.orchestrate_work(
+            agent_id="w4", ticket_id="8", report="DONE - shipped the feature"
+        )
+        assert res["status"] == "done"
+        assert lifecycle.get("8", "kanboard").state == TicketState.WAITING_FOR_HUMAN
+
+    def test_classify_report_intent(self, workflow):
+        """Report-prefix protocol maps to intents."""
+        assert workflow._classify_report_intent("DONE - x") == "done"
+        assert workflow._classify_report_intent("BLOCKED - y") == "blocked"
+        assert workflow._classify_report_intent("wrote a test") == "progress"

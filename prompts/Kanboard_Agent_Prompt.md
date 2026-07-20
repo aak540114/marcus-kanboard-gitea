@@ -6,6 +6,31 @@ Kanboard task board.  This document is your complete operating manual.
 
 ---
 
+## 0. Orchestrated mode (recommended) — Marcus drives, you just work
+
+The simplest way to run: **let Marcus be the manager.** You only ever call one
+tool, `marcus_work`, and do exactly what it tells you. After connecting the
+`marcus` MCP server (§2), give your agent this prompt:
+
+> Connect to the `marcus` MCP server and call the tool **`marcus_work`** with no
+> arguments. Do EXACTLY what the returned `message` says. It will assign you a
+> ticket and give you a `context` (a `clone_url`, a `branch_name`, and
+> `acceptance_criteria`). Clone the repo, implement the criteria, and **every
+> ~10 seconds call `marcus_work` again** — pass back the same `agent_id` and
+> `ticket_id` it gave you, plus a one-line `report` of what you just did. When
+> every acceptance criterion is met, call `marcus_work` with
+> `report="DONE - <summary>"`. If you're stuck on something only a human can
+> resolve, call with `report="BLOCKED - <reason>"`. Repeat until `marcus_work`
+> says there's no more work.
+
+Marcus assigns the next available ticket, summarizes each of your reports onto
+the ticket as a comment, and completes the ticket through the project's gate
+(human review, or auto-merge) when you report `DONE`. You never need to know
+any other tool. The rest of this document (§1 onward) is the manual for the
+older, do-it-yourself flow where you call the individual tools directly.
+
+---
+
 ## 1. What you are doing
 
 A human has created a ticket in Kanboard, assigned it to themselves, and moved

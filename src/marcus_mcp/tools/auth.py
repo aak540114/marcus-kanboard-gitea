@@ -16,6 +16,7 @@ from ..audit import get_audit_logger
 # role, but an *agent* client must be allowed to call them too — otherwise
 # get_work_context and friends are invisible to the very agents they're for.
 HUMAN_GATED_AGENT_TOOLS = [
+    "marcus_work",
     "get_work_context",
     "get_project_description",
     "update_project_description",

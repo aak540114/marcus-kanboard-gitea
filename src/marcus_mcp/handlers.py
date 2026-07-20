@@ -1025,6 +1025,39 @@ def get_tool_definitions(role: str = "agent") -> List[types.Tool]:
             },
         ),
         types.Tool(
+            name="marcus_work",
+            description=(
+                "Orchestration entry point — the ONLY tool a worker needs. "
+                "Call with no arguments to get your first task, then call "
+                "again every ~10 seconds with the agent_id + ticket_id Marcus "
+                "returned plus a short `report` of what you just did. Marcus "
+                "assigns work, summarizes each report onto the ticket, guides "
+                "you, and finishes the ticket when you report DONE. Always "
+                "read and follow the returned `message`."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "agent_id": {
+                        "type": "string",
+                        "description": "Your worker id (echo back Marcus's).",
+                    },
+                    "ticket_id": {
+                        "type": "string",
+                        "description": "The ticket you're on (echo it back).",
+                    },
+                    "report": {
+                        "type": "string",
+                        "description": (
+                            "One line on what you just did. Prefix 'DONE' when "
+                            "all criteria are met, or 'BLOCKED' if stuck."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        ),
+        types.Tool(
             name="update_project_description",
             description=(
                 "Update the project-wide tech-stack/context document based on "
@@ -1781,6 +1814,7 @@ async def handle_tool_call(
         # Human-gated workflow tools (Kanboard+Gitea integration)
         elif name in {
             "get_work_context",
+            "marcus_work",
             "get_project_description",
             "update_project_description",
             "generate_acceptance_criteria",
@@ -1797,6 +1831,7 @@ async def handle_tool_call(
 
             _dispatch = {
                 "get_work_context": _hg.get_work_context,
+                "marcus_work": _hg.marcus_work,
                 "get_project_description": _hg.get_project_description,
                 "update_project_description": _hg.update_project_description,
                 "generate_acceptance_criteria": _hg.generate_acceptance_criteria,

@@ -39,6 +39,7 @@ TOOL_GROUPS: Dict[str, Set[str]] = {
         "list_project_history_files",
         # Human-gated workflow tools (Kanboard+Gitea integration)
         "get_work_context",
+        "marcus_work",
         "get_project_description",
         "update_project_description",
         "generate_acceptance_criteria",
@@ -75,6 +76,7 @@ TOOL_GROUPS: Dict[str, Set[str]] = {
         "list_project_history_files",
         # Human-gated workflow tools (Kanboard+Gitea integration)
         "get_work_context",
+        "marcus_work",
         "get_project_description",
         "update_project_description",
         "generate_acceptance_criteria",
