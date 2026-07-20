@@ -13,6 +13,10 @@ A production deployment of **[Marcus](https://github.com/lwgray/marcus)** — th
 | **Kanboard provider** | Full Kanboard JSON-RPC integration — tickets, columns, comments, assignments |
 | **Gitea integration** | `GiteaManager` + `ProjectSyncWorkflow` (`src/integrations/gitea_manager.py`, `src/workflows/project_sync_workflow.py`) auto-create a Gitea repo per Kanboard project — proactively via a `ProjectWatcher` poll, and on-demand the first time an agent calls `get_work_context` — no manual repo setup. |
 | **Parallel agents** | `HumanGatedWorkflow` keeps up to `MARCUS_MAX_PARALLEL_AGENTS` (default 3) tickets in progress at once, each held by a distinct agent "slot". A busy slot is never preempted, so an agent actively working is never interrupted; extra assigned tickets simply wait for a free slot. |
+| **Orchestrate mode (`marcus_work`)** | Marcus is the manager, the agent is a worker. Prompt any agent to "connect to Marcus and do what it says": it loops on ONE tool, `marcus_work`, which hands out the next ticket that's **assigned to a human (anyone) and in Ready**, returns exact instructions, LLM-summarizes each worker report onto the ticket as a comment (~every 10 s, driven by the worker's callbacks), and completes the ticket through the project's gate on `DONE`. |
+| **Ticket decomposition** | Marcus splits a big ticket into 2–5 independent sub-tickets — created on the **parent's board**, linked "is a child of", inheriting the parent's owner and Ready status — so multiple agents work them in parallel; the parent parks in Blocked until its children finish. Automatic when a ticket with 4+ acceptance criteria is handed to a worker, or on demand via a **`@marcus decompose`** comment. Needs an LLM configured (`claude_subscription` works). |
+| **Approve from the board or a comment** | Dragging a card to **Done** merges its branch to `main` (fixed: Kanboard fires a column-move event, not a close event — Marcus now honors both). Commenting **`@marcus approve`** (or plain "approve"/"lgtm"/"merge to main") on a waiting ticket does the same; negated/conditional comments ("don't merge", "approve after you fix X") count as change requests instead. Marcus merges the agent's **pushed** branch (fetched from Gitea), not its own stale local copy. |
+| **Live board refresh (SSE push)** | The Kanboard UI updates the instant Marcus or an agent changes anything — comments, column moves, state — via one Server-Sent Events stream (`/api/events/stream`). No polling, no manual reload; a pending refresh is held while you're typing a comment and applied when you stop. |
 | **Zero-setup agent clone** | `get_work_context` returns a ready-to-run `clone_url` (browser-facing host from `GITEA_PUBLIC_URL`, git credentials embedded unless `MARCUS_EMBED_GIT_CREDENTIALS=false`). The agent clones into **its own** directory — no manual clone, and parallel agents never share a working tree. Prefer a scoped `GITEA_AGENT_TOKEN` over the admin token. |
 | **Kanboard → code links** | The board header links to the project's Gitea repo; each ticket's sidebar links to the exact branch it's worked on — jump from board to code in one click. |
 | **MarcusDevEnv plugin** | Kanboard plugin that adds AI-aware UI to every board and task |
@@ -54,6 +58,7 @@ The plugin ships in `kanboard/plugins/MarcusDevEnv/` and is automatically active
 | **Human Gate / AI Gate toggle** | Sets the project-level gate mode. Human Gate (default): AI pauses for human review before done. AI Gate: AI merges and closes autonomously. |
 | **AI Verify counter** | Appears when AI Gate is active. `[−] N [+]` sets how many sequential LLM review rounds run before the branch auto-merges. 0 = disabled. |
 | **Max dev environments counter** | Global, always visible. `[−] N [+]` caps how many "Open Dev Environment" Docker containers can run at once across every ticket — `∞` (default) means unlimited. Once the limit is reached, starting a new one fails until an existing one is stopped. |
+| **Live refresh** | (Invisible widget.) The page holds one SSE connection to Marcus and reloads the moment Marcus/an agent changes anything — no manual refresh. Deferred while you're typing or a Kanboard dialog is open. |
 
 ### Task sidebar
 | Panel | What it does |
@@ -62,6 +67,7 @@ The plugin ships in `kanboard/plugins/MarcusDevEnv/` and is automatically active
 | **Marcus Dev Environment** | Start / Open / Stop a hot-reload preview for this ticket's branch. Any language — stack comes from the project description. |
 | **Marcus Gate Mode** | Per-ticket gate override. Shows the project default; lets you switch this ticket to Human or AI gate independently. Ticket setting overrides project setting. Includes a per-ticket AI Verify override when AI Gate is active. |
 | **Marcus Dependencies** | Dependency graph: *Depends on*, *Blocks*, *Related* — each with a colour-coded column-status badge. |
+| **Live refresh** | (Invisible.) Same SSE stream as the board: a new comment or state change from Marcus/an agent reloads the task view instantly — never while you're mid-comment. |
 
 ---
 
@@ -94,7 +100,7 @@ AI agents (Claude Code, Codex, etc.)
 
 ### How AI agents reach tickets
 
-AI agents never call Kanboard's JSON-RPC API and never receive Kanboard's API token. They call Marcus's MCP tools (`get_work_context`, `get_project_description`, `post_ticket_progress`, `signal_ready_for_review`, …); Marcus alone holds `KANBOARD_API_TOKEN` and is the only thing that makes JSON-RPC calls to Kanboard, over the internal Docker network (`http://kanboard/jsonrpc.php`, not the host-published `:8080`). No tool response ever contains a Kanboard URL or credential. This is why gating Marcus's HTTP endpoint with a bearer token (see [Authenticating remote agents](#authenticating-remote-agents)) is sufficient to control ticket access: it's the *only* door.
+AI agents never call Kanboard's JSON-RPC API and never receive Kanboard's API token. They call Marcus's MCP tools — in orchestrate mode just **`marcus_work`** (Marcus assigns, guides, and summarizes), or the individual tools (`get_work_context`, `get_project_description`, `post_ticket_progress`, `signal_ready_for_review`, …); Marcus alone holds `KANBOARD_API_TOKEN` and is the only thing that makes JSON-RPC calls to Kanboard, over the internal Docker network (`http://kanboard/jsonrpc.php`, not the host-published `:8080`). No tool response ever contains a Kanboard URL or credential. This is why gating Marcus's HTTP endpoint with a bearer token (see [Authenticating remote agents](#authenticating-remote-agents)) is sufficient to control ticket access: it's the *only* door.
 
 `get_work_context` — the first call every agent makes — returns everything Marcus knows about a ticket: title, description, acceptance criteria, a ready-to-run `clone_url` (plus `repo_web_url`/`branch_web_url`), branch name, labels, dependency links (`depends_on`/`blocks`/`relates_to`), and its last 10 comments (see `prompts/Kanboard_Agent_Prompt.md` for the full field reference). `get_project_description` returns the project-wide tech stack and architecture notes when per-ticket context isn't enough.
 
@@ -187,7 +193,11 @@ claude mcp add --transport http marcus http://localhost:4298/mcp
 
 This always works from the same machine Marcus runs on. Connecting from a **different machine** (another laptop, a remote VPS) additionally requires you to have opted in during setup — see [Network access](#network-access).
 
-Once connected, point the agent at a ticket: it calls `get_work_context`, which returns a `clone_url` it uses to `git clone` the ticket's repo into its own directory, then works on the pre-made branch — no manual clone step. `prompts/Kanboard_Agent_Prompt.md` is the full agent operating manual (auth, gate modes, the tool call sequence). For a **remote** agent to clone a private repo seamlessly, set `GITEA_PUBLIC_URL` to a browser-reachable address and provide a `GITEA_AGENT_TOKEN`.
+Once connected, the simplest way to run an agent is **orchestrate mode** — prompt it with roughly:
+
+> Call the `marcus_work` tool with no arguments and do exactly what the returned `message` says. Every ~10 seconds call `marcus_work` again with the `agent_id`/`ticket_id` it gave you plus a one-line `report`. Report `DONE - <summary>` when finished.
+
+Marcus hands out the next human-readied ticket, posts a summarized progress comment on each report, and completes the ticket through the gate — the agent needs no other tool. Alternatively, point the agent at a specific ticket: it calls `get_work_context`, which returns a `clone_url` it uses to `git clone` the repo into its own directory, then works on the pre-made branch. `prompts/Kanboard_Agent_Prompt.md` is the full agent operating manual (auth, gate modes, both flows). For a **remote** agent to clone a private repo seamlessly, set `GITEA_PUBLIC_URL` to a browser-reachable address and provide a `GITEA_AGENT_TOKEN`.
 
 ### Tearing down
 
@@ -305,19 +315,29 @@ To start Marcus again later without re-provisioning anything (e.g. after a reboo
 Human creates ticket in Kanboard
   → Marcus generates acceptance criteria (AI)
 
-Human assigns ticket + moves to "Ready"
+Human assigns ticket (to anyone) + moves to "Ready"
   → Marcus checks project description for tech stack
-  → If stack missing: posts clarification comment, moves to "Waiting for Human"
-  → If stack OK: creates branch in Gitea, moves to "In Progress"
+  → If stack missing: INFERS it from the ticket (LLM); only asks the human
+    if it can't even guess
+  → If the ticket is big (4+ acceptance criteria) and handed out via
+    marcus_work: Marcus may DECOMPOSE it into linked sub-tickets on the
+    same board (parent parks in Blocked until children finish)
+  → Creates branch in Gitea, moves to "In Progress"
 
-AI agent works on the branch
-  → Posts progress comments at 25 / 50 / 75 / 100 %
-  → Calls signal_ready_for_review when done
+AI agent works on the branch (its own clone)
+  → Orchestrate mode: agent loops on marcus_work; Marcus posts a
+    summarized progress comment on each ~10 s report
+  → Classic mode: agent posts progress comments itself, then calls
+    signal_ready_for_review when done
 
   Human Gate (default):
     → Ticket moves to "Waiting for Human"
     → Human reviews branch + live preview
-    → Human moves card to "Done" → branch auto-merges to main
+    → Approve: drag the card to "Done" OR comment "@marcus approve"
+      (plain "approve"/"lgtm" works too) → Marcus fetches the agent's
+      pushed branch and merges it to main
+    → Request changes: any other comment → back to "In Progress", agent
+      resumes with your feedback
 
   AI Gate (AI Verify OFF):
     → Branch auto-merges to main immediately
@@ -385,6 +405,7 @@ When `MARCUS_AGENT_TOKEN` is set (automatic once you allow remote access — see
 | `/api/dev-env/status?ticket_id=<id>` | GET | Returns `{running, url}` for a ticket's dev environment |
 | `/api/dev-env-setting` | GET/PUT | Global `max_parallel_containers` limit (`null` = unlimited) — see [Hot-reload dev environments](#hot-reload-dev-environments) |
 | `/api/active-agents` | GET | All tickets currently claimed by an AI agent |
+| `/api/events/stream` | GET | Server-Sent Events stream — pushes a `refresh` event the instant Marcus/an agent changes anything; the MarcusDevEnv plugin reloads the page on it (auth via `?token=`, since EventSource can't send headers) |
 | `/api/ticket-links?ticket_id=<id>` | GET | Dependency graph (`depends_on`/`blocks`/`relates_to`) plus the ticket's `repo_web_url` and `branch_web_url` |
 | `/api/project-repo?project_id=<id>` | GET | Browser URL of the project's Gitea repo (`null` until provisioned) — backs the board's Repository button |
 | `/project-description?project_id=<id>` | GET | Editable project description page |
