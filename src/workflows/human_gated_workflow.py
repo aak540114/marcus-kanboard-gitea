@@ -929,31 +929,80 @@ class HumanGatedWorkflow:
             "cd into it; `git checkout -B <context.branch_name> "
             "origin/<context.branch_name>`.\n"
             "2. Implement every item in `context.acceptance_criteria` — make "
-            "real code changes, commit, and push to that branch.\n"
+            "real code changes. After EACH change: `git commit` then "
+            "`git push origin <context.branch_name>`. Push every commit (not "
+            "just at the end) so your work is visible on the remote branch for "
+            "review.\n"
             "3. Every ~10 seconds, call `marcus_work` again with the SAME "
             "`agent_id` and `ticket_id` and a `report` of the one thing you "
             "just did (a short sentence).\n"
-            "4. When EVERY acceptance criterion is met, call `marcus_work` "
-            "with `report=\"DONE - <one-line summary>\"`. If you hit something "
-            "only a human can resolve, call with `report=\"BLOCKED - "
+            "4. When EVERY acceptance criterion is met, FIRST push your final "
+            "commit, THEN call `marcus_work` with `report=\"DONE - <one-line "
+            "summary>\"` (start the report with the word DONE). If you hit "
+            "something only a human can resolve, call with `report=\"BLOCKED - "
             "<reason>\"`."
         )
 
     def _classify_report_intent(self, report: str) -> str:
-        """Classify a worker report by its leading keyword.
+        """Classify a worker report into done / blocked / waiting / progress.
 
-        Marcus instructs the worker to prefix a finishing report with
-        ``DONE`` and a blocker with ``BLOCKED`` (see
-        :meth:`_worker_instructions`), so this simple, reliable prefix check
-        replaces brittle free-text intent detection.
+        Marcus instructs the worker to PREFIX a finishing report with ``DONE``
+        and a blocker with ``BLOCKED`` (see :meth:`_worker_instructions`), and
+        those explicit prefixes always win. But agents don't reliably use the
+        exact prefix — one that reports "finished implementing everything" or
+        "all acceptance criteria met" would otherwise be read as "keep going"
+        and the ticket would never move to waiting-for-human. So a lenient
+        fallback also recognizes common completion / blocked phrasings, guarded
+        against negation ("not done yet", "isn't finished") so a partial update
+        is never mistaken for completion.
         """
         head = report.strip().lower()
+
+        # 1. Explicit prefixes (the documented contract) — highest priority.
         if head.startswith("done"):
             return "done"
         if head.startswith("blocked"):
             return "blocked"
         if head.startswith("waiting") or head.startswith("need human"):
             return "waiting"
+
+        negated = any(
+            n in head
+            for n in ("not ", "n't", "no longer", "not yet", "still working")
+        )
+
+        # 2. Lenient completion phrasings (only when not negated).
+        if not negated and any(
+            k in head
+            for k in (
+                "all acceptance criteria",
+                "ready for review",
+                "finished implement",
+                "implementation complete",
+                "implementation is complete",
+                "task complete",
+                "work is complete",
+                "work complete",
+                "all done",
+                "everything is done",
+                "completed all",
+                "i'm done",
+                "i am done",
+            )
+        ):
+            return "done"
+
+        # 3. Lenient blocked / waiting phrasings.
+        if not negated and ("i'm blocked" in head or "i am blocked" in head):
+            return "blocked"
+        if not negated and (
+            "need human" in head
+            or "waiting for human" in head
+            or "need a human" in head
+            or "human input" in head
+        ):
+            return "waiting"
+
         return "progress"
 
     async def _summarize_report(self, report: str) -> str:
@@ -1474,6 +1523,66 @@ class HumanGatedWorkflow:
             percentage=percentage,
             message=message,
             commits=commits,
+        )
+        return await self._post_comment(ticket_id, comment)
+
+    async def handle_branch_push(
+        self, branch_name: str, commit_messages: List[str]
+    ) -> bool:
+        """Announce commits pushed to a ticket branch, from the Gitea webhook.
+
+        Wired to the Gitea push webhook so the board shows REAL, code-driven
+        progress the instant an agent pushes — independent of whether the
+        agent bothers to self-report via ``marcus_work``. A push is also
+        activity, so this refreshes the ticket's liveness heartbeat (keeping
+        the "actively worked" highlight lit) and lets a human review the
+        pushed code on the branch whenever they want.
+
+        Parameters
+        ----------
+        branch_name : str
+            The pushed branch, e.g. ``ticket/kanboard/5``. Matched against a
+            lifecycle record's stored ``branch_name`` (exact, by construction
+            — never re-parsed back into a ticket id).
+        commit_messages : List[str]
+            Commit messages in the push (newest last). An empty list (e.g.
+            Marcus's own branch-create push, which carries no new commits) is
+            a no-op.
+
+        Returns
+        -------
+        bool
+            ``True`` if a matching, still-open ticket was found and a comment
+            was posted; ``False`` otherwise.
+        """
+        if not commit_messages:
+            return False
+        record = next(
+            (
+                r
+                for r in self._lifecycle.all_records()
+                if r.provider == self._provider and r.branch_name == branch_name
+            ),
+            None,
+        )
+        # Only comment while the ticket is still being worked / reviewed — a
+        # push to an already-DONE ticket's branch is noise.
+        if record is None or record.state == TicketState.DONE:
+            return False
+
+        ticket_id = record.ticket_id
+        # A push is agent activity — keep the "actively worked" ring lit.
+        self._mark_progress_activity(ticket_id)
+
+        count = len(commit_messages)
+        shown = [m.splitlines()[0][:100] for m in commit_messages[-5:] if m.strip()]
+        lines = "\n".join(f"- {line}" for line in shown)
+        more = "" if count <= 5 else f"\n_…and {count - 5} earlier commit(s)._"
+        comment = (
+            f"🔨 **{count} new commit{'s' if count != 1 else ''} pushed** to "
+            f"`{branch_name}`:\n{lines}{more}\n\n"
+            "Open the branch from this ticket's **Marcus Code** link to review "
+            "the code."
         )
         return await self._post_comment(ticket_id, comment)
 

@@ -3115,3 +3115,74 @@ class TestActivityHeartbeat:
         await workflow.set_blocked("60", blocked_by="dep #61")
 
         assert "60" not in workflow.get_working_ticket_ids()
+
+
+class TestClassifyReportIntentLenient:
+    """Report classification tolerates common phrasings, guards negation."""
+
+    def test_explicit_prefixes(self, workflow):
+        assert workflow._classify_report_intent("DONE - shipped") == "done"
+        assert workflow._classify_report_intent("BLOCKED - need key") == "blocked"
+        assert workflow._classify_report_intent("waiting on API") == "waiting"
+
+    def test_lenient_completion_phrasings(self, workflow):
+        for r in (
+            "Finished implementing all the acceptance criteria",
+            "All acceptance criteria met and tested",
+            "The implementation is complete",
+            "I'm done with the feature",
+            "everything is done",
+        ):
+            assert workflow._classify_report_intent(r) == "done", r
+
+    def test_negated_completion_is_progress(self, workflow):
+        for r in (
+            "not done yet, still writing tests",
+            "the implementation isn't complete",
+            "still working on the acceptance criteria",
+        ):
+            assert workflow._classify_report_intent(r) == "progress", r
+
+    def test_plain_progress_stays_progress(self, workflow):
+        assert workflow._classify_report_intent("wrote the login form") == "progress"
+
+    def test_lenient_blocked_and_waiting(self, workflow):
+        assert workflow._classify_report_intent("I'm blocked on the DB schema") == "blocked"
+        assert workflow._classify_report_intent("I need human input on the design") == "waiting"
+
+
+class TestHandleBranchPush:
+    """A Gitea push to a ticket branch posts a 'commits pushed' comment and
+    keeps the ticket's liveness heartbeat lit."""
+
+    @pytest.mark.asyncio
+    async def test_posts_comment_and_marks_activity(self, workflow, lifecycle, mock_kanban):
+        rec = lifecycle.get_or_create("5", "kanboard")
+        rec.branch_name = "ticket/kanboard/5"
+
+        ok = await workflow.handle_branch_push(
+            "ticket/kanboard/5", ["add login form", "wire up validation"]
+        )
+
+        assert ok is True
+        assert mock_kanban.add_comment.await_count >= 1
+        assert "5" in workflow.get_working_ticket_ids()
+
+    @pytest.mark.asyncio
+    async def test_empty_commits_is_noop(self, workflow, lifecycle):
+        rec = lifecycle.get_or_create("6", "kanboard")
+        setattr(rec, "branch_name", "ticket/kanboard/6")
+        assert await workflow.handle_branch_push("ticket/kanboard/6", []) is False
+
+    @pytest.mark.asyncio
+    async def test_no_matching_ticket_is_noop(self, workflow):
+        assert await workflow.handle_branch_push("ticket/kanboard/999", ["x"]) is False
+
+    @pytest.mark.asyncio
+    async def test_done_ticket_is_skipped(self, workflow, lifecycle):
+        rec = lifecycle.get_or_create("8", "kanboard")
+        setattr(rec, "branch_name", "ticket/kanboard/8")
+        lifecycle.transition("8", "kanboard", TicketState.READY)
+        lifecycle.transition("8", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("8", "kanboard", TicketState.DONE)
+        assert await workflow.handle_branch_push("ticket/kanboard/8", ["x"]) is False

@@ -189,3 +189,51 @@ class TestRefreshTriggering:
         mock_dev_env.refresh_by_branch.assert_awaited_once_with(
             "ticket/kanboard/1"
         )
+
+
+def _push_body_with_commits(branch: str, messages: list) -> bytes:
+    """Gitea push payload carrying commit objects."""
+    return json.dumps(
+        {
+            "ref": f"refs/heads/{branch}",
+            "repository": {"name": "shopping-cart"},
+            "commits": [{"message": m} for m in messages],
+        }
+    ).encode()
+
+
+class TestOnCommitsCallback:
+    """The on_commits hook fires for ticket-branch pushes so Marcus can post a
+    'commits pushed' comment on the ticket."""
+
+    @pytest.mark.asyncio
+    async def test_callback_invoked_with_branch_and_messages(self, mock_dev_env):
+        on_commits = AsyncMock()
+        rcv = GiteaWebhookReceiver(
+            dev_env_manager=mock_dev_env, on_commits=on_commits
+        )
+        body = _push_body_with_commits(
+            "ticket/kanboard/5", ["add form", "wire validation"]
+        )
+
+        assert await rcv.handle_request(body) is True
+        on_commits.assert_awaited_once_with(
+            "ticket/kanboard/5", ["add form", "wire validation"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_callback_error_does_not_fail_webhook(self, mock_dev_env):
+        on_commits = AsyncMock(side_effect=RuntimeError("boom"))
+        rcv = GiteaWebhookReceiver(
+            dev_env_manager=mock_dev_env, on_commits=on_commits
+        )
+        body = _push_body_with_commits("ticket/kanboard/5", ["x"])
+        # Best-effort: a comment failure must not reject the delivery.
+        assert await rcv.handle_request(body) is True
+
+    @pytest.mark.asyncio
+    async def test_no_callback_still_refreshes(self, mock_dev_env):
+        rcv = GiteaWebhookReceiver(dev_env_manager=mock_dev_env)  # on_commits=None
+        body = _push_body_with_commits("ticket/kanboard/5", ["x"])
+        assert await rcv.handle_request(body) is True
+        mock_dev_env.refresh_by_branch.assert_awaited_once_with("ticket/kanboard/5")

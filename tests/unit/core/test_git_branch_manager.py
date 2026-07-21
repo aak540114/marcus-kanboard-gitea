@@ -124,3 +124,91 @@ class TestMergeFetchesAgentBranch:
             c[0] == "merge" and "ticket/kanboard/3" in c
             for c in _calls(mgr._git)
         )
+
+
+class TestCreateBranchPublishesToRemote:
+    """create_branch must reliably PUBLISH the branch to the remote (Gitea).
+
+    The old code cut the branch locally and pushed with the result discarded,
+    and early-returned without pushing when the branch already existed
+    locally. Either path could leave a local-only branch: the agent then
+    couldn't `git checkout origin/<branch>`, worked on a local-only branch,
+    and its commits never reached Gitea.
+    """
+
+    @pytest.mark.asyncio
+    async def test_new_branch_is_pushed_to_remote(self):
+        """A freshly created branch is pushed with -u to the remote."""
+        mgr = _mgr()
+        # show-ref (branch_exists) → 1 (absent); everything else → 0.
+
+        async def fake_git(*args):
+            if args[0] == "show-ref":
+                return (1, "", "")
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+
+        ok = await mgr.create_branch("ticket/kanboard/7")
+
+        assert ok is True
+        calls = _calls(mgr._git)
+        assert ("push", "-u", "origin", "ticket/kanboard/7") in calls
+
+    @pytest.mark.asyncio
+    async def test_push_failure_propagates_as_false(self):
+        """If the push fails, create_branch returns False (not a silent True)."""
+        mgr = _mgr()
+
+        async def fake_git(*args):
+            if args[0] == "show-ref":
+                return (1, "", "")          # branch absent locally
+            if args[0] == "push":
+                return (1, "", "denied")    # push rejected
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+
+        ok = await mgr.create_branch("ticket/kanboard/7")
+
+        assert ok is False
+
+    @pytest.mark.asyncio
+    async def test_existing_local_branch_is_still_pushed(self):
+        """A branch that already exists LOCALLY is still pushed to the remote
+        (a prior run may have created it without a successful push)."""
+        mgr = _mgr()
+
+        async def fake_git(*args):
+            if args[0] == "show-ref":
+                return (0, "", "")          # branch already present locally
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+
+        ok = await mgr.create_branch("ticket/kanboard/7")
+
+        assert ok is True
+        calls = _calls(mgr._git)
+        # No checkout -b (it already exists) but it IS pushed.
+        assert not any(c[0] == "checkout" for c in calls)
+        assert ("push", "-u", "origin", "ticket/kanboard/7") in calls
+
+    @pytest.mark.asyncio
+    async def test_push_disabled_skips_push(self):
+        """push_on_create=False keeps the old local-only behaviour."""
+        mgr = BranchManager(
+            BranchManagerConfig(repo_path="/tmp/fake-repo", push_on_create=False)
+        )
+
+        async def fake_git(*args):
+            if args[0] == "show-ref":
+                return (1, "", "")
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+
+        ok = await mgr.create_branch("ticket/kanboard/7")
+
+        assert ok is True
+        assert not any(c[0] == "push" for c in _calls(mgr._git))

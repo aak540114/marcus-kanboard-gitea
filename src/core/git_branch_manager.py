@@ -166,27 +166,48 @@ class BranchManager:
         """
         base = from_branch or self.config.main_branch
 
-        if await self.branch_exists(branch_name) and not force:
-            logger.info("Branch %s already exists — skipping create", branch_name)
-            return True
+        already_local = await self.branch_exists(branch_name)
+        if not already_local or force:
+            # Ensure we have the latest main, then cut the branch from it.
+            await self._git("fetch", self.config.remote, base)
+            checkout = "-B" if force else "-b"
+            rc, _, stderr = await self._git(
+                "checkout", checkout, branch_name, f"{self.config.remote}/{base}"
+            )
+            if rc != 0:
+                logger.error("Failed to create branch %s: %s", branch_name, stderr)
+                return False
+            logger.info(
+                "Created branch %s from %s/%s", branch_name, self.config.remote, base
+            )
+        else:
+            logger.info("Branch %s already exists locally", branch_name)
 
-        # Ensure we have the latest main.
-        await self._git("fetch", self.config.remote, base)
-        args = ["checkout", "-b", branch_name, f"{self.config.remote}/{base}"]
-        if force:
-            args = ["checkout", "-B", branch_name, f"{self.config.remote}/{base}"]
-
-        rc, _, stderr = await self._git(*args)
-        if rc != 0:
-            logger.error("Failed to create branch %s: %s", branch_name, stderr)
-            return False
-
-        logger.info(
-            "Created branch %s from %s/%s", branch_name, self.config.remote, base
-        )
-
+        # Publish the branch to the remote so it is visible on Gitea and the
+        # agent (and human reviewers) can see and push to it.
+        #
+        # Two deliberate changes from the old behaviour, both of which caused
+        # a "Marcus never created the branch on Gitea" symptom:
+        #   1. Push even when the branch already existed LOCALLY. A prior run
+        #      could have created it locally but failed to push; the old early
+        #      `return True` then meant it was never retried, so the branch
+        #      lived only in Marcus's clone forever.
+        #   2. PROPAGATE a push failure (return False) instead of discarding
+        #      the result. A silently-dropped push left a local-only branch
+        #      while callers proceeded as if it were on the remote — the agent
+        #      then couldn't `git checkout origin/<branch>`, worked on a
+        #      local-only branch, and its own pushes had no upstream, so its
+        #      commits never reached Gitea.
         if self.config.push_on_create:
-            await self.push(branch_name)
+            pushed = await self.push(branch_name, force=force)
+            if not pushed:
+                logger.error(
+                    "Branch %s created locally but push to %s failed — the "
+                    "branch is NOT on the remote",
+                    branch_name,
+                    self.config.remote,
+                )
+                return False
 
         return True
 

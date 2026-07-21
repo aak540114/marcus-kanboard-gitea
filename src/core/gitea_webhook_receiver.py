@@ -60,10 +60,26 @@ class GiteaWebhookReceiver:
         Defaults to the ``GITEA_WEBHOOK_TOKEN`` environment variable.
     """
 
-    def __init__(self, dev_env_manager: Any, secret: Optional[str] = None) -> None:
-        """Initialise the receiver."""
+    def __init__(
+        self,
+        dev_env_manager: Any,
+        secret: Optional[str] = None,
+        on_commits: Optional[Any] = None,
+    ) -> None:
+        """Initialise the receiver.
+
+        Parameters
+        ----------
+        on_commits : Optional[Any]
+            Optional async callable ``(branch_name: str, commit_messages:
+            list[str]) -> Any`` invoked when a ticket branch receives a push
+            with commits. Used to post a "commits pushed" progress comment on
+            the ticket. Best-effort: an exception here never fails the
+            webhook. ``None`` disables it.
+        """
         self._dev_env = dev_env_manager
         self._secret = secret or os.getenv("GITEA_WEBHOOK_TOKEN")
+        self._on_commits = on_commits
 
     async def handle_request(
         self, body: bytes, *, signature: Optional[str] = None
@@ -113,6 +129,23 @@ class GiteaWebhookReceiver:
                 branch_name,
             )
             return True
+
+        # Announce pushed commits on the ticket (best-effort). This is what
+        # makes real code progress visible on the board even when the agent
+        # doesn't self-report — and confirms the code actually reached Gitea.
+        if self._on_commits is not None:
+            commit_messages = [
+                str(c.get("message", ""))
+                for c in payload.get("commits", [])
+                if isinstance(c, dict)
+            ]
+            try:
+                await self._on_commits(branch_name, commit_messages)
+            except Exception:
+                logger.exception(
+                    "Error posting pushed-commits comment for branch=%s",
+                    branch_name,
+                )
 
         # Match by the FULL branch name, not a re-parsed ticket id: the
         # branch's id segment was sanitized+lowercased at branch-creation

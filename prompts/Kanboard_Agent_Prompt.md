@@ -180,9 +180,18 @@ repeat:
   implement a piece of the work
   git add <files>
   git commit -m "meaningful commit message"
+  git push origin <branch_name>          # push EVERY commit — see note below
   call post_ticket_progress with percentage and a summary
 until all acceptance criteria are met
 ```
+
+> **Push every commit, not just at the end.** The branch already exists on the
+> remote (Marcus created and pushed it before handing you the ticket), so
+> `git push origin <branch_name>` just publishes your new commits. Pushing
+> frequently is what lets a human review your work-in-progress on the branch at
+> any time, keeps the live preview up to date, and makes Marcus post a
+> "commits pushed" comment on the ticket. Commits that stay on your local clone
+> are invisible to everyone else.
 
 Call `post_ticket_progress` at roughly 25 %, 50 %, 75 %, and 100 %:
 

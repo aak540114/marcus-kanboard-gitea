@@ -4165,7 +4165,26 @@ if __name__ == "__main__":
 
             receiver = getattr(server, "_gitea_webhook_receiver", None)
             if receiver is None:
-                receiver = GiteaWebhookReceiver(dev_env_manager=dev_mgr)
+                # Post a "commits pushed" progress comment on the ticket
+                # whenever an agent pushes to its branch — real, code-driven
+                # progress on the board independent of agent self-reporting.
+                async def _announce_commits(
+                    branch_name: str, commit_messages: List[str]
+                ) -> None:
+                    from src.marcus_mcp.tools.human_gated import (
+                        _workflow as _hg_workflow,
+                    )
+
+                    wf = _hg_workflow()
+                    handler = (
+                        getattr(wf, "handle_branch_push", None) if wf else None
+                    )
+                    if handler is not None:
+                        await handler(branch_name, commit_messages)
+
+                receiver = GiteaWebhookReceiver(
+                    dev_env_manager=dev_mgr, on_commits=_announce_commits
+                )
                 server._gitea_webhook_receiver = receiver  # type: ignore[attr-defined]
 
             signature = request.headers.get("X-Gitea-Signature")
