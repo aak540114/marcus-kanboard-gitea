@@ -2837,3 +2837,147 @@ class TestDecomposition:
         workflow._llm_generate = AsyncMock()
         rec = lifecycle.get("102", "kanboard")
         assert workflow._should_attempt_decompose(rec) is False
+
+
+class TestDependencyGate:
+    """A ticket doesn't start until its dependencies are Done+merged."""
+
+    def _make_links(self, depends_on_ids):
+        return {
+            "depends_on": [{"task_id": d, "title": "", "column": ""}
+                           for d in depends_on_ids],
+            "blocks": [],
+            "relates_to": [],
+        }
+
+    @pytest.mark.asyncio
+    async def test_blocks_when_dependency_not_done(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """Ready ticket with an unfinished dependency is parked BLOCKED."""
+        # Dependency #40 exists but is not DONE.
+        lifecycle.get_or_create("40", "kanboard")
+        lifecycle.transition("40", "kanboard", TicketState.READY)
+        # Dependent ticket #41, assigned + ready, depends on #40.
+        lifecycle.get_or_create("41", "kanboard")
+        lifecycle.transition("41", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("41", "kanboard", "alice")
+        mock_kanban.get_task_links = AsyncMock(
+            return_value=self._make_links(["40"])
+        )
+
+        rec = lifecycle.get("41", "kanboard")
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            side_effect=lambda p, t: f"ticket/{p}/{t}",
+        ):
+            await workflow._start_ai_work("41", rec)
+
+        blocked = lifecycle.get("41", "kanboard")
+        assert blocked.state == TicketState.BLOCKED
+        assert blocked.ai_agent_id is None  # never claimed/started
+        mock_branch.create_branch.assert_not_awaited()
+        assert "#40" in (blocked.blocked_by or "")
+
+    @pytest.mark.asyncio
+    async def test_resumes_when_last_dependency_completes(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """When the blocking ticket merges, the dependent auto-resumes."""
+        lifecycle.get_or_create("50", "kanboard")
+        lifecycle.transition("50", "kanboard", TicketState.READY)
+        # #51 blocked on #50.
+        lifecycle.get_or_create("51", "kanboard")
+        lifecycle.transition("51", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("51", "kanboard", "alice")
+        lifecycle.human_transition("51", "kanboard", TicketState.BLOCKED)
+        lifecycle.set_blocked_by("51", "kanboard", "#50")
+        # Now #50 is done; links for #51 report #50 as its (now satisfied) dep.
+        lifecycle.transition("50", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("50", "kanboard", TicketState.DONE)
+        mock_kanban.get_task_links = AsyncMock(
+            return_value=self._make_links(["50"])
+        )
+
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            side_effect=lambda p, t: f"ticket/{p}/{t}",
+        ):
+            await workflow._resume_tickets_blocked_by("50")
+
+        resumed = lifecycle.get("51", "kanboard")
+        assert resumed.state == TicketState.IN_PROGRESS
+
+    @pytest.mark.asyncio
+    async def test_subticket_not_blocked_on_its_parent(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """A child's 'is a child of' link must NOT block it on the parent."""
+        lifecycle.get_or_create("100", "kanboard")  # parent (not done)
+        # Child #101 depends_on #100 (Kanboard classifies is-a-child-of so).
+        lifecycle.get_or_create(
+            "101", "kanboard",
+            acceptance_criteria="- [ ] x\n<!-- Sub-ticket of #100 -->",
+        )
+        lifecycle.transition("101", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("101", "kanboard", "alice")
+        mock_kanban.get_task_links = AsyncMock(
+            return_value=self._make_links(["100"])
+        )
+
+        rec = lifecycle.get("101", "kanboard")
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            side_effect=lambda p, t: f"ticket/{p}/{t}",
+        ):
+            await workflow._start_ai_work("101", rec)
+
+        # Not blocked — the parent link is excluded → it started.
+        assert lifecycle.get("101", "kanboard").state == TicketState.IN_PROGRESS
+
+
+class TestParentAutoComplete:
+    """A parent completes automatically once all its sub-tickets are Done."""
+
+    def _child(self, lifecycle, tid, parent):
+        lifecycle.get_or_create(
+            tid, "kanboard",
+            acceptance_criteria=f"- [ ] x\n<!-- Sub-ticket of #{parent} -->",
+        )
+
+    @pytest.mark.asyncio
+    async def test_parent_completes_when_all_children_done(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        lifecycle.get_or_create("200", "kanboard")  # parent
+        lifecycle.human_transition("200", "kanboard", TicketState.BLOCKED)
+        self._child(lifecycle, "201", "200")
+        self._child(lifecycle, "202", "200")
+        # Both children done.
+        for c in ("201", "202"):
+            lifecycle.transition(c, "kanboard", TicketState.READY)
+            lifecycle.transition(c, "kanboard", TicketState.IN_PROGRESS)
+            lifecycle.transition(c, "kanboard", TicketState.DONE)
+
+        await workflow._maybe_complete_parent("202")
+
+        assert lifecycle.get("200", "kanboard").state == TicketState.DONE
+
+    @pytest.mark.asyncio
+    async def test_parent_not_completed_while_a_child_pending(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        lifecycle.get_or_create("210", "kanboard")
+        lifecycle.human_transition("210", "kanboard", TicketState.BLOCKED)
+        self._child(lifecycle, "211", "210")
+        self._child(lifecycle, "212", "210")
+        lifecycle.transition("211", "kanboard", TicketState.READY)
+        lifecycle.transition("211", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("211", "kanboard", TicketState.DONE)
+        # #212 still in progress.
+        lifecycle.transition("212", "kanboard", TicketState.READY)
+        lifecycle.transition("212", "kanboard", TicketState.IN_PROGRESS)
+
+        await workflow._maybe_complete_parent("211")
+
+        assert lifecycle.get("210", "kanboard").state == TicketState.BLOCKED

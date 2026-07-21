@@ -531,6 +531,7 @@ class HumanGatedWorkflow:
                 ticket_id,
             )
             await self._resume_tickets_blocked_by(ticket_id)
+            await self._maybe_complete_parent(ticket_id)
             await self._pickup_next_ticket()
             return
 
@@ -628,6 +629,8 @@ class HumanGatedWorkflow:
 
             # This completion may unblock other tickets.
             await self._resume_tickets_blocked_by(ticket_id)
+            # If this was a sub-ticket, its parent may now be fully complete.
+            await self._maybe_complete_parent(ticket_id)
 
             # Agent is now free — pick up the next ticket in dependency order.
             await self._pickup_next_ticket()
@@ -1688,6 +1691,156 @@ class HumanGatedWorkflow:
                 continue
             await self._start_ai_work(blocked_id, record)
 
+    # ------------------------------------------------------------------
+    # Dependency gating + parent (sub-ticket) auto-completion
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parent_of(record: TicketRecord) -> Optional[str]:
+        """Return the parent ticket id for a sub-ticket, or ``None``.
+
+        Reads the ``<!-- Sub-ticket of #<parent> -->`` marker that
+        :meth:`decompose_ticket` embeds in a child's acceptance criteria.
+        """
+        import re
+
+        m = re.search(
+            r"<!-- Sub-ticket of #(\d+) -->", record.acceptance_criteria or ""
+        )
+        return m.group(1) if m else None
+
+    def _children_of(self, parent_id: str) -> List[TicketRecord]:
+        """Return the sub-ticket records created for *parent_id*."""
+        marker = f"<!-- Sub-ticket of #{parent_id} -->"
+        return [
+            r
+            for r in self._lifecycle.all_records()
+            if r.provider == self._provider
+            and marker in (r.acceptance_criteria or "")
+        ]
+
+    async def _dependencies_satisfied(
+        self, ticket_id: str
+    ) -> Tuple[bool, List[str]]:
+        """Return (all deps done?, [unmet dep ids]) for a ticket.
+
+        A dependency is any ticket this one ``depends_on`` (Kanboard "is
+        blocked by" / "depends on" links). A dependency is satisfied only
+        when its lifecycle record is ``DONE``. The ticket's OWN parent is
+        excluded — Kanboard lumps "is a child of" into depends_on, and a
+        sub-ticket must never wait on its parent (the parent completes when
+        its children do → deadlock). Fail-open on any Kanboard error so a
+        transient outage can't wedge every start.
+        """
+        get_links = getattr(self._kanban, "get_task_links", None)
+        if get_links is None:
+            return True, []
+        try:
+            links = await get_links(ticket_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Dependency check: links fetch failed: %s", exc)
+            return True, []
+
+        record = self._lifecycle.get(ticket_id, self._provider)
+        parent_id = self._parent_of(record) if record else None
+
+        unmet: List[str] = []
+        for dep in links.get("depends_on", []):
+            dep_id = str(dep.get("task_id", "")).strip()
+            if not dep_id or dep_id == parent_id:
+                continue
+            dep_rec = self._lifecycle.get(dep_id, self._provider)
+            if dep_rec is None or dep_rec.state != TicketState.DONE:
+                unmet.append(dep_id)
+        return (len(unmet) == 0), unmet
+
+    async def _block_on_dependencies(
+        self, ticket_id: str, unmet: List[str]
+    ) -> None:
+        """Park a ticket in BLOCKED until its dependencies are done+merged.
+
+        Records the blockers so :meth:`_resume_tickets_blocked_by` moves the
+        ticket back to In Progress the moment the LAST dependency completes.
+        """
+        blockers = ", ".join("#" + d for d in unmet)
+        try:
+            self._lifecycle.release_ticket(ticket_id, self._provider)
+        except KeyError:
+            pass
+        try:
+            self._lifecycle.human_transition(
+                ticket_id,
+                self._provider,
+                TicketState.BLOCKED,
+                reason=f"Waiting on dependencies: {blockers}",
+            )
+        except (InvalidTransitionError, KeyError):
+            pass
+        try:
+            self._lifecycle.set_blocked_by(ticket_id, self._provider, blockers)
+        except KeyError:
+            pass
+        try:
+            await self._kanban.move_task_to_column(ticket_id, "blocked")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not move %s to blocked: %s", ticket_id, exc)
+        await self._post_comment(
+            ticket_id,
+            f"⛔ **Waiting on {blockers}** to be done and merged before this "
+            "ticket can start. It will resume automatically once they're done.",
+        )
+        logger.info("Ticket %s blocked on dependencies: %s", ticket_id, blockers)
+
+    async def _maybe_complete_parent(self, child_id: str) -> None:
+        """Complete a parent ticket once ALL its sub-tickets are DONE.
+
+        The parent is a tracking shell (no branch of its own to merge), so
+        it is marked DONE directly. Its completion may in turn unblock other
+        tickets that depended on it.
+        """
+        child = self._lifecycle.get(child_id, self._provider)
+        if child is None:
+            return
+        parent_id = self._parent_of(child)
+        if parent_id is None:
+            return
+        parent = self._lifecycle.get(parent_id, self._provider)
+        if parent is None or parent.state == TicketState.DONE:
+            return
+        children = self._children_of(parent_id)
+        if not children or not all(
+            c.state == TicketState.DONE for c in children
+        ):
+            return
+
+        try:
+            self._lifecycle.release_ticket(parent_id, self._provider)
+        except KeyError:
+            pass
+        try:
+            self._lifecycle.human_transition(
+                parent_id,
+                self._provider,
+                TicketState.DONE,
+                reason="All sub-tickets complete",
+            )
+        except (InvalidTransitionError, KeyError):
+            pass
+        try:
+            self._lifecycle.set_merged(parent_id, self._provider)
+        except KeyError:
+            pass
+        try:
+            await self._kanban.move_task_to_column(parent_id, "done")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not move parent %s to done: %s", parent_id, exc)
+        await self._post_comment(
+            parent_id,
+            "✅ **All sub-tickets are complete** — this parent ticket is done.",
+        )
+        logger.info("Parent %s auto-completed (all children done)", parent_id)
+        await self._resume_tickets_blocked_by(parent_id)
+
     async def _resolve_project_repo_mapping(
         self, kanboard_project_id: Optional[int]
     ) -> Optional[Dict[str, Any]]:
@@ -2269,6 +2422,22 @@ class HumanGatedWorkflow:
                 ticket_id,
             )
             return
+
+        # Preemptive dependency gate: never START a ticket whose "is blocked
+        # by"/"depends on" tickets aren't Done+merged yet. Park it BLOCKED
+        # (recording the blockers); _resume_tickets_blocked_by moves it back
+        # to In Progress the moment the LAST dependency completes. Only gate
+        # fresh starts and dependency-resumes (TODO/READY/BLOCKED) — not the
+        # WAITING_FOR_HUMAN/REOPENED feedback resumes, which already passed.
+        if record.state in (
+            TicketState.TODO,
+            TicketState.READY,
+            TicketState.BLOCKED,
+        ):
+            deps_ok, unmet = await self._dependencies_satisfied(ticket_id)
+            if not deps_ok:
+                await self._block_on_dependencies(ticket_id, unmet)
+                return
 
         if claim_as is not None:
             # Orchestrate mode: the worker holds the claim under its own id.
@@ -2971,6 +3140,8 @@ class HumanGatedWorkflow:
 
         # This completion may unblock other tickets.
         await self._resume_tickets_blocked_by(ticket_id)
+        # If this was a sub-ticket, its parent may now be fully complete.
+        await self._maybe_complete_parent(ticket_id)
 
         await self._pickup_next_ticket()
         return True
