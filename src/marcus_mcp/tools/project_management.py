@@ -25,8 +25,7 @@ async def list_projects(server: Any, arguments: Dict[str, Any]) -> List[Dict[str
     arguments : Dict[str, Any]
         Optional filters:
         - filter_tags: List of tags to filter by
-        - provider: Provider to filter by (planka, linear, github)
-        - force_sync: Force sync from Planka (default: True)
+        - provider: Provider to filter by (e.g. kanboard)
 
     Returns
     -------
@@ -35,21 +34,6 @@ async def list_projects(server: Any, arguments: Dict[str, Any]) -> List[Dict[str
     """
     filter_tags = arguments.get("filter_tags")
     provider = arguments.get("provider")
-    force_sync = arguments.get("force_sync", True)
-
-    # Sync from Planka if that's the configured provider
-    if force_sync and server.provider == "planka":
-        try:
-            sync_result = await discover_planka_projects(server, {"auto_sync": True})
-            if not sync_result.get("success"):
-                logger.warning(f"Planka sync failed: {sync_result.get('error')}")
-        except Exception as e:
-            # Log but don't fail if sync fails
-            logger.error(f"Failed to sync from Planka: {e}")
-            server.log_event(
-                "list_projects_auto_sync_failed",
-                {"error": str(e), "error_type": type(e).__name__},
-            )
 
     # Get projects from registry
     projects = await server.project_registry.list_projects(
@@ -563,8 +547,7 @@ async def select_project(server: Any, arguments: Dict[str, Any]) -> Dict[str, An
                     f"and board_name='{board_name}'"
                 ),
                 "hint": (
-                    "Use list_projects to see available projects and boards, "
-                    "or run discover_planka_projects to sync from Planka"
+                    "Use list_projects to see available projects and boards."
                 ),
             }
         elif len(matching_projects) > 1:
@@ -681,153 +664,6 @@ async def select_project(server: Any, arguments: Dict[str, Any]) -> Dict[str, An
         }
 
 
-async def discover_planka_projects(
-    server: Any, arguments: Dict[str, Any]
-) -> Dict[str, Any]:
-    """
-    Discover all projects from Planka automatically.
-
-    This tool fetches all projects from your Planka instance and returns
-    them in a format ready to sync into Marcus's registry. Optionally,
-    you can auto-sync them immediately.
-
-    Parameters
-    ----------
-    server : Any
-        MarcusServer instance
-    arguments : Dict[str, Any]
-        - auto_sync: bool (optional) - If True, automatically syncs discovered projects
-
-    Returns
-    -------
-    Dict[str, Any]
-        Discovered projects and sync status
-
-    Examples
-    --------
-    >>> # Just discover (no sync)
-    >>> result = await discover_planka_projects(server, {})
-    >>> print(f"Found {len(result['projects'])} Planka projects")
-
-    >>> # Discover and auto-sync
-    >>> result = await discover_planka_projects(server, {"auto_sync": True})
-    """
-    from src.integrations.providers.planka import Planka
-
-    auto_sync = arguments.get("auto_sync", False)
-
-    # Get Planka config from MarcusConfig.kanban
-    kanban_config = server.config.kanban
-    if not kanban_config.planka_base_url:
-        return {
-            "success": False,
-            "error": "Planka not configured. Check config_marcus.json",
-        }
-
-    # Create Planka client config dict from MarcusConfig
-    planka_config = {
-        "base_url": kanban_config.planka_base_url,
-        "email": kanban_config.planka_email,
-        "password": kanban_config.planka_password,
-    }
-    # Create temporary Planka client to fetch projects
-    planka = Planka(planka_config)
-
-    try:
-        await planka.connect()
-
-        # Get all projects from Planka
-        planka_projects = await planka.client.get_projects()
-
-        # Convert to sync format
-        projects_to_sync = []
-        for proj in planka_projects:
-            project_id = proj.get("id")
-            project_name = proj.get("name", "Unnamed Project")
-
-            # Skip projects without IDs
-            if not project_id:
-                logger.warning(f"Skipping project without ID: {project_name}")
-                continue
-
-            # Fetch boards for this project
-            try:
-                boards = await planka.client.get_boards_for_project(project_id)
-                logger.info(f"Project '{project_name}' has {len(boards)} board(s)")
-
-                for board in boards:
-                    board_id = board.get("id")
-                    board_name = board.get("name", "Unnamed Board")
-
-                    # Include board name in project name for clarity
-                    full_name = f"{project_name} - {board_name}"
-
-                    projects_to_sync.append(
-                        {
-                            "name": full_name,
-                            "provider": "planka",
-                            "config": {
-                                "project_id": project_id,
-                                "project_name": project_name,
-                                "board_id": board_id,
-                                "board_name": board_name,
-                            },
-                            "tags": ["discovered", "planka"],
-                        }
-                    )
-            except Exception as e:
-                logger.warning(
-                    f"Failed to get boards for project '{project_name}': {e}"
-                )
-                continue
-
-        # Clean up stale boards - remove registry entries for boards
-        # that no longer exist in Planka
-        valid_board_ids = {
-            proj["config"]["board_id"]  # type: ignore[index]
-            for proj in projects_to_sync
-        }
-        cleanup_result = await _remove_stale_boards(server, valid_board_ids)
-
-        result = {
-            "success": True,
-            "discovered_count": len(projects_to_sync),
-            "projects": projects_to_sync,
-            "stale_removed": cleanup_result,
-        }
-
-        # Auto-sync if requested
-        if auto_sync and projects_to_sync:
-            sync_result = await sync_projects(server, {"projects": projects_to_sync})
-            result["sync_result"] = sync_result
-
-        # Log the discovery and cleanup operation
-        stale_count = cleanup_result.get("removed_count", 0)
-        thought = f"Discovered {len(projects_to_sync)} projects from Planka"
-        if stale_count > 0:
-            thought += f", removed {stale_count} stale boards"
-
-        conversation_logger.log_pm_thinking(
-            thought=thought,
-            context={
-                "auto_sync": auto_sync,
-                "project_count": len(projects_to_sync),
-                "stale_removed": stale_count,
-            },
-        )
-
-        return result
-
-    except Exception as e:
-        import traceback
-
-        logger.error(f"Failed to discover Planka projects: {e}")
-        logger.error(f"Full traceback:\n{traceback.format_exc()}")
-        return {"success": False, "error": str(e)}
-    finally:
-        await planka.disconnect()
-
-
 def _get_provider_key(provider: str, config: Dict[str, Any]) -> str:
     """
     Generate a unique key for a project based on provider and config.
@@ -888,49 +724,6 @@ async def _deduplicate_registry(server: Any) -> Dict[str, Any]:
                 logger.info(
                     f"Removed duplicate project '{dup.name}' (kept '{keep.name}')"
                 )
-
-    return {"removed_count": len(removed), "removed": removed}
-
-
-async def _remove_stale_boards(
-    server: Any, valid_board_ids: set[str]
-) -> Dict[str, Any]:
-    """
-    Remove registry entries for Planka boards that no longer exist.
-
-    Parameters
-    ----------
-    server : Any
-        MarcusServer instance
-    valid_board_ids : set[str]
-        Set of board IDs that currently exist in Planka
-
-    Returns
-    -------
-    Dict[str, Any]
-        Summary with count of stale boards removed
-    """
-    # Get all Planka projects from registry
-    all_projects = await server.project_registry.list_projects(provider="planka")
-
-    removed = []
-    for project in all_projects:
-        board_id = project.provider_config.get("board_id")
-        if board_id and board_id not in valid_board_ids:
-            # This board doesn't exist in Planka anymore - remove it
-            await server.project_registry.delete_project(project.id)
-            removed.append(
-                {
-                    "id": project.id,
-                    "name": project.name,
-                    "board_id": board_id,
-                    "reason": "Board not found in Planka",
-                }
-            )
-            logger.info(
-                f"Removed stale board '{project.name}' (board_id: {board_id}) "
-                "- no longer exists in Planka"
-            )
 
     return {"removed_count": len(removed), "removed": removed}
 
