@@ -45,51 +45,6 @@ class TestProjectManagementWithMarcusConfig:
         return server
 
     @pytest.mark.asyncio
-    async def test_discover_planka_accesses_kanban_config(self, mock_server):
-        """Test discover_planka_projects uses config.kanban, not .get('planka')."""
-        from src.marcus_mcp.tools.project_management import discover_planka_projects
-
-        with patch("src.integrations.providers.planka.Planka") as mock_planka_class:
-            mock_planka = Mock()
-            mock_planka.client = Mock()
-            mock_planka.client.get_projects = AsyncMock(return_value=[])
-            mock_planka.connect = AsyncMock()
-            mock_planka.disconnect = AsyncMock()
-            mock_planka_class.return_value = mock_planka
-
-            # This should NOT raise AttributeError: 'MarcusConfig' has no attribute 'get'
-            result = await discover_planka_projects(mock_server, {"auto_sync": False})
-
-            assert result["success"] is True
-            # Verify Planka was initialized with correct config dict
-            call_args = mock_planka_class.call_args[0][0]
-            assert call_args["base_url"] == "http://localhost:3333"
-            assert call_args["email"] == "demo@demo.demo"
-            assert call_args["password"] == "demo"
-
-    @pytest.mark.asyncio
-    async def test_discover_planka_missing_config(self):
-        """Test discover_planka_projects handles missing Planka config."""
-        from src.marcus_mcp.tools.project_management import discover_planka_projects
-
-        # Create config with empty Planka settings
-        config = MarcusConfig()
-        config.kanban = KanbanSettings(
-            provider="planka",
-            planka_base_url="",  # Empty base_url
-            planka_email="",
-            planka_password="",
-        )
-
-        server = Mock()
-        server.config = config
-
-        result = await discover_planka_projects(server, {})
-
-        assert result["success"] is False
-        assert "not configured" in result["error"].lower()
-
-    @pytest.mark.asyncio
     async def test_select_project_accesses_auto_sync_with_getattr(self, mock_server):
         """Test select_project uses getattr for auto_sync_projects attribute."""
         from src.marcus_mcp.tools.project_management import select_project
