@@ -3235,15 +3235,28 @@ class TestAgentPresenceAndUsage:
         assert res["status"] == "no_work"
         assert "worker-A" in workflow.get_connected_agent_ids()
 
-    def test_active_agents_are_workers_of_live_tickets(self, workflow, lifecycle):
+    def test_active_agents_are_connected_workers_of_live_tickets(
+        self, workflow, lifecycle
+    ):
         rec = lifecycle.get_or_create("5", "kanboard")
         rec.ai_agent_id = "worker-A"          # claimed
+        workflow._mark_agent_seen("worker-A")  # connected (polling)
         workflow._mark_progress_activity("5")  # live progress heartbeat → working
         assert workflow.get_active_agent_ids() == ["worker-A"]
+
+    def test_working_but_not_connected_is_not_active(self, workflow, lifecycle):
+        """A claimer working a live ticket but NOT polling marcus_work (e.g. an
+        internal marcus-<slot> reservation) is not counted as an active agent —
+        active must be a connected agent."""
+        rec = lifecycle.get_or_create("7", "kanboard")
+        rec.ai_agent_id = "marcus-slot0"      # internal claim, never polls
+        workflow._mark_progress_activity("7")  # ticket has a live heartbeat
+        assert workflow.get_active_agent_ids() == []
 
     def test_claimed_but_idle_ticket_is_not_active(self, workflow, lifecycle):
         rec = lifecycle.get_or_create("6", "kanboard")
         rec.ai_agent_id = "worker-B"          # claimed but NO progress heartbeat
+        workflow._mark_agent_seen("worker-B")  # connected, but not working
         assert workflow.get_active_agent_ids() == []
 
     def test_usage_shared_across_one_account(self, workflow):

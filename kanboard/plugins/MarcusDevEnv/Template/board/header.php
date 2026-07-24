@@ -388,7 +388,7 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
                 var connected = data.connected_agent_count || 0;
                 var active    = data.active_agent_count || 0;
                 var agents    = data.agents || [];
-                badge.className = active > 0 ? 'active' : (connected > 0 ? 'idle' : 'idle');
+                badge.className = active > 0 ? 'active' : 'idle';
                 label.textContent = '🔌 ' + connected + ' connected · 🤖 '
                     + active + ' working';
                 if (connected === 0 && active === 0) {

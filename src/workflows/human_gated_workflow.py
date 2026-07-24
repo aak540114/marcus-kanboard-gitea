@@ -1615,18 +1615,23 @@ class HumanGatedWorkflow:
     def get_active_agent_ids(self) -> List[str]:
         """Return agent ids that are ACTIVELY working a ticket right now.
 
-        Active = holds a claimed ticket whose progress heartbeat is live (see
-        :meth:`get_working_ticket_ids`). Derived by mapping each currently-worked
-        ticket to the agent that claimed it, so it reflects real work, not a
-        mere claim or a mere connection.
+        Active = a CONNECTED agent (recently polling ``marcus_work``) that holds
+        a claimed ticket whose progress heartbeat is live (see
+        :meth:`get_working_ticket_ids`) — the strict "connected AND claimed AND
+        working" definition. Requiring connectedness makes active a subset of
+        connected and naturally excludes internal ``marcus-<slot>`` claims
+        (human-gated auto-start reservations), which never poll and so are not
+        connected agents.
         """
         working = set(self.get_working_ticket_ids())
+        connected = set(self.get_connected_agent_ids())
         active = {
             str(r.ai_agent_id)
             for r in self._lifecycle.all_records()
             if r.provider == self._provider
             and r.ticket_id in working
             and r.ai_agent_id
+            and str(r.ai_agent_id) in connected
         }
         return list(active)
 
