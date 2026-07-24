@@ -289,6 +289,15 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
         return h;
     }
 
+    // HTML-escape any value before putting it into innerHTML. Used for
+    // agent-controlled fields (agent id, reported usage) so a crafted value
+    // can't inject markup/script into the board.
+    function mEsc(s) {
+        return String(s).replace(/[&<>"]/g, function (c) {
+            return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+        });
+    }
+
     /* ── Live board refresh (push, no polling) ───────────────────────── */
     // Hold ONE Server-Sent Events connection to Marcus. Marcus pushes a
     // "refresh" the instant it changes anything (comment, card move, state),
@@ -385,16 +394,19 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
                 if (connected === 0 && active === 0) {
                     tooltip.innerHTML = 'No AI agents connected right now.';
                 } else {
+                    // agent_id / ticket_id / usage are agent-controlled and go
+                    // into innerHTML — escape every interpolation to prevent XSS.
                     var rows = agents.map(function (a) {
                         var u = a.usage;
                         var usageStr = '';
                         if (u && (u.used != null || u.limit != null)) {
-                            var lim = (u.limit == null) ? '∞' : u.limit;
-                            usageStr = '&nbsp;&mdash;&nbsp;usage ' + (u.used == null ? '?' : u.used)
-                                + ' / ' + lim + (u.unit ? ' ' + u.unit : '');
+                            var lim = (u.limit == null) ? '&#8734;' : mEsc(u.limit);
+                            usageStr = '&nbsp;&mdash;&nbsp;usage '
+                                + (u.used == null ? '?' : mEsc(u.used))
+                                + ' / ' + lim + (u.unit ? ' ' + mEsc(u.unit) : '');
                         }
-                        return '&#x25B6; Ticket&nbsp;<strong>#' + a.ticket_id
-                            + '</strong>&nbsp;&mdash;&nbsp;' + a.agent_id + usageStr;
+                        return '&#x25B6; Ticket&nbsp;<strong>#' + mEsc(a.ticket_id)
+                            + '</strong>&nbsp;&mdash;&nbsp;' + mEsc(a.agent_id) + usageStr;
                     });
                     tooltip.innerHTML =
                         '<strong>' + connected + '</strong> connected, <strong>'

@@ -49,6 +49,7 @@ HumanGatedWorkflow
 """
 
 import logging
+import math
 import os
 import time
 import uuid
@@ -84,6 +85,34 @@ _WORKING_WINDOW_SECONDS = 40.0
 #: (shorter than the working window is fine) tolerates a couple of missed
 #: polls; a longer silence means the agent has disconnected/stopped.
 _AGENT_POLL_WINDOW = 30.0
+
+#: Hard caps applied to the agent-supplied ``usage`` payload — it is fully
+#: untrusted (any connected agent can send anything) and flows into stored
+#: state and the Kanboard UI, so it is sanitized on ingest to bound memory and
+#: keep values to safe JSON scalars.
+_MAX_TRACKED_ACCOUNTS = 100   # distinct accounts kept in memory (evict oldest)
+_ACCOUNT_ID_MAX = 128         # max length of an account id / agent id
+_USAGE_SCALAR_MAX = 64        # max length of a used/limit/unit string value
+
+
+def _safe_usage_scalar(value: Any, max_len: int = _USAGE_SCALAR_MAX) -> Any:
+    """Coerce an agent-supplied usage value to a safe JSON scalar, or ``None``.
+
+    Accepts a finite number or a length-capped string; everything else
+    (bools, NaN/Inf, dicts, lists, objects) becomes ``None``. This keeps a
+    malicious or buggy agent from planting non-serializable values, huge
+    blobs, or nested structures in Marcus's state or the ``/api/active-agents``
+    response.
+    """
+    if isinstance(value, bool):
+        return None  # bool is an int subclass — not a usage number
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, str):
+        return value[:max_len]
+    return None
 
 
 def _ticket_priority_key(record: TicketRecord) -> Tuple[int, int]:
@@ -1353,7 +1382,11 @@ class HumanGatedWorkflow:
             ``status`` is one of ``assigned``/``working``/``continue``/
             ``done``/``blocked``/``waiting``/``no_work``.
         """
-        agent_id = (agent_id or "").strip() or f"worker-{uuid.uuid4().hex[:8]}"
+        # Cap the length: agent_id is caller-supplied, used as an in-memory
+        # dict key, and rendered in the Kanboard UI.
+        agent_id = (agent_id or "").strip()[:_ACCOUNT_ID_MAX] or (
+            f"worker-{uuid.uuid4().hex[:8]}"
+        )
         # Every poll — with or without a report, with or without a ticket —
         # means this agent is connected right now. Record its self-reported
         # subscription/account usage too, if it sent any.
@@ -1598,22 +1631,43 @@ class HumanGatedWorkflow:
         return list(active)
 
     def _record_agent_usage(self, agent_id: str, usage: Any) -> None:
-        """Store an agent's self-reported subscription/account usage.
+        """Store an agent's self-reported subscription/account usage (sanitized).
 
         ``usage`` is a dict the agent passes to marcus_work, e.g.
         ``{"account": "team@x.com", "used": 12.5, "limit": 50, "unit": "M tok"}``.
         Stored per ACCOUNT so agents sharing one subscription share one figure;
-        ``limit`` None/absent means unlimited (e.g. a self-hosted model). Best
-        effort — a malformed report is ignored, never raised.
+        ``limit`` None/absent means unlimited (e.g. a self-hosted model).
+
+        The payload is UNTRUSTED (any connected agent can send anything) and is
+        sanitized here before it ever reaches state or the UI: values are coerced
+        to safe JSON scalars (:func:`_safe_usage_scalar`), the account id is
+        length-capped, and the number of distinct accounts is bounded (evicting
+        the least-recently-updated) so a rogue agent can't exhaust memory. A
+        malformed report is ignored, never raised.
         """
         if not agent_id or not isinstance(usage, dict):
             return
-        account = str(usage.get("account") or agent_id)
+        raw_account = usage.get("account")
+        account = (
+            str(raw_account)[:_ACCOUNT_ID_MAX]
+            if raw_account not in (None, "")
+            else agent_id
+        )
+        # Bound distinct accounts held in memory; evict the stalest when full.
+        if (
+            account not in self._account_usage
+            and len(self._account_usage) >= _MAX_TRACKED_ACCOUNTS
+        ):
+            oldest = min(
+                self._account_usage,
+                key=lambda k: self._account_usage[k].get("ts", 0.0),
+            )
+            self._account_usage.pop(oldest, None)
         self._agent_account[agent_id] = account
         self._account_usage[account] = {
-            "used": usage.get("used"),
-            "limit": usage.get("limit"),  # None → unlimited (∞)
-            "unit": usage.get("unit"),
+            "used": _safe_usage_scalar(usage.get("used")),
+            "limit": _safe_usage_scalar(usage.get("limit")),  # None → unlimited
+            "unit": _safe_usage_scalar(usage.get("unit")),
             "ts": time.monotonic(),
         }
 

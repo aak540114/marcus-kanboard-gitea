@@ -3293,3 +3293,65 @@ class TestAgentPresenceAndUsage:
             usage={"account": "team@x", "used": 5, "limit": 50},
         )
         assert workflow.usage_for_agent("worker-A")["used"] == 5
+
+
+class TestUsageSanitization:
+    """The agent-supplied `usage` payload is untrusted — sanitize it on ingest
+    (safe JSON scalars, capped lengths, bounded account count) so a crafted or
+    buggy agent can't crash Marcus, bloat the API, or exhaust memory."""
+
+    def test_scalar_accepts_numbers_and_strings(self):
+        from src.workflows.human_gated_workflow import _safe_usage_scalar
+        assert _safe_usage_scalar(12) == 12
+        assert _safe_usage_scalar(1.5) == 1.5
+        assert _safe_usage_scalar("45%") == "45%"
+
+    def test_scalar_rejects_unsafe_values(self):
+        from src.workflows.human_gated_workflow import _safe_usage_scalar
+        assert _safe_usage_scalar(True) is None          # bool
+        assert _safe_usage_scalar(float("inf")) is None   # not finite
+        assert _safe_usage_scalar(float("nan")) is None
+        assert _safe_usage_scalar({"x": 1}) is None        # dict
+        assert _safe_usage_scalar([1, 2]) is None          # list
+        assert _safe_usage_scalar(None) is None
+
+    def test_scalar_caps_string_length(self):
+        from src.workflows.human_gated_workflow import (
+            _safe_usage_scalar, _USAGE_SCALAR_MAX,
+        )
+        assert len(_safe_usage_scalar("x" * 5000)) == _USAGE_SCALAR_MAX
+
+    def test_record_sanitizes_stored_values(self, workflow):
+        workflow._record_agent_usage("worker-A", {
+            "account": "a",
+            "used": float("inf"),                       # → None
+            "limit": True,                              # → None
+            "unit": "<script>alert(1)</script>" * 20,   # → capped string
+        })
+        u = workflow.usage_for_agent("worker-A")
+        assert u["used"] is None
+        assert u["limit"] is None
+        assert isinstance(u["unit"], str) and len(u["unit"]) <= 64
+
+    def test_record_caps_account_id_length(self, workflow):
+        from src.workflows.human_gated_workflow import _ACCOUNT_ID_MAX
+        workflow._record_agent_usage("worker-A", {"account": "z" * 5000, "used": 1})
+        assert all(len(k) <= _ACCOUNT_ID_MAX for k in workflow._account_usage)
+
+    def test_record_bounds_number_of_accounts(self, workflow):
+        from src.workflows.human_gated_workflow import _MAX_TRACKED_ACCOUNTS
+        for i in range(_MAX_TRACKED_ACCOUNTS + 25):
+            workflow._record_agent_usage(
+                "agent-%d" % i, {"account": "acct-%d" % i, "used": i}
+            )
+        assert len(workflow._account_usage) <= _MAX_TRACKED_ACCOUNTS
+
+    def test_non_dict_usage_is_ignored(self, workflow):
+        workflow._record_agent_usage("worker-A", ["not", "a", "dict"])
+        assert workflow.usage_for_agent("worker-A") is None
+
+    @pytest.mark.asyncio
+    async def test_orchestrate_caps_agent_id_length(self, workflow):
+        from src.workflows.human_gated_workflow import _ACCOUNT_ID_MAX
+        res = await workflow.orchestrate_work(agent_id="A" * 5000)
+        assert len(res["agent_id"]) <= _ACCOUNT_ID_MAX
