@@ -61,6 +61,11 @@ $eventsStreamUrl = $marcusUrl . '/api/events/stream'
     . ($marcusToken !== '' ? '?token=' . urlencode($marcusToken) : '');
 
 $gateApiBase = $marcusUrl . '/api/gate-setting';
+
+// Active-agents feed — used to show the working agent's subscription usage
+// on this ticket. fetch() sends the bearer token via marcusHeaders(); no
+// ?token= needed here (this is a fetch, not a navigation).
+$agentsUrl = $marcusUrl . '/api/active-agents';
 ?>
 
 <!-- ── Section 1: Dev environment ─────────────────────────────────── -->
@@ -210,6 +215,15 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
     <p id="marcus-dev-env-status-msg"></p>
 </div>
 
+<!-- ── Agent usage: the working agent's subscription usage/limit ────── -->
+<!-- Hidden unless an agent is actively working THIS ticket and its
+     account reported usage. Two agents on one subscription show the same
+     account-wide figure; a self-hosted model shows the limit as ∞. -->
+<div class="sidebar-collapse" id="marcus-agent-usage-wrap" style="display:none;">
+    <h2 class="sidebar-title"><?= t('Agent Subscription Usage') ?></h2>
+    <div id="marcus-agent-usage" style="font-size:12px;color:#444;"></div>
+</div>
+
 <!-- ── Section 2: Gate mode ───────────────────────────────────────── -->
 <div class="sidebar-collapse">
     <h2 class="sidebar-title"><?= t('Marcus Gate Mode') ?></h2>
@@ -329,6 +343,7 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
     var STOP_URL     = <?= json_encode($stopUrl) ?>;
     var STATUS_URL   = <?= json_encode($statusUrl) ?>;
     var LINKS_URL    = <?= json_encode($linksUrl) ?>;
+    var AGENTS_URL   = <?= json_encode($agentsUrl) ?>;
     var EVENTS_STREAM_URL = <?= json_encode($eventsStreamUrl) ?>;
     var GATE_URL     = <?= json_encode($gateApiBase) ?>;
     var TICKET_ID    = <?= json_encode((string) $ticketId) ?>;
@@ -342,6 +357,47 @@ $gateApiBase = $marcusUrl . '/api/gate-setting';
         if (MARCUS_TOKEN) { h['Authorization'] = 'Bearer ' + MARCUS_TOKEN; }
         return h;
     }
+
+    /* ── Agent subscription usage for THIS ticket ─────────────────────── */
+    // Poll active-agents; if an agent is working this ticket and its account
+    // reported usage, show the account's usage/limit (limit null → ∞).
+    (function () {
+        var wrap = document.getElementById('marcus-agent-usage-wrap');
+        var body = document.getElementById('marcus-agent-usage');
+        if (!wrap || !body) { return; }
+        function esc(s) {
+            return String(s).replace(/[&<>"]/g, function (c) {
+                return { '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c];
+            });
+        }
+        function refresh() {
+            fetch(AGENTS_URL, { cache: 'no-store', headers: marcusHeaders() })
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    var mine = (data.agents || []).filter(function (a) {
+                        return String(a.ticket_id) === String(TICKET_ID);
+                    })[0];
+                    if (!mine || !mine.usage ||
+                        (mine.usage.used == null && mine.usage.limit == null)) {
+                        wrap.style.display = 'none';
+                        return;
+                    }
+                    var u = mine.usage;
+                    var lim = (u.limit == null) ? '∞' : esc(u.limit);
+                    var unit = u.unit ? ' ' + esc(u.unit) : '';
+                    body.innerHTML =
+                        '<div><strong>' + (u.used == null ? '?' : esc(u.used))
+                        + ' / ' + lim + unit + '</strong></div>'
+                        + '<div style="font-size:11px;color:#888;margin-top:2px;">'
+                        + 'account-wide usage reported by the working agent '
+                        + '(' + esc(mine.agent_id) + ')</div>';
+                    wrap.style.display = '';
+                })
+                .catch(function () { /* leave as-is on a transient error */ });
+        }
+        refresh();
+        setInterval(refresh, 15000);
+    }());
 
     /* ── Live task refresh (push, no polling) ────────────────────────── */
     // One Server-Sent Events connection to Marcus; it pushes a "refresh" the

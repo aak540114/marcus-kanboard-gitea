@@ -17,8 +17,11 @@ tool, `marcus_work`, and do exactly what it tells you. After connecting the
 > ticket and give you a `context` (a `clone_url`, a `branch_name`, and
 > `acceptance_criteria`). Clone the repo, implement the criteria, and **every
 > ~10 seconds call `marcus_work` again** — pass back the same `agent_id` and
-> `ticket_id` it gave you, plus a one-line `report` of what you just did. When
-> every acceptance criterion is met, call `marcus_work` with
+> `ticket_id` it gave you, plus a one-line `report` of what you just did (and,
+> if you can determine it, `usage={"account": "<your account id>", "used":
+> <n>, "limit": <n or null>, "unit": "tokens"}` so the human sees your
+> subscription usage on the ticket — use `null` limit for a self-hosted/unlimited
+> model). When every acceptance criterion is met, call `marcus_work` with
 > `report="DONE - <summary>"`. If you're stuck on something only a human can
 > resolve, call with `report="BLOCKED - <reason>"`. Repeat until `marcus_work`
 > says there's no more work.

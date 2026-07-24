@@ -4733,22 +4733,28 @@ function save() {{
             return response
 
         async def active_agents(request: Request) -> JSONResponse:
-            """Return all tickets currently claimed by an AI agent.
+            """Return agent presence + per-ticket claims for the board plugin.
 
-            Used by the MarcusDevEnv Kanboard plugin to display a live
-            "active AI agents" count on the board view.
+            Two distinct counts (both surfaced on the board):
+            - ``connected_agent_count``: agents polling ``marcus_work`` within
+              the last ~30s, whether or not they hold work (idle-but-connected
+              still counts).
+            - ``active_agent_count``: agents ACTIVELY working a claimed ticket
+              (progress heartbeat live) — a strict subset of connected.
+
+            ``agents`` lists tickets currently claimed by an agent, each with
+            the working agent's self-reported account ``usage`` (if any), so a
+            ticket can show its agent's subscription usage/limit.
 
             Response body
             -------------
             {
+                "connected_agent_count": <int>,
                 "active_agent_count": <int>,
+                "working_ticket_ids": [<str>, ...],
                 "agents": [
-                    {
-                        "agent_id": "<str>",
-                        "ticket_id": "<str>",
-                        "provider": "<str>",
-                        "state": "<str>"
-                    },
+                    { "agent_id", "ticket_id", "provider", "state",
+                      "usage": {"used", "limit", "unit"}? },
                     ...
                 ]
             }
@@ -4775,12 +4781,12 @@ function save() {{
                 if r.ai_agent_id is not None
             ]
 
-            # Liveness signal for the board's "actively worked" highlight:
-            # ticket ids an agent has reported progress on within the last
-            # ~40s (see HumanGatedWorkflow.get_working_ticket_ids). This is
-            # derived purely from agent activity, NOT ticket state, so a
-            # stuck-column bug can't turn the highlight on/off. Empty when the
-            # workflow isn't wired.
+            # Presence + usage come from the workflow's in-memory heartbeats
+            # (poll heartbeat = connected; progress heartbeat = working). These
+            # are derived from real agent activity, NOT ticket state. All default
+            # to empty/zero when the workflow isn't wired.
+            connected_count = 0
+            active_count = 0
             working_ids: List[str] = []
             try:
                 from src.marcus_mcp.tools.human_gated import (
@@ -4788,15 +4794,31 @@ function save() {{
                 )
 
                 wf = _hg_workflow()
-                getter = getattr(wf, "get_working_ticket_ids", None) if wf else None
-                if getter is not None:
-                    working_ids = list(getter())
+                if wf is not None:
+                    gw = getattr(wf, "get_working_ticket_ids", None)
+                    if gw is not None:
+                        working_ids = list(gw())
+                    gc = getattr(wf, "get_connected_agent_ids", None)
+                    if gc is not None:
+                        connected_count = len(gc())
+                    ga = getattr(wf, "get_active_agent_ids", None)
+                    if ga is not None:
+                        active_count = len(ga())
+                    usage_for_agent = getattr(wf, "usage_for_agent", None)
+                    if usage_for_agent is not None:
+                        for a in active:
+                            u = usage_for_agent(a["agent_id"])
+                            if u is not None:
+                                a["usage"] = {
+                                    k: u.get(k) for k in ("used", "limit", "unit")
+                                }
             except Exception as exc:  # noqa: BLE001
-                logger.warning("working_ticket_ids lookup failed: %s", exc)
+                logger.warning("agent presence/usage lookup failed: %s", exc)
 
             response = JSONResponse(
                 {
-                    "active_agent_count": len(active),
+                    "connected_agent_count": connected_count,
+                    "active_agent_count": active_count,
                     "agents": active,
                     "working_ticket_ids": working_ids,
                 }

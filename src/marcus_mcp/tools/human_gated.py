@@ -773,6 +773,10 @@ async def marcus_work(
             ``ticket_id`` — the ticket you're on (echo it back).
             ``report`` — one line on what you just did; prefix ``DONE`` when
             all acceptance criteria are met, or ``BLOCKED`` if stuck.
+            ``usage`` — optional dict of your account's subscription usage so
+            the human can see it on the ticket, e.g.
+            ``{"account": "team@x.com", "used": 12.5, "limit": 50, "unit": "M tokens"}``.
+            Omit ``limit`` (or set null) for a self-hosted/unlimited model.
 
     Returns
     -------
@@ -783,11 +787,13 @@ async def marcus_work(
     wf = _workflow()
     if wf is None:
         return {"success": False, "error": "HumanGatedWorkflow not initialised"}
+    usage = arguments.get("usage")
     try:
         result = await wf.orchestrate_work(
             agent_id=arguments.get("agent_id"),
             report=arguments.get("report"),
             ticket_id=arguments.get("ticket_id"),
+            usage=usage if isinstance(usage, dict) else None,
         )
         return {"success": True, "result": result}
     except Exception as exc:  # noqa: BLE001

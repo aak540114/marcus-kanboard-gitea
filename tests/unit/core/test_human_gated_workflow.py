@@ -3207,3 +3207,89 @@ class TestHandleBranchPush:
         lifecycle.transition("8", "kanboard", TicketState.IN_PROGRESS)
         lifecycle.transition("8", "kanboard", TicketState.DONE)
         assert await workflow.handle_branch_push("ticket/kanboard/8", ["x"]) is False
+
+
+class TestAgentPresenceAndUsage:
+    """Connected (polling) vs active (working) agent presence, and the
+    account-level subscription usage agents self-report via marcus_work."""
+
+    def test_connected_includes_polling_agent(self, workflow):
+        workflow._mark_agent_seen("worker-A")
+        assert "worker-A" in workflow.get_connected_agent_ids()
+
+    def test_connected_prunes_stale(self, workflow):
+        with patch(
+            "src.workflows.human_gated_workflow.time.monotonic", return_value=1000.0
+        ):
+            workflow._mark_agent_seen("worker-A")
+        with patch(
+            "src.workflows.human_gated_workflow.time.monotonic", return_value=1100.0
+        ):
+            assert workflow.get_connected_agent_ids() == []
+        assert workflow._agent_seen == {}
+
+    @pytest.mark.asyncio
+    async def test_poll_counts_as_connected_even_with_no_work(self, workflow):
+        """An agent that polls but gets no ticket is still 'connected'."""
+        res = await workflow.orchestrate_work(agent_id="worker-A")
+        assert res["status"] == "no_work"
+        assert "worker-A" in workflow.get_connected_agent_ids()
+
+    def test_active_agents_are_workers_of_live_tickets(self, workflow, lifecycle):
+        rec = lifecycle.get_or_create("5", "kanboard")
+        rec.ai_agent_id = "worker-A"          # claimed
+        workflow._mark_progress_activity("5")  # live progress heartbeat → working
+        assert workflow.get_active_agent_ids() == ["worker-A"]
+
+    def test_claimed_but_idle_ticket_is_not_active(self, workflow, lifecycle):
+        rec = lifecycle.get_or_create("6", "kanboard")
+        rec.ai_agent_id = "worker-B"          # claimed but NO progress heartbeat
+        assert workflow.get_active_agent_ids() == []
+
+    def test_usage_shared_across_one_account(self, workflow):
+        workflow._record_agent_usage(
+            "worker-A", {"account": "team@x", "used": 10, "limit": 50, "unit": "M"}
+        )
+        workflow._record_agent_usage(
+            "worker-B", {"account": "team@x", "used": 12, "limit": 50}
+        )
+        ua = workflow.usage_for_agent("worker-A")
+        ub = workflow.usage_for_agent("worker-B")
+        assert ua == ub                       # same account → same figure
+        assert ua["used"] == 12 and ua["limit"] == 50
+
+    def test_different_accounts_stay_separate(self, workflow):
+        """Agents from DIFFERENT subscription accounts keep separate figures —
+        each ticket shows only its own agent's account usage, never mixed."""
+        workflow._record_agent_usage(
+            "worker-A", {"account": "acct-1", "used": 10, "limit": 50}
+        )
+        workflow._record_agent_usage(
+            "worker-B", {"account": "acct-2", "used": 30, "limit": 100}
+        )
+        ua = workflow.usage_for_agent("worker-A")
+        ub = workflow.usage_for_agent("worker-B")
+        assert ua["used"] == 10 and ua["limit"] == 50
+        assert ub["used"] == 30 and ub["limit"] == 100
+        assert ua != ub
+
+    def test_usage_unlimited_keeps_none_limit(self, workflow):
+        workflow._record_agent_usage(
+            "worker-A", {"account": "local", "used": 0, "limit": None}
+        )
+        assert workflow.usage_for_agent("worker-A")["limit"] is None
+
+    def test_usage_none_for_unknown_agent(self, workflow):
+        assert workflow.usage_for_agent("nobody") is None
+
+    def test_malformed_usage_is_ignored(self, workflow):
+        workflow._record_agent_usage("worker-A", "not a dict")
+        assert workflow.usage_for_agent("worker-A") is None
+
+    @pytest.mark.asyncio
+    async def test_orchestrate_records_reported_usage(self, workflow):
+        await workflow.orchestrate_work(
+            agent_id="worker-A",
+            usage={"account": "team@x", "used": 5, "limit": 50},
+        )
+        assert workflow.usage_for_agent("worker-A")["used"] == 5

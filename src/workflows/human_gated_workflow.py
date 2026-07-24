@@ -79,6 +79,12 @@ logger = logging.getLogger(__name__)
 #: silence (the agent finished, crashed, or stalled) lets the highlight lapse.
 _WORKING_WINDOW_SECONDS = 40.0
 
+#: How long after an agent's last ``marcus_work`` poll it still counts as
+#: "connected". An agent polls every ~10s whether or not it has work, so this
+#: (shorter than the working window is fine) tolerates a couple of missed
+#: polls; a longer silence means the agent has disconnected/stopped.
+_AGENT_POLL_WINDOW = 30.0
+
 
 def _ticket_priority_key(record: TicketRecord) -> Tuple[int, int]:
     """Sort key for selecting the next ticket in dependency order.
@@ -185,6 +191,19 @@ class HumanGatedWorkflow:
         # In-memory only: a Marcus restart clears it and agents re-populate it
         # on their next report.
         self._progress_activity: Dict[str, float] = {}
+        # "Connected agents" heartbeat: ``{agent_id: <monotonic ts>}`` stamped on
+        # EVERY marcus_work poll (see orchestrate_work), whether or not the agent
+        # got work. Powers the board's "connected" count — an idle-but-polling
+        # agent still counts. In-memory only (a restart clears it; agents
+        # repopulate on their next poll).
+        self._agent_seen: Dict[str, float] = {}
+        # Subscription/account usage the agents self-report via marcus_work,
+        # keyed by ACCOUNT so agents sharing one subscription share one figure:
+        # ``{account_id: {"used", "limit", "unit", "ts"}}`` (limit None = ∞, e.g.
+        # a self-hosted model). Plus ``{agent_id: account_id}`` so a ticket's
+        # working agent maps to its account's usage for display.
+        self._account_usage: Dict[str, Dict[str, Any]] = {}
+        self._agent_account: Dict[str, str] = {}
         # How many tickets may be in progress at once (parallel-agent cap).
         self._max_parallel_agents = max(1, int(max_parallel_agents))
         # Unique identifier for this Marcus workflow instance. This is slot
@@ -935,7 +954,11 @@ class HumanGatedWorkflow:
             "review.\n"
             "3. Every ~10 seconds, call `marcus_work` again with the SAME "
             "`agent_id` and `ticket_id` and a `report` of the one thing you "
-            "just did (a short sentence).\n"
+            "just did (a short sentence). If you can determine your account's "
+            "subscription usage, also pass `usage={\"account\": \"<your account "
+            "id/email>\", \"used\": <number>, \"limit\": <number or null>, "
+            "\"unit\": \"<e.g. tokens>\"}` (null/omit `limit` for a self-hosted "
+            "or unlimited model) so the human sees it on the ticket.\n"
             "4. When EVERY acceptance criterion is met, FIRST push your final "
             "commit, THEN call `marcus_work` with `report=\"DONE - <one-line "
             "summary>\"` (start the report with the word DONE). If you hit "
@@ -1299,6 +1322,7 @@ class HumanGatedWorkflow:
         agent_id: Optional[str] = None,
         report: Optional[str] = None,
         ticket_id: Optional[str] = None,
+        usage: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Single entry point a worker loops on — Marcus orchestrates it.
 
@@ -1316,6 +1340,11 @@ class HumanGatedWorkflow:
             The worker's natural-language update of what it just did.
         ticket_id : Optional[str]
             The ticket the worker is on (echoed from a prior response).
+        usage : Optional[Dict[str, Any]]
+            The worker's self-reported subscription/account usage, e.g.
+            ``{"account": "team@x.com", "used": 12.5, "limit": 50, "unit": "M"}``.
+            Stored per account and surfaced on the tickets that account's agents
+            are working (``limit`` None/absent → unlimited, e.g. self-hosted).
 
         Returns
         -------
@@ -1325,6 +1354,12 @@ class HumanGatedWorkflow:
             ``done``/``blocked``/``waiting``/``no_work``.
         """
         agent_id = (agent_id or "").strip() or f"worker-{uuid.uuid4().hex[:8]}"
+        # Every poll — with or without a report, with or without a ticket —
+        # means this agent is connected right now. Record its self-reported
+        # subscription/account usage too, if it sent any.
+        self._mark_agent_seen(agent_id)
+        if usage is not None:
+            self._record_agent_usage(agent_id, usage)
         active = (ticket_id or "").strip() or self._lifecycle.get_agent_ticket(
             agent_id
         )
@@ -1515,6 +1550,82 @@ class HumanGatedWorkflow:
             else:
                 self._progress_activity.pop(key, None)
         return working
+
+    # ------------------------------------------------------------------
+    # Agent presence (connected vs active) + reported account usage
+    # ------------------------------------------------------------------
+
+    def _mark_agent_seen(self, agent_id: str) -> None:
+        """Stamp *now* as this agent's last poll — it is connected right now."""
+        if agent_id:
+            self._agent_seen[agent_id] = time.monotonic()
+
+    def get_connected_agent_ids(
+        self, window_seconds: float = _AGENT_POLL_WINDOW
+    ) -> List[str]:
+        """Return agent ids that have polled ``marcus_work`` within the window.
+
+        This is the "connected" set: every agent asking Marcus for work counts,
+        whether or not it currently holds a ticket — an idle-but-polling agent
+        is still connected. Stale entries are pruned.
+        """
+        now = time.monotonic()
+        connected: List[str] = []
+        for agent_id, ts in list(self._agent_seen.items()):
+            if now - ts <= window_seconds:
+                connected.append(agent_id)
+            else:
+                self._agent_seen.pop(agent_id, None)
+                self._agent_account.pop(agent_id, None)
+        return connected
+
+    def get_active_agent_ids(self) -> List[str]:
+        """Return agent ids that are ACTIVELY working a ticket right now.
+
+        Active = holds a claimed ticket whose progress heartbeat is live (see
+        :meth:`get_working_ticket_ids`). Derived by mapping each currently-worked
+        ticket to the agent that claimed it, so it reflects real work, not a
+        mere claim or a mere connection.
+        """
+        working = set(self.get_working_ticket_ids())
+        active = {
+            str(r.ai_agent_id)
+            for r in self._lifecycle.all_records()
+            if r.provider == self._provider
+            and r.ticket_id in working
+            and r.ai_agent_id
+        }
+        return list(active)
+
+    def _record_agent_usage(self, agent_id: str, usage: Any) -> None:
+        """Store an agent's self-reported subscription/account usage.
+
+        ``usage`` is a dict the agent passes to marcus_work, e.g.
+        ``{"account": "team@x.com", "used": 12.5, "limit": 50, "unit": "M tok"}``.
+        Stored per ACCOUNT so agents sharing one subscription share one figure;
+        ``limit`` None/absent means unlimited (e.g. a self-hosted model). Best
+        effort — a malformed report is ignored, never raised.
+        """
+        if not agent_id or not isinstance(usage, dict):
+            return
+        account = str(usage.get("account") or agent_id)
+        self._agent_account[agent_id] = account
+        self._account_usage[account] = {
+            "used": usage.get("used"),
+            "limit": usage.get("limit"),  # None → unlimited (∞)
+            "unit": usage.get("unit"),
+            "ts": time.monotonic(),
+        }
+
+    def usage_for_agent(self, agent_id: str) -> Optional[Dict[str, Any]]:
+        """Return the account-level usage figure for *agent_id*, or ``None``.
+
+        Two agents on the same reported ``account`` resolve to the SAME figure.
+        """
+        account = self._agent_account.get(agent_id)
+        if account is None:
+            return None
+        return self._account_usage.get(account)
 
     async def report_progress(
         self,

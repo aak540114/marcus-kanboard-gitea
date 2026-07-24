@@ -52,7 +52,7 @@ The plugin ships in `kanboard/plugins/MarcusDevEnv/` and is automatically active
 ### Board header
 | Widget | What it does |
 |---|---|
-| **Active AI Agents badge** | Live green/grey/amber badge showing how many tickets are currently held by an AI agent. Updates every 15 s; hover to see ticket IDs. |
+| **Agent presence badge** | Two live counts: **connected** (agents polling Marcus for work every ~10 s, counted even when idle) and **working** (agents actively working a claimed ticket — a strict subset). Hover to see each claimed ticket, its agent, and that agent's reported subscription usage. Updates every 15 s. |
 | **Actively-worked card highlight** | Cards an AI agent is working **right now** get a pulsing golden ring. It's driven by a *liveness* signal — the agent reported progress within the last ~40 s — **not** by ticket state/column, so a state-management bug that leaves a card stuck can't make the ring lie. It clears the moment the agent stops (finished, handed off, blocked, or went silent). Re-applied after Kanboard's own board redraws, so it never gets lost. |
 | **Project Description button** | Opens the Marcus-served project description page for this project — the AI agents' shared source of truth for language, framework, and architecture. |
 | **Repository button** | Links to this project's Gitea repository (opens in a new tab). Appears once the repo has been provisioned. |
@@ -65,6 +65,7 @@ The plugin ships in `kanboard/plugins/MarcusDevEnv/` and is automatically active
 | Panel | What it does |
 |---|---|
 | **Marcus Code** | Link to the exact Gitea branch this ticket is worked on, so you can review the code updates on the branch at any time. |
+| **Agent Subscription Usage** | When an AI agent is actively working this ticket and its account reported usage, shows that account's usage / limit (self-reported via `marcus_work`; a self-hosted/unlimited model shows the limit as **∞**). Usage is kept **per account**: two agents on one subscription show the same shared figure, while agents on different accounts stay separate — each ticket shows only its own agent's account. |
 | **Marcus Dev Environment** | Start / Open / Stop a hot-reload preview for this ticket's branch. Any language — stack comes from the project description. |
 | **Marcus Gate Mode** | Per-ticket gate override. Shows the project default; lets you switch this ticket to Human or AI gate independently. Ticket setting overrides project setting. Includes a per-ticket AI Verify override when AI Gate is active. |
 | **Marcus Dependencies** | Dependency graph: *Depends on*, *Blocks*, *Related* — each with a colour-coded column-status badge. |

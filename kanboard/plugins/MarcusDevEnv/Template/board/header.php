@@ -373,19 +373,33 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
         fetch(AGENTS_URL, { cache: 'no-store', headers: marcusHeaders() })
             .then(function (r) { return r.json(); })
             .then(function (data) {
-                var count  = data.active_agent_count || 0;
-                var agents = data.agents || [];
-                badge.className = count > 0 ? 'active' : 'idle';
-                if (count === 0) {
-                    label.textContent = '🤖 Marcus: no active agents';
-                    tooltip.innerHTML = 'No AI agents are working right now.';
+                // Two distinct signals:
+                //  connected = agents polling Marcus for work (incl. idle)
+                //  active    = agents actually working a claimed ticket
+                var connected = data.connected_agent_count || 0;
+                var active    = data.active_agent_count || 0;
+                var agents    = data.agents || [];
+                badge.className = active > 0 ? 'active' : (connected > 0 ? 'idle' : 'idle');
+                label.textContent = '🔌 ' + connected + ' connected · 🤖 '
+                    + active + ' working';
+                if (connected === 0 && active === 0) {
+                    tooltip.innerHTML = 'No AI agents connected right now.';
                 } else {
-                    label.textContent = '🤖 Marcus: ' + count
-                        + (count === 1 ? ' agent active' : ' agents active');
-                    tooltip.innerHTML = agents.map(function (a) {
+                    var rows = agents.map(function (a) {
+                        var u = a.usage;
+                        var usageStr = '';
+                        if (u && (u.used != null || u.limit != null)) {
+                            var lim = (u.limit == null) ? '∞' : u.limit;
+                            usageStr = '&nbsp;&mdash;&nbsp;usage ' + (u.used == null ? '?' : u.used)
+                                + ' / ' + lim + (u.unit ? ' ' + u.unit : '');
+                        }
                         return '&#x25B6; Ticket&nbsp;<strong>#' + a.ticket_id
-                            + '</strong>&nbsp;&mdash;&nbsp;' + a.agent_id;
-                    }).join('<br>');
+                            + '</strong>&nbsp;&mdash;&nbsp;' + a.agent_id + usageStr;
+                    });
+                    tooltip.innerHTML =
+                        '<strong>' + connected + '</strong> connected, <strong>'
+                        + active + '</strong> working<br>'
+                        + (rows.length ? rows.join('<br>') : 'No claimed tickets.');
                 }
                 // Rebuild the active set from Marcus's activity-based liveness
                 // signal (not ticket state) and repaint the golden rings.
