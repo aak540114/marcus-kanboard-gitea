@@ -360,6 +360,7 @@ If you prefer containerized development, see [DOCKER_QUICKSTART.md](DOCKER_QUICK
 - **Create a project:** See [experiments/](experiments/) for example prompts
 - **Run experiments:** Use [dev-tools/experiments/runners/spawn_agents.py](dev-tools/experiments/runners/spawn_agents.py)
 - **Explore examples:** Check [experiments/snake_game_single_agent_prompt.md](experiments/snake_game_single_agent_prompt.md)
+- **Read architecture:** See [demo/marcus_origin_story.docx](demo/marcus_origin_story.docx)
 
 ## Getting Help
 
