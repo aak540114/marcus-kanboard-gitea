@@ -2,7 +2,7 @@
 Unit tests for src.cost_tracking.cost_aggregator.
 
 Aggregator is read-only: takes a CostStore, returns dicts shaped like the
-Cato ``/api/cost/*`` response payloads documented in #409. Tests seed the
+the dashboard ``/api/cost/*`` response payloads documented in #409. Tests seed the
 store with deterministic events and assert the aggregations are correct.
 """
 
@@ -169,7 +169,7 @@ class TestExperimentSummary:
 
 
 class TestProjectSummary:
-    """Project-scoped summary used by Cato's project-first dashboard.
+    """Project-scoped summary used by the project-first dashboard.
 
     Mirrors :class:`TestExperimentSummary` but keyed on project_id.
     Marcus runs that never call start_experiment still produce token

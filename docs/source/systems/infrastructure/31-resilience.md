@@ -206,11 +206,11 @@ The resilience system works transparently across different Kanban providers:
 ### State Synchronization
 Circuit breaker state is maintained globally, ensuring consistent behavior across multiple board operations within the same Marcus instance.
 
-## Integration with Cato
+## Integration with the Dashboard
 
-While Cato (the AI coach) is not directly integrated with the resilience system, it benefits from resilience protections:
+While the dashboard is not directly integrated with the resilience system, it benefits from resilience protections:
 
-- **AI Provider Circuit Breakers**: Protect Cato's LLM calls
+- **AI Provider Circuit Breakers**: Protect the dashboard's LLM calls
 - **Fallback Coaching**: When AI unavailable, falls back to rule-based suggestions
 - **Persistent Learning**: Coaching history survives storage failures through resilient persistence
 

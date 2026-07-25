@@ -1109,7 +1109,7 @@ class TestCoverageToTelemetry:
     canonical PLANNING_INTENT_FIDELITY event payload shape.
 
     Issue #456 Stage 5 follow-up (Kaia review #6, Simon ``1efc9406``):
-    the four telemetry keys are load-bearing for Cato consumers — any
+    the four telemetry keys are load-bearing for downstream consumers — any
     drift breaks the wire.  An explicit unit test here makes the
     contract grep-able alongside the source, replacing the Stage 2
     ``TestTelemetryKeyPinning`` class that was retired with the
@@ -1151,7 +1151,7 @@ class TestCoverageToTelemetry:
         assert telemetry["coverage_before_fill"] == {"o1": ["t1"]}
         assert telemetry["coverage_after_fill"] == {"o1": ["t1", "gap"]}
         # gap_filled_outcomes is the list of UserOutcome IDs (strings),
-        # not the full UserOutcome objects — Cato consumes IDs.
+        # not the full UserOutcome objects — the dashboard consumes IDs.
         assert telemetry["gap_filled_outcomes"] == ["o2"]
 
 

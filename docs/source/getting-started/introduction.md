@@ -90,10 +90,6 @@ Every conversation logged, every decision tracked, every outcome measured. This 
 
 The coordination server. Runs at `http://localhost:4298/mcp`. Decomposes natural-language project descriptions, manages the task graph, routes artifacts and context, enforces the work loop, recovers from failures.
 
-### Cato — the visual dashboard
-
-[Cato](https://github.com/lwgray/cato) is the active Marcus dashboard. Real-time visualization of agents, tasks, and board health, with a built-in kanban view. Sibling product — install separately and point at the same data store.
-
 ### Posidonius — the experiment platform
 
 [Posidonius](https://github.com/lwgray/posidonius) is the experiment dashboard for launching and monitoring **multi-run** Marcus experiments — benchmarking, parameter sweeps, and parallel batches across any CLI agent. Web UI, run history, integration with Epictetus for grading agent output.
@@ -120,7 +116,7 @@ A Claude Code skill (`skills/marcus/SKILL.md`) that wraps experiment setup into 
 - **Project-level thinking** — understands entire systems, not just individual tasks
 - **Multi-agent coordination** — manages teams, not individuals
 - **Safety guarantees** — hybrid intelligence prevents catastrophic errors
-- **Observable behavior** — full transparency through Cato
+- **Observable behavior** — full transparency through the board
 
 ### From other multi-agent frameworks
 

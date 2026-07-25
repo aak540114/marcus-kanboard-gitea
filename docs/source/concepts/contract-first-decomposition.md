@@ -60,15 +60,15 @@ The experiment also exposed WidgetPosition schema divergence: the Python contrac
 
 ## Architectural Decisions
 
-### 1. Cato Observability Uses Synthetic Design Ghosts
+### 1. Dashboard Observability Uses Synthetic Design Ghosts
 
-**Decision**: When contract-first generates contracts, Marcus synthesizes one DONE design ghost task per usable contract domain. These ghosts carry the contract artifacts and appear in Cato's DAG view.
+**Decision**: When contract-first generates contracts, Marcus synthesizes one DONE design ghost task per usable contract domain. These ghosts carry the contract artifacts and appear in the dashboard's DAG view.
 
 **Alternatives considered**:
-- **Option B (new emitter path)**: Create a dedicated contract emitter in Cato. Rejected because it required Cato changes and a new data model.
-- **Option C (Cato classifier fix)**: Teach Cato to infer contract provenance from task metadata. Rejected because it was fragile and pushed domain logic into the visualization layer.
+- **Option B (new emitter path)**: Create a dedicated contract emitter in the dashboard. Rejected because it required dashboard changes and a new data model.
+- **Option C (dashboard classifier fix)**: Teach the dashboard to infer contract provenance from task metadata. Rejected because it was fragile and pushed domain logic into the visualization layer.
 
-**Rationale**: Option A (synthetic ghosts) reuses four existing code paths: `_run_design_phase`, `log_artifact`, the `auto_completed` label filter, and the dependency graph. Zero Cato changes needed. Implementation tasks depend on their matching design ghost via `source_context["contract_file"]`.
+**Rationale**: Option A (synthetic ghosts) reuses four existing code paths: `_run_design_phase`, `log_artifact`, the `auto_completed` label filter, and the dependency graph. Zero dashboard changes needed. Implementation tasks depend on their matching design ghost via `source_context["contract_file"]`.
 
 ### 2. Invariant 5 Is the Only Hard Gate
 

@@ -4,7 +4,7 @@
   "service": "marcus",
   "workspaceFolder": "/app",
 
-  "forwardPorts": [3333, 4298, 4301, 5173],
+  "forwardPorts": [3333, 4298],
 
   "portsAttributes": {
     "3333": {
@@ -16,20 +16,10 @@
       "label": "Marcus MCP Server",
       "onAutoForward": "silent",
       "protocol": "http"
-    },
-    "4301": {
-      "label": "Cato API (Backend)",
-      "onAutoForward": "silent",
-      "protocol": "http"
-    },
-    "5173": {
-      "label": "Cato Dashboard (Frontend)",
-      "onAutoForward": "notify",
-      "protocol": "http"
     }
   },
 
-  "postCreateCommand": "echo '\n✅ Marcus environment ready!\n\nServices:\n- Planka Board: http://localhost:3333 (demo@demo.demo / demo)\n- Marcus MCP: http://localhost:4298\n- Cato Dashboard: docker-compose --profile viz up (http://localhost:5173)\n'",
+  "postCreateCommand": "echo '\n✅ Marcus environment ready!\n\nServices:\n- Planka Board: http://localhost:3333 (demo@demo.demo / demo)\n- Marcus MCP: http://localhost:4298\n'",
 
   "customizations": {
     "vscode": {

@@ -291,9 +291,9 @@ For advanced features and multi-agent coordination:
 - **Commit Tracking**: Links commits to tasks and decisions
 - **Branch Management**: Tracks branch states and merge conflicts
 
-## Cato Integration
+## AI Assistant Integration
 
-The Persistence Layer provides the data foundation for Cato (the future Marcus AI assistant):
+The Persistence Layer provides the data foundation for Marcus's future AI assistant capabilities:
 
 ### Knowledge Base Storage
 - **Decision History**: All architectural decisions available for AI analysis

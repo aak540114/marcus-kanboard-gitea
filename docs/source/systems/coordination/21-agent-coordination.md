@@ -319,11 +319,11 @@ class KanbanInterface:
     async def add_comment(self, task_id: str, comment: str)
 ```
 
-## Cato Integration
+## Specialized Agent Integration
 
-While the coordination system doesn't directly integrate with Cato (a philosophy AI), it provides the infrastructure for philosophical agents:
+While the coordination system doesn't directly integrate with any specific philosophy-focused AI product, it provides the infrastructure for philosophical agents:
 
-- **Capability Registration**: Cato agents register with specialized skills
+- **Capability Registration**: Philosophical agents register with specialized skills
 - **Task Type Routing**: Philosophy-related tasks routed to appropriate agents
 - **Context Preservation**: Maintains conversation context across philosophical discussions
 - **Progress Tracking**: Monitors philosophical analysis milestones

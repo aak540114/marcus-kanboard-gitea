@@ -90,10 +90,10 @@ def _carry_forward_active_subtasks(
     ``request_next_task`` hot path (issue #667).
 
     This trims the in-memory list ONLY. The durable record in
-    ``data/marcus_state/subtasks.json`` -- which Cato reads directly as its
-    subtask data source -- is never modified here. Issue #672 tracks moving
-    subtask storage into the database so Cato consumes a contract rather
-    than Marcus's private file.
+    ``data/marcus_state/subtasks.json`` -- which downstream consumers read
+    directly as their subtask data source -- is never modified here. Issue
+    #672 tracks moving subtask storage into the database so downstream
+    consumers consume a contract rather than Marcus's private file.
 
     A transient empty ``parent_ids`` (the board fetch returned no tasks --
     the Planka provider does this on error) is treated as "no information"
@@ -1034,10 +1034,11 @@ class MarcusServer:
                     #
                     # We trim the in-memory list ONLY. The durable record in
                     # ``data/marcus_state/subtasks.json`` is left untouched:
-                    # Cato reads that file directly as its subtask data
-                    # source, so deleting from it would blank Cato's views.
-                    # Issue #672 tracks the proper fix (move subtask storage
-                    # into the DB so Cato reads a contract, not this file).
+                    # downstream consumers read that file directly as their
+                    # subtask data source, so deleting from it would blank
+                    # the dashboard's views. Issue #672 tracks the proper fix
+                    # (move subtask storage into the DB so downstream
+                    # consumers read a contract, not this file).
                     parent_ids = {t.id for t in parent_tasks}
                     existing_subtasks, dropped_orphans = _carry_forward_active_subtasks(
                         self.project_tasks, parent_ids
@@ -2615,7 +2616,7 @@ class MarcusServer:
                     state=server,
                 )
 
-        # Pipeline tools removed - all pipeline functionality moved to Cato
+        # Pipeline tools removed - all pipeline functionality removed
 
         # Project management tools
         if "add_project" in allowed_tools:

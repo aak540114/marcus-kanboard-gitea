@@ -106,7 +106,7 @@ Learn more: [Creating Projects](../guides/project-management/creating-projects.m
 **How Marcus uses the board**:
 - **Single source of truth** — all task status, context, and history live here
 - **Communication medium** — agents log decisions and artifacts to the board, not to each other
-- **Visibility layer** — Cato (the dashboard) reads the board for real-time UI
+- **Visibility layer** — the dashboard reads the board for real-time UI
 - **Audit trail** — complete history of what happened, who did it, and why
 
 **Key characteristics**:
@@ -232,11 +232,10 @@ Learn more: [AI Intelligence](../concepts/ai-intelligence.md)
 Marcus the orchestration server is the core, but several sibling tools layer on top of it:
 
 - **`/marcus` skill** — Claude Code skill (`skills/marcus/SKILL.md`) that wraps experiment setup into one command. Spawns N independent Claude CLI agents in tmux panes, each registering with the Marcus MCP server. The fastest path from idea → multi-agent run.
-- **[Cato](https://github.com/lwgray/cato)** — the active visual dashboard. Real-time agent activity, kanban view, board health. Sibling product; install separately and point at the same data store.
 - **[Posidonius](https://github.com/lwgray/posidonius)** — multi-run experiment platform. Launches and monitors batches of independent Marcus runs (parameter sweeps, benchmarks, parallel projects). Web UI plus integration with Epictetus for grading agent output.
 - **Epictetus** — code auditor that grades software projects (and the agents that built them). Wired into the Posidonius pipeline as a post-run audit.
 
-Marcus the orchestration server is required for all of the above. The dashboard, experiment platform, and grader are optional layers.
+Marcus the orchestration server is required for all of the above. The experiment platform and grader are optional layers.
 
 ## How It All Fits Together
 

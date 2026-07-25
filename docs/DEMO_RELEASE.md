@@ -71,10 +71,10 @@ You want to:
   # Test MCP endpoints
   ```
 
-- [ ] **Cato visualization working**
+- [ ] **Dashboard visualization working**
   ```bash
-  cd /Users/lwgray/dev/cato
-  ./cato start
+  cd /Users/lwgray/dev/dashboard
+  ./dashboard start
   # Verify all views render correctly
   ```
 
@@ -151,9 +151,9 @@ You want to:
     --notes-file RELEASE_NOTES.md
   ```
 
-- [ ] **Update Cato to matching version**
+- [ ] **Update the dashboard to matching version**
   ```bash
-  cd /Users/lwgray/dev/cato
+  cd /Users/lwgray/dev/dashboard
   git checkout -b release/v0.2.0
   # Update pyproject.toml to 0.2.0
   # Update CHANGELOG.md
@@ -247,8 +247,8 @@ pre-commit install
 
 **Current State:**
 ```
-Marcus:  0.1.3.1 → 0.2.0 (demo target)
-Cato:    2.0.0   → 0.2.0 (realign with Marcus)
+Marcus:    0.1.3.1 → 0.2.0 (demo target)
+Dashboard: 2.0.0   → 0.2.0 (realign with Marcus)
 ```
 
 **Next Steps:**
@@ -296,7 +296,7 @@ git push origin hotfix/critical-bug
 
 **Before Demo:**
 1. Marcus v0.2.0 running in Docker
-2. Cato v0.2.0 visualization ready
+2. Dashboard v0.2.0 visualization ready
 3. Planka board with lists created
 4. Test agent registered and ready
 
@@ -304,11 +304,11 @@ git push origin hotfix/critical-bug
 1. "Create a todo app with authentication"
 2. Watch Marcus break into tasks
 3. Watch agents pull and work on tasks
-4. Show Cato visualization of coordination
+4. Show the dashboard visualization of coordination
 5. Show completed code + passing tests
 
 **Success Criteria:**
 - ✅ All tasks complete without manual intervention
 - ✅ Context flows between agents
-- ✅ Cato shows beautiful visualization
+- ✅ The dashboard shows beautiful visualization
 - ✅ No errors or blockers during demo

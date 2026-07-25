@@ -75,7 +75,7 @@ After running `bump-version.sh`:
 - [ ] Review the changes (`git show HEAD`)
 - [ ] Push commit (`git push origin BRANCH_NAME`)
 - [ ] Push tag (`git push origin vX.X.X`)
-- [ ] Update Cato if needed (coordinate versions)
+- [ ] Update the dashboard if needed (coordinate versions)
 
 ---
 
@@ -165,18 +165,18 @@ git push origin YOUR_BRANCH
 
 ---
 
-## 📦 Coordinating Marcus + Cato
+## 📦 Coordinating Marcus + Dashboard
 
 **Rule:** Independent versioning. Each repo versions on its own cadence.
 
 - Changes in one don't always require changes in the other
-- Cato README notes minimum compatible Marcus version
+- The dashboard README notes minimum compatible Marcus version
 - MAJOR version stays in sync (both go to 1.0 together)
 
 ```bash
-# Marcus and Cato version independently
-# No need to bump Cato when Marcus patches
-# No need to bump Marcus when Cato adds UI features
+# Marcus and the dashboard version independently
+# No need to bump the dashboard when Marcus patches
+# No need to bump Marcus when the dashboard adds UI features
 ```
 
 ---

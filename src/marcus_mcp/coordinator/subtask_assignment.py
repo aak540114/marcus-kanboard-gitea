@@ -278,7 +278,7 @@ async def check_and_complete_parent_task(
         Marcus server state for accessing artifacts and context
     completing_agent_id : str, optional
         ID of the agent that completed the final subtask. When provided,
-        a ``task_assignment`` event is emitted so Cato's DAG/SwimLanes
+        a ``task_assignment`` event is emitted so the dashboard's DAG/SwimLanes
         can attribute the parent completion to a real agent.
 
     Returns
@@ -324,7 +324,7 @@ async def check_and_complete_parent_task(
 
         await kanban_client.add_comment(parent_task_id, completion_comment)
 
-        # Emit attribution event so Cato DAG/SwimLanes can link the parent
+        # Emit attribution event so the dashboard's DAG/SwimLanes can link the parent
         # task to the agent that drove it to completion (Bug 3 fix).
         # Without this, the parent appears as a ghost completion with no
         # agent record — invisible in experiment analytics.
@@ -358,9 +358,9 @@ async def check_and_complete_parent_task(
         #   lives. Subtask-driven parents are DERIVATIVE — the data
         #   already lives on the subtasks.
         #
-        #   Downstream observers (Cato) aggregate subtask data for parent
-        #   display rather than relying on a parent outcome row. See
-        #   cato_src/core/aggregator._apply_subtask_rollup.
+        #   Downstream observers aggregate subtask data for parent
+        #   display rather than relying on a parent outcome row (the
+        #   dashboard's aggregator applies a subtask rollup for this).
         if completing_agent_id and state and hasattr(state, "log_event"):
             state.log_event(
                 "task_assignment",

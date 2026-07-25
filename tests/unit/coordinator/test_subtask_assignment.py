@@ -1189,7 +1189,7 @@ class TestParentTaskAttribution:
         Verify auto-completing a parent task emits a task_assignment log event.
 
         Dashboard-v98 post-mortem: parent tasks (e.g. Tech Foundation) were
-        auto-completed via subtasks with no agent attribution. Cato's DAG and
+        auto-completed via subtasks with no agent attribution. The dashboard's DAG and
         SwimLanes use task_assignment events to build agent-task links. Without
         this event the parent task appears as a ghost completion.
         """
@@ -1361,7 +1361,7 @@ class TestSubtaskAssignedToOnPickup:
     Tests that Subtask.assigned_to is set when an agent picks up a subtask.
 
     Without this fix, Subtask.assigned_to stays None from creation until the
-    agent explicitly calls report_task_progress(IN_PROGRESS). Cato reads
+    agent explicitly calls report_task_progress(IN_PROGRESS). The dashboard reads
     SubtaskManager state for attribution, so it saw assigned_agent_id=null
     for any subtask that hadn't yet reported progress.
 
@@ -1400,7 +1400,7 @@ class TestSubtaskAssignedToOnPickup:
         the Subtask's assigned_to field immediately.
 
         This simulates what request_next_task now does at pickup time so
-        Cato sees attribution without waiting for an explicit progress report.
+        The dashboard sees attribution without waiting for an explicit progress report.
         """
         parent_id = "parent-002"
         subtasks_data = [

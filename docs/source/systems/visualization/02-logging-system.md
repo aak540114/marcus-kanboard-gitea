@@ -294,14 +294,14 @@ The logging system adapts to different board types:
 - Risk assessment logging
 - Pattern recognition results
 
-## Cato Integration
+## Downstream Consumer Integration
 
-While not directly integrated with Cato, the logging system provides:
+While not directly integrated with any specific downstream consumer, the logging system provides:
 
-1. **Decision History**: Cato can analyze logged decisions for pattern extraction
-2. **Performance Data**: Metrics feed into Cato's optimization algorithms
-3. **Learning Material**: Conversation logs provide training data for Cato's models
-4. **Feedback Loops**: Logged outcomes enable Cato to refine predictions
+1. **Decision History**: Downstream consumers can analyze logged decisions for pattern extraction
+2. **Performance Data**: Metrics feed into downstream optimization algorithms
+3. **Learning Material**: Conversation logs provide training data for downstream models
+4. **Feedback Loops**: Logged outcomes enable downstream consumers to refine predictions
 
 ## Typical Scenario Flow
 

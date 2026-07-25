@@ -369,7 +369,7 @@ class TestCompositionDescriptionV3:
         ), "Description must signal agent-side discovery of entry point"
 
     def test_description_requires_log_decision_entry_point_wired(self) -> None:
-        """Locks the canonical decision title so Cato/Epictetus can grep
+        """Locks the canonical decision title so the dashboard/Epictetus can grep
         compliance metrics consistently across runs (parallel to the
         \"Public API surface\" decision title pattern from #446)."""
         desc = self._build_description()

@@ -85,7 +85,7 @@ For each usable contract domain, Marcus synthesizes one DONE design ghost task:
 
 Implementation tasks are linked to their domain's ghost via `source_context["contract_file"]`. This provides:
 
-- **Cato observability**: ghosts appear in the DAG, showing that contract generation happened
+- **Dashboard observability**: ghosts appear in the DAG, showing that contract generation happened
 - **Artifact discovery**: implementation agents call `get_task_context`, which walks dependencies and finds contract artifacts on the ghost
 - **Provenance**: `source_type="contract_first_design"` identifies ghosts as contract-generated rather than manually created
 

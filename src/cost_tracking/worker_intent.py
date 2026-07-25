@@ -19,7 +19,7 @@ to answer two questions per record:
 Both functions are **pure**: they take raw dict input and return plain
 values, with no IO and no React/DOM coupling. The ingester owns the
 walking, dedup, and DB writes; this module owns the parsing. Same
-split as ``operationsPanel.logic.ts`` on the Cato side.
+split as ``operationsPanel.logic.ts`` on the dashboard side.
 
 Notes
 -----

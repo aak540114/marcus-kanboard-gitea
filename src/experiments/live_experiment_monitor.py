@@ -180,7 +180,7 @@ class LiveExperimentMonitor:
         The ``success`` flag in the result reflects whether all tasks
         actually completed cleanly. If any tasks are still BLOCKED on
         the board at stop time, ``success`` is set to ``False`` so
-        downstream consumers (Posidonius, Cato, MLflow) can distinguish
+        downstream consumers (Posidonius, MLflow) can distinguish
         a clean run from one that ended with unresolved blockers.
 
         Marcus completion math counts BLOCKED + DONE as terminal so the

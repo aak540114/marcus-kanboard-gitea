@@ -551,7 +551,7 @@ def _missing_verifications_for_required_outcomes_response(
     targets.
 
     Rejection shape mirrors :func:`_missing_coverage_response` so
-    Cato / log analyzers can treat both as the same "missing
+    Downstream consumers / log analyzers can treat both as the same "missing
     coverage" category, distinguished by ``error`` ("verifications_
     required_but_missing" here vs "verifications_missing_coverage"
     for partial coverage inside the verifications branch).
@@ -2372,7 +2372,7 @@ async def request_next_task(agent_id: str, state: Any) -> Any:
 
                 _mark("kanban_update")
 
-                # Sync subtask manager's assigned_to so Cato/analytics
+                # Sync subtask manager's assigned_to so downstream consumers/analytics
                 # see attribution immediately on pickup, not only at
                 # completion. Without this, Subtask.assigned_to stays
                 # None until report_task_progress(IN_PROGRESS) is called.
@@ -3103,7 +3103,7 @@ def _apply_merge_failure_to_update_data(
     # failure means the task is NOT actually done.
     update_data["status"] = TaskStatus.BLOCKED
     # Clear completed_at — leaving it populated alongside BLOCKED
-    # would corrupt downstream telemetry (Cato completion latency).
+    # would corrupt downstream telemetry (dashboard completion latency).
     update_data.pop("completed_at", None)
 
     # Build the merge_conflict record stamped onto source_context.
@@ -5497,7 +5497,7 @@ async def _find_optimal_task_original_logic(
         phase_enforcer = PhaseDependencyEnforcer()
         classifier = EnhancedTaskClassifier()
 
-        # System/metadata labels that Marcus adds internally (e.g. for Cato
+        # System/metadata labels that Marcus adds internally (e.g. for dashboard
         # visualisation).  These are NOT feature identifiers and must not be
         # used to group tasks into the same phase-enforcement feature group.
         # Without this exclusion, all pre-fork foundation tasks (which share

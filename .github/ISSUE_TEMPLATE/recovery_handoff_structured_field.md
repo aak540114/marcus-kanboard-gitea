@@ -15,7 +15,7 @@ Recovery handoff information is written as Kanban comments by `_create_recovery_
 3. No mechanism signals to the agent that recovery occurred
 
 **Why This Is a Problem:**
-- **Operational information hidden in audit trail**: Recovery info is operational (agents need it to work correctly), but comments are primarily for observability/audit (humans and Cato)
+- **Operational information hidden in audit trail**: Recovery info is operational (agents need it to work correctly), but comments are primarily for observability/audit (humans and the dashboard)
 - **No guaranteed visibility**: Agents may miss critical context about previous work
 - **Risk of duplicated/conflicting work**: Next agent might take a completely different approach, leaving dead code
 - **Poor separation of concerns**: Mixing operational coordination data with audit trail
@@ -28,7 +28,7 @@ Add explicit `recovery_info` field to the Task model that is:
 - **Easy to detect programmatically** (agents can check `if task.recovery_info`)
 - **Versioned and evolvable** (can add fields without breaking changes)
 
-**Plus** dual-write to Kanban comments for audit trail (humans and Cato still see it).
+**Plus** dual-write to Kanban comments for audit trail (humans and the dashboard still see it).
 
 ## Implementation Details
 
@@ -234,7 +234,7 @@ async def _create_recovery_handoff_comment(
 
 **Solution**:
 - Task model is source of truth (where agents read from)
-- Kanban is audit trail (where humans/Cato read from)
+- Kanban is audit trail (where humans/the dashboard read from)
 - If Kanban write fails: log error, continue
 - Don't fail entire recovery if audit trail write fails
 

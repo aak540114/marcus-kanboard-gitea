@@ -12,7 +12,7 @@
 9. [Future Evolution](#future-evolution)
 10. [Task Complexity Handling](#task-complexity-handling)
 11. [Board-Specific Considerations](#board-specific-considerations)
-12. [Cato Integration](#cato-integration)
+12. [Downstream Decision-Review Integration](#downstream-decision-review-integration)
 13. [Typical Scenario Integration](#typical-scenario-integration)
 
 ## Overview
@@ -688,24 +688,24 @@ class BoardAnalysisAdapter:
         return analysis
 ```
 
-## Cato Integration
+## Downstream Decision-Review Integration
 
-Future integration with Cato for enhanced decision-making oversight:
+Future integration with downstream decision-review tooling for enhanced decision-making oversight:
 
 ```python
-# Future Cato integration
-class CatoCodeAnalysisIntegration:
-    """Integration between code analysis and Cato decision system"""
+# Future decision-review integration
+class DecisionReviewIntegration:
+    """Integration between code analysis and a downstream decision review system"""
 
-    async def validate_analysis_with_cato(self, analysis: CodeAnalysis, context: DecisionContext) -> ValidatedAnalysis:
-        """Use Cato to validate and enhance code analysis results"""
-        cato_review = await self.cato_client.review_analysis(analysis, context)
+    async def validate_analysis_with_reviewer(self, analysis: CodeAnalysis, context: DecisionContext) -> ValidatedAnalysis:
+        """Use the downstream reviewer to validate and enhance code analysis results"""
+        review = await self.reviewer_client.review_analysis(analysis, context)
 
         return ValidatedAnalysis(
             original_analysis=analysis,
-            cato_confidence=cato_review.confidence,
-            cato_modifications=cato_review.suggested_modifications,
-            final_recommendations=cato_review.enhanced_recommendations
+            review_confidence=review.confidence,
+            review_modifications=review.suggested_modifications,
+            final_recommendations=review.enhanced_recommendations
         )
 ```
 

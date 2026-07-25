@@ -340,9 +340,9 @@ Different providers require different configuration structures:
 
 The system handles these differences transparently through provider-specific configuration sections.
 
-## Cato Integration
+## AI Decision Engine Integration
 
-While Cato (the decision-making AI component) doesn't have explicit configuration integration, it leverages the Configuration Management System through:
+While the AI decision-making component doesn't have explicit configuration integration, it leverages the Configuration Management System through:
 
 1. **AI Provider Settings**: Model selection, temperature, token limits
 2. **Decision Thresholds**: Risk assessment parameters

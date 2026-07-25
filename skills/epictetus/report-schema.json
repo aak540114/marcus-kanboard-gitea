@@ -190,7 +190,7 @@
               "type": "object",
               "properties": {
                 "available": { "type": "boolean" },
-                "unavailable_reason": { "type": "string", "description": "e.g. 'server down', 'data cleared by Cato', 'connection refused'" },
+                "unavailable_reason": { "type": "string", "description": "e.g. 'server down', 'data cleared by the dashboard', 'connection refused'" },
                 "tasks_retrieved": { "type": "integer" },
                 "timeline_events_total": { "type": "integer" }
               }

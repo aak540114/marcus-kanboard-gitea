@@ -10,7 +10,7 @@ Schema
 ------
 - ``runs``           : registry of project runs (project, path, totals)
 - ``token_events``   : one row per LLM call (immutable token counts)
-- ``model_prices``   : versioned by ``effective_from``; edited by Cato UI
+- ``model_prices``   : versioned by ``effective_from``; edited by the dashboard
 - ``v_event_cost``   : view joining events × the price active at each
                       event's timestamp, exposing ``cost_usd``
 
@@ -163,7 +163,7 @@ CREATE INDEX IF NOT EXISTS idx_te_op_model  ON token_events(operation, model);
 CREATE INDEX IF NOT EXISTS idx_te_intent    ON token_events(tool_intent);
 CREATE INDEX IF NOT EXISTS idx_te_timestamp ON token_events(timestamp);
 -- Partial unique index for dedup. Worker JSONL ingestion may sweep the
--- same session files repeatedly (e.g. Cato's 30s dashboard poll re-runs
+-- same session files repeatedly (e.g. the dashboard's 30s poll re-runs
 -- run_ingest with a fresh ingester whose in-memory ``_seen_uuids`` set
 -- is empty). Without DB-level dedup, every poll re-inserts every event
 -- and token counts double silently. ``request_id`` is Claude Code's
@@ -177,7 +177,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_te_request_id
 -- attributed to those projects stay. To keep the dashboard from
 -- showing opaque hex IDs after a project is deleted, Marcus snapshots
 -- the human-readable name into this table whenever a PlannerContext
--- is pushed (or a worker JSONL is ingested with a known name). Cato
+-- is pushed (or a worker JSONL is ingested with a known name). The dashboard
 -- reads from here first, then falls back to projects.json.
 CREATE TABLE IF NOT EXISTS project_names (
   project_id    TEXT PRIMARY KEY,
@@ -190,7 +190,7 @@ CREATE TABLE IF NOT EXISTS project_names (
 
 -- Per-task name snapshot (Marcus #530). Mirrors project_names. Marcus
 -- writes the kanban task name here when the decomposer first creates
--- the task; Cato joins by task_id in by_task SQL so the dashboard
+-- the task; the dashboard joins by task_id in by_task SQL so it
 -- shows real names instead of opaque hex IDs. Idempotent UPSERT keeps
 -- the most recent name when a task gets renamed mid-flight.
 CREATE TABLE IF NOT EXISTS task_names (
@@ -205,7 +205,7 @@ CREATE TABLE IF NOT EXISTS task_names (
 -- Project-level budget caps. Set by the dashboard so users can compare
 -- spend against a target without needing MLflow experiments. Stored in
 -- the cost DB (not ProjectRegistry) because the cap is a cost concept,
--- and keeps the write path under Cato's control without touching
+-- and keeps the write path under the dashboard's control without touching
 -- Marcus's project metadata. One row per project_id; subsequent writes
 -- update budget_usd in place.
 CREATE TABLE IF NOT EXISTS project_budgets (
@@ -270,7 +270,7 @@ LEFT JOIN model_prices p
 
 # Default seed prices loaded on first use unless caller provides their own.
 # Values pulled from the official Anthropic pricing page on _SEED_DATE
-# (see the populating block below). Tweaking these is harmless — Cato
+# (see the populating block below). Tweaking these is harmless — the dashboard
 # can override at runtime via the Pricing tab, which inserts new
 # ``model_prices`` rows with a fresh ``effective_from``.
 DEFAULT_SEED: List["ModelPrice"] = []  # populated below after dataclass def
@@ -452,7 +452,7 @@ class ModelPrice:
 # pricing page (2026-05-11). We don't know the actual day each rate
 # became effective on Anthropic's side, only that these are current
 # values as of that date. Users who need historically-accurate cost
-# for earlier experiments can insert versioned overrides via Cato.
+# for earlier experiments can insert versioned overrides via the dashboard.
 _SEED_DATE = datetime(2026, 5, 11, tzinfo=timezone.utc)
 # Authoritative Anthropic prices sourced from the official pricing page
 # (claude.com/pricing, captured 2026-05-11). Per the spec, prices are:
@@ -461,8 +461,8 @@ _SEED_DATE = datetime(2026, 5, 11, tzinfo=timezone.utc)
 #   cache read (0.1× input) | output
 #
 # Our schema's cache_creation_per_million column maps to the 5-minute cache
-# write multiplier. Cato displays the 5m rate; users who need 1h pricing
-# can insert a versioned override via Cato's pricing form. See #409 docs.
+# write multiplier. The dashboard displays the 5m rate; users who need 1h pricing
+# can insert a versioned override via the dashboard's pricing form. See #409 docs.
 #
 # Tuple order for the positional constructor:
 #   (model, provider, effective_from, input, output,
@@ -625,7 +625,7 @@ DEFAULT_SEED.extend(
             0.03,
             "default",
         ),
-        # ── OpenAI (kept as a starting point; users override via Cato) ──
+        # ── OpenAI (kept as a starting point; users override via the dashboard) ──
         ModelPrice("gpt-4o", "openai", _SEED_DATE, 5.0, 15.0, None, None, "default"),
     ]
 )
@@ -662,9 +662,9 @@ class CostStore:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
         # Wait up to 5s for the lock on startup DDL / contended writes
-        # before raising OperationalError. Cato polls run_ingest every
+        # before raising OperationalError. The dashboard polls run_ingest every
         # 30s; bare 0ms timeout caused Marcus startup to die immediately
-        # when Cato held the WAL.
+        # when the dashboard held the WAL.
         self.conn.execute("PRAGMA busy_timeout=5000")
         self._init_schema()
 
@@ -889,7 +889,7 @@ class CostStore:
         - Fresh install (token_events absent) — nothing to dedup.
         - Already-migrated DB (ux_te_request_id present) — by construction
           there are no duplicates, and the DELETE would still take a write
-          lock that conflicts with concurrent Cato polling. This makes the
+          lock that conflicts with concurrent dashboard polling. This makes the
           migration truly no-op on every Marcus restart after the first.
         """
         table_exists = self.conn.execute(
@@ -1465,7 +1465,7 @@ class CostStore:
 
         Mirrors :meth:`upsert_project_name` for tasks. Called by the
         decomposer at the moment a task is first created, so the
-        ``by_task`` chart on Cato shows human-readable names instead
+        ``by_task`` chart on the dashboard shows human-readable names instead
         of opaque hex IDs. Idempotent: same ``(task_id, name)`` is a
         no-op after the first call; a name change updates in place
         and bumps ``last_seen``.
@@ -1535,7 +1535,7 @@ class CostStore:
 
         Project budgets live in the cost DB rather than Marcus's
         ProjectRegistry because the cap is a cost concept, and keeping
-        it here lets Cato own the write path without touching project
+        it here lets the dashboard own the write path without touching project
         metadata. Re-calling with the same ``project_id`` updates the
         cap in place; ``set_at`` is refreshed automatically.
 

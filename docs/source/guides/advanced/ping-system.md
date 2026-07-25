@@ -45,9 +45,9 @@ if echo:
             "health_priorities": ["assignment_system", "task_scheduling", "context_services"]
         }
 
-    # Analytics client patterns (Cato dashboard)
-    elif "cato" in echo_lower:
-        client_type = "cato_analytics"
+    # Analytics client patterns (visualization dashboard)
+    elif "dashboard" in echo_lower:
+        client_type = "dashboard_analytics"
         client_context = {
             "capabilities": ["advanced_analytics", "pattern_analysis", "prediction_modeling"],
             "preferred_response": "comprehensive_metrics",

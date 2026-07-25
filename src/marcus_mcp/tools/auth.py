@@ -49,8 +49,8 @@ ROLE_TOOLS = {
         "check_task_dependencies",
         # Scheduling and resource planning
         "get_optimal_agent_count",  # Calculate optimal agent count using CPM
-        # Analytics and monitoring (delegated to Cato)
-        # Pipeline tools removed - functionality moved to Cato
+        # Analytics and monitoring
+        # Pipeline tools removed
         # System health monitoring
         "check_assignment_health",  # Debug assignments
         # Audit and usage analytics
@@ -151,13 +151,13 @@ async def authenticate(
     Parameters
     ----------
     client_id : str
-        Unique identifier for the client (e.g., "cato-001",
+        Unique identifier for the client (e.g., "dashboard-001",
         "user-john", "agent-backend-01"). This should be consistent
         across sessions for the same client
 
     client_type : str
         Must be one of: "observer", "developer", "agent", "admin"
-        - observer: Read-only access for monitoring/analytics (e.g., Cato, PMs)
+        - observer: Read-only access for monitoring/analytics (e.g., dashboards, PMs)
         - developer: Can create/manage projects and features via NLP
         - agent: AI agents that execute tasks (register → request → progress → complete)
         - admin: Full access to all tools
@@ -191,9 +191,9 @@ async def authenticate(
 
     Examples
     --------
-    # Authenticate Cato as an observer for analytics
+    # Authenticate a dashboard client as an observer for analytics
     authenticate(
-        client_id="cato-prod-001",
+        client_id="dashboard-prod-001",
         client_type="observer",
         role="analytics",
         metadata={"version": "2.0", "environment": "production"}
@@ -352,7 +352,7 @@ AUTHENTICATE_TOOL = Tool(
             "client_id": {
                 "type": "string",
                 "description": (
-                    "Unique client identifier " "(e.g., 'cato-001', 'user-john')"
+                    "Unique client identifier " "(e.g., 'dashboard-001', 'user-john')"
                 ),
             },
             "client_type": {

@@ -336,10 +336,10 @@ class TestContractFirstFallback:
         """
         All stages succeed → returns design ghost(s) + impl task(s).
 
-        After GH-320 PR 3 (Cato retrofit), the contract-first path
+        After GH-320 PR 3 (dashboard retrofit), the contract-first path
         prepends one synthetic design ghost task per usable domain to
         the impl tasks returned by ``decompose_by_contract``. The
-        ghosts make Cato's structural-task classifier fire so contract
+        ghosts make the dashboard's structural-task classifier fire so contract
         generation work shows up in the dashboard the same way the
         feature-based design phase does.
         """
@@ -821,17 +821,17 @@ class TestContractFirstDesignGhosts:
     """
     Test design ghost task creation in contract-first decomposition.
 
-    Synthetic design tasks are the Cato retrofit (GH-320 PR after #333):
+    Synthetic design tasks are the dashboard retrofit (GH-320 PR after #333):
     contract-first generates contract artifacts and decisions in Phase A
     via ``_generate_contracts_by_domain`` but, before this fix, those
     were discarded after being passed to ``decompose_by_contract``. No
     log_artifact, no log_decision, no structural task in marcus.db, no
-    ghost node in Cato.
+    ghost node in the dashboard.
 
     The fix synthesizes one DONE design task per usable domain so the
     existing feature-based Phase B infrastructure
     (``_register_design_via_mcp``) and the marcus.db design-task
-    persistence block both fire naturally — zero Cato changes.
+    persistence block both fire naturally — zero dashboard changes.
     """
 
     @pytest.mark.asyncio
@@ -953,7 +953,7 @@ class TestContractFirstDesignGhosts:
         for ghost in ghosts:
             assert _is_design_task(ghost), (
                 f"Ghost task {ghost.name!r} with labels {ghost.labels} "
-                f"does not satisfy _is_design_task — Cato/marcus.db "
+                f"does not satisfy _is_design_task — the dashboard/marcus.db "
                 f"persistence path will not fire for this task."
             )
 

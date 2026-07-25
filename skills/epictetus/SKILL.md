@@ -202,7 +202,7 @@ if API is up, or infer from pane titles if not).
 - `monitor` / `monitoring`
 - `coordinator` / `orchestrator`
 - `creator` / `project_creator`
-- Any pane whose title contains "cato", "monitor", or "status"
+- Any pane whose title contains "monitor" or "status"
 
 State which panes you captured and which you skipped, with reasons.
 
@@ -258,10 +258,11 @@ For each signal found, record: `agent_id`, `timestamp` (if available),
 curl -s --max-time 5 http://localhost:4301/api/experiments
 ```
 
-If the API is down (timeout, connection refused, or Cato has already cleared
-the data), note: "Marcus API unavailable — process evidence from tmux logs
-only" and skip to Cross-Reference. **This is expected** — the server may
-have been shut down after the experiment, or Cato may have consumed the data.
+If the API is down (timeout, connection refused, or the dashboard has already
+cleared the data), note: "Marcus API unavailable — process evidence from tmux
+logs only" and skip to Cross-Reference. **This is expected** — the server may
+have been shut down after the experiment, or the dashboard may have consumed
+the data.
 
 **Step B2: Pull conversation timelines using task IDs from Step A3**
 
@@ -735,18 +736,18 @@ Create `docs/audit-reports/` and `audit-index.json` if they don't exist.
 *After completing this phase: `_phase_done 8 "Write Reports"`*
 
 ### Phase 8.5: Persist to marcus.db (best-effort)
-<!-- COLLECTION NAME: quality_assessments — Cato queries this exact string; any other name will not appear in the dashboard -->
+<!-- COLLECTION NAME: quality_assessments — the dashboard queries this exact string; any other name will not appear in the dashboard -->
 
 **If `--mini` was passed:** Skip this phase entirely. Emit `_phase_done 8.5 "Persist to marcus.db" true`.
 
 After writing the 3 disk artifacts, attempt to persist the JSON report to
-marcus.db so Cato can display it in the Quality dashboard. This step is
+marcus.db so the dashboard can display it in the Quality view. This step is
 **best-effort** — if marcus.db isn't found, skip silently. The disk
 artifacts are always the primary output.
 
 marcus.db is the single canonical location for quality assessments.
 Do NOT write to kanban.db — that is the board database, not the observability
-store. Cato reads exclusively from marcus.db.
+store. The dashboard reads exclusively from marcus.db.
 
 **Step 1: Resolve project_id**
 

@@ -78,14 +78,14 @@ marcus config --edit
 
 ## Integration with Other Tools
 
-### With Cato
+### With the dashboard
 
 ```bash
 # Start Marcus with HTTP
 marcus start --http
 
-# In another terminal, start Cato (the dashboard)
-./cato start
+# In another terminal, start the dashboard
+./dashboard start
 ```
 
 ### With Claude

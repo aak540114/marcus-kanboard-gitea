@@ -364,7 +364,7 @@ class EventTypes:
     # Emitted by NaturalLanguageProjectCreator after each decomposer
     # path returns, when MARCUS_OUTCOME_COVERAGE is on and outcomes
     # were extracted.  Carries intent_fidelity_score plus coverage
-    # maps so Cato can surface intent-fidelity telemetry alongside
+    # maps so the dashboard can surface intent-fidelity telemetry alongside
     # the planning-phase swim lanes.
     PLANNING_INTENT_FIDELITY = "planning_intent_fidelity"
 

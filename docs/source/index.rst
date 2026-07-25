@@ -64,8 +64,8 @@ Why Marcus?
     .. tab-item:: Built-in Observability
 
         Every action is on the board: tasks, dependencies, decisions, artifacts,
-        progress. Pair with **Cato** for a real-time dashboard, **Posidonius** for
-        multi-run experiments, and **Epictetus** for post-run grading.
+        progress. Pair with **Posidonius** for multi-run experiments and
+        **Epictetus** for post-run grading.
 
 
 Quick Example

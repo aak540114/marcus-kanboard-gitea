@@ -3,7 +3,7 @@ Progress reporting for Phase 2 analysis engine.
 
 Provides progress event emission during long-running analyses so that:
 - Users see "Analyzing task 45/247..." instead of frozen screen
-- Cato UI can show progress bars (Phase 3 requirement)
+- The dashboard can show progress bars (Phase 3 requirement)
 - Analysis operations can report percentage complete
 
 Usage
@@ -200,7 +200,7 @@ class ProgressReporter:
     """
     Progress reporter for long-running analysis operations.
 
-    Emits progress events that can be consumed by UI layers (like Cato)
+    Emits progress events that can be consumed by UI layers (like the dashboard)
     or logging systems to provide feedback during expensive LLM analyses.
 
     Parameters

@@ -1,10 +1,10 @@
 """
 Read-only aggregator over the Marcus cost store.
 
-Provides the query helpers that power the Cato ``/api/cost/*`` endpoints
+Provides the query helpers that power the ``/api/cost/*`` endpoints
 described in #409. Aggregator never writes; it only reads from
 :class:`src.cost_tracking.cost_store.CostStore` and returns dicts shaped
-like the documented API responses, so the Cato backend can pass them
+like the documented API responses, so the dashboard can pass them
 through with minimal transformation.
 
 All methods are synchronous (sqlite3 is sync). The aggregator is safe to
@@ -92,7 +92,7 @@ class CostAggregator:
         return self._rows(sql, (project_id, project_id, limit))
 
     def run_summary(self, run_id: str) -> Optional[Dict[str, Any]]:
-        """Full per-run summary used by Cato's drill-in view.
+        """Full per-run summary used by the dashboard's drill-in view.
 
         Renamed from ``experiment_summary`` (Simon ``7ed3074d``).
 
@@ -557,7 +557,7 @@ class CostAggregator:
         )
 
     def project_summary(self, project_id: str) -> Optional[Dict[str, Any]]:
-        """Full per-project summary used by Cato's drill-in view.
+        """Full per-project summary used by the dashboard's drill-in view.
 
         Mirrors :meth:`run_summary` but scoped to ``project_id``,
         because Marcus's coordination model identifies work by project,

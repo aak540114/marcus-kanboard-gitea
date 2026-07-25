@@ -168,7 +168,7 @@ Auto-completed design tasks produce the same outputs a worker agent would:
 
 From the perspective of a worker agent calling `get_task_context`, there is no difference between a design task completed by Marcus and one completed by another agent.
 
-## Cato Integration
+## Dashboard Visibility
 
 Tasks with the `"auto_completed"` label are filtered from the default board view in `_filter_tasks_by_view()`. Design tasks are hidden from the DAG and swim lane views, but their artifacts and decisions remain visible on dependent task cards.
 

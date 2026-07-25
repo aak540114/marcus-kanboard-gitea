@@ -1,7 +1,7 @@
 """
 Unit tests for ``_emit_intent_fidelity_event`` (issue #449, Phase 5).
 
-The helper bridges decomposer-side coverage telemetry to Cato by
+The helper bridges decomposer-side coverage telemetry to the dashboard by
 publishing a ``PLANNING_INTENT_FIDELITY`` event after each decomposer
 path returns.  These tests cover:
 

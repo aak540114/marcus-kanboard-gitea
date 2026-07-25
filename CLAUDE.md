@@ -129,7 +129,7 @@ FILE_MANAGEMENT:
   ALWAYS:
   - Open with a 1-2 sentence "What is this system, briefly" paragraph that
     explains the project in plain English BEFORE introducing any internal
-    concepts (Marcus, Cato, Posidonius, MCP, etc.)
+    concepts (Marcus, Posidonius, MCP, etc.)
   - Define EVERY internal term (PlannerContext, decomposer, blackboard,
     run_id, kanban board, etc.) the first time it is used
   - State the problem in user-facing language BEFORE the technical
@@ -152,7 +152,7 @@ FILE_MANAGEMENT:
   - Keep sentences short. Plain English first; jargon second
 
   NEVER:
-  - Assume the reader knows what Marcus, Cato, Posidonius, MCP, blackboard
+  - Assume the reader knows what Marcus, Posidonius, MCP, blackboard
     architecture, agent invariants, or any internal concept is
   - Use unexplained acronyms or codebase-specific jargon
   - Reference "the usual pattern" or "as we did before" without naming the

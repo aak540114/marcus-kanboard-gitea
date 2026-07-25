@@ -251,11 +251,11 @@ elif board_quality_score < 0.5:
 - **Team size correlation** with board complexity preferences
 - **Board structure impact** on task distribution recommendations
 
-## Cato Integration
+## Dashboard Integration
 
 ### Visualization Handoff
 - **Marcus Role**: Pattern analysis and recommendation generation
-- **Cato Role**: Visualization, user interaction, recommendation presentation
+- **Dashboard Role**: Visualization, user interaction, recommendation presentation
 - **Data Exchange**: JSON-formatted recommendation reports
 
 ### API Integration Points
@@ -270,7 +270,7 @@ def get_recommendations_for_cato(flow_id: str) -> Dict[str, Any]:
 ```
 
 ### Shared Data Models
-- Recommendation format standardized for Cato consumption
+- Recommendation format standardized for dashboard consumption
 - Supporting data includes visualization hints
 - Action callbacks translated to API endpoints
 

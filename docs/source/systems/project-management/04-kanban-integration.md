@@ -543,7 +543,7 @@ Configurable workflow states with automation rules
 
 ## Analytics Integration
 
-> **NOTE:** Cato (the dashboard) reads kanban state directly from the board (SQLite/Planka/etc.) rather than through a callable analytics class inside Marcus. There is no `CatoClient` class inside Marcus that exposes methods like `analyze_project_description()`, `generate_project_structure()`, or `analyze_task_complexity()` — those examples in the snippets below are illustrative of where Cato could plug in, not a current API.
+> **NOTE:** The dashboard reads kanban state directly from the board (SQLite/Planka/etc.) rather than through a callable analytics class inside Marcus. There is no client class inside Marcus that exposes methods like `analyze_project_description()`, `generate_project_structure()`, or `analyze_task_complexity()` — those examples in the snippets below are illustrative of where a dashboard integration could plug in, not a current API.
 
 The kanban integration contributes data to Marcus's broader intelligence systems through existing components:
 

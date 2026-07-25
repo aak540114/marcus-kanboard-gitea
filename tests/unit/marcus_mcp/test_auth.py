@@ -3,7 +3,7 @@ Unit tests for src/marcus_mcp/tools/auth.py — role-based access control.
 
 Regression coverage for a confirmed access-control bug: the "observer"
 role is documented (authenticate()'s own docstring) as read-only, used by
-analytics/monitoring clients like Cato, but its ROLE_TOOLS entry included
+analytics/monitoring clients like the dashboard, but its ROLE_TOOLS entry included
 "remove_project" — a destructive operation. Any client authenticating as
 "observer" could permanently delete a live project.
 """
@@ -41,10 +41,10 @@ class TestObserverRoleIsReadOnly:
         """End-to-end: a registered observer client can't reach remove_project."""
         state = SimpleNamespace(
             _registered_clients={
-                "cato-001": {"client_type": "observer"},
+                "dashboard-001": {"client_type": "observer"},
             }
         )
-        tools = get_client_tools("cato-001", state)
+        tools = get_client_tools("dashboard-001", state)
         assert "remove_project" not in tools
 
 

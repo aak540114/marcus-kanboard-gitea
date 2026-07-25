@@ -447,7 +447,7 @@ class NaturalLanguageProjectCreator(NaturalLanguageTaskCreator):
             logger.debug(f"PRD result: {prd_result}")
             return []
 
-        # Phase 5: emit intent-fidelity event for Cato telemetry.
+        # Phase 5: emit intent-fidelity event for downstream telemetry.
         # TaskGenerationResult flattens the coverage fields at the top
         # level (vs contract-first's nested .coverage object) — see
         # the type asymmetry note in _emit_intent_fidelity_event's
@@ -526,10 +526,10 @@ class NaturalLanguageProjectCreator(NaturalLanguageTaskCreator):
         coverage_after_fill: Optional[Dict[str, List[str]]],
         gap_filled_outcomes: List[str],
     ) -> None:
-        """Emit a PLANNING_INTENT_FIDELITY event for Cato telemetry.
+        """Emit a PLANNING_INTENT_FIDELITY event for downstream telemetry.
 
         Issue #449 — Phase 5.  Both decomposer paths call this after
-        producing tasks so Cato can render intent-fidelity alongside
+        producing tasks so the dashboard can render intent-fidelity alongside
         the planning-phase swim lanes.  No-ops when the score is
         ``None`` (coverage didn't run) or when the state object has
         no event system attached.
@@ -862,7 +862,7 @@ class NaturalLanguageProjectCreator(NaturalLanguageTaskCreator):
             # name so each augmenter's payload sits in its own dict.
             tasks = decompose_result.augmented_tasks
 
-            # Phase 5: emit intent-fidelity event for Cato telemetry.
+            # Phase 5: emit intent-fidelity event for downstream telemetry.
             # The outcome_coverage augmenter contributes its slice
             # under the ``outcome_coverage`` key.  When the augmenter
             # no-opped (flag off / no outcomes / LLM error), the slice
@@ -921,7 +921,7 @@ class NaturalLanguageProjectCreator(NaturalLanguageTaskCreator):
         # ``src/integrations/contract_validation.py`` for future use
         # as an advisory diagnostic in #64.
 
-        # Cato retrofit (GH-320 PR after #333): synthesize one DONE
+        # Contract-first dashboard retrofit (GH-320 PR after #333): synthesize one DONE
         # design task per usable domain so the existing feature-based
         # observability infrastructure fires for contract-first runs.
         #
@@ -929,9 +929,9 @@ class NaturalLanguageProjectCreator(NaturalLanguageTaskCreator):
         # Phase A (above) and consumed by ``decompose_by_contract`` to
         # build implementation task descriptions, then thrown away.
         # No ``log_artifact`` call, no ``log_decision`` call, no
-        # structural task in marcus.db. Cato's display_role classifier
-        # at ``cato_src/core/aggregator.py`` only marks tasks as
-        # ``"structural"`` when they have ``"design"`` in labels — so
+        # structural task in marcus.db. The dashboard's display_role
+        # classifier only marks tasks as ``"structural"`` when they
+        # have ``"design"`` in labels — so
         # without these ghosts, contract-first projects show up as
         # all-work, no design phase, no decisions, no artifacts.
         #
@@ -1408,7 +1408,7 @@ class NaturalLanguageProjectCreator(NaturalLanguageTaskCreator):
                 # being populated — pre-fork alone is neither an
                 # implementation nor exclusion label, so the filter
                 # defaults to "skip" (#557 / Codex P2 on PR #559).
-                # "pre-fork" stays so Cato can surface the pre-domain
+                # "pre-fork" stays so the dashboard can surface the pre-domain
                 # distinction; no "design"/"foundation" label.
                 labels=["pre-fork", "implementation"],
                 source_type="pre_fork_synthesis",
@@ -1517,7 +1517,7 @@ class NaturalLanguageProjectCreator(NaturalLanguageTaskCreator):
                     elif hasattr(self.kanban_client, "connect"):
                         await self.kanban_client.connect()
                     # Set active_project_id so task_metadata in marcus.db
-                    # gets the correct project_id for Cato filtering.
+                    # gets the correct project_id for dashboard filtering.
                     # Only set if not already assigned (caller may have
                     # set it to the Marcus registry ID).
                     if not self.active_project_id:
@@ -1765,7 +1765,7 @@ class NaturalLanguageProjectCreator(NaturalLanguageTaskCreator):
 
                 # Planning phase ends: board is populated, agents can now
                 # self-select work.  Log JSONL event (debugging) and persist
-                # to marcus.db so Cato renders a "Marcus Planning" swim lane
+                # to marcus.db so the dashboard renders a "Marcus Planning" swim lane
                 # bar attributed to "Marcus", spanning setup duration.
                 _planning_ended_at = datetime.now(timezone.utc)
                 log_agent_event(
@@ -1873,7 +1873,7 @@ class NaturalLanguageProjectCreator(NaturalLanguageTaskCreator):
                 )
 
                 # Persist About task metadata and outcome to marcus.db
-                # so Cato can see it (same pattern as nlp_base.py)
+                # so the dashboard can see it (same pattern as nlp_base.py)
                 try:
                     from pathlib import Path
 
@@ -1923,7 +1923,7 @@ class NaturalLanguageProjectCreator(NaturalLanguageTaskCreator):
                     )
 
                 # Persist design task metadata and outcomes to marcus.db
-                # so Cato can show them in Swim Lane (same pattern as About task)
+                # so the dashboard can show them in Swim Lane (same pattern as About task)
                 try:
                     for task_with_id in tasks_with_real_ids:
                         if not _is_design_task(task_with_id):
@@ -2104,7 +2104,7 @@ class NaturalLanguageProjectCreator(NaturalLanguageTaskCreator):
             if project_root and has_design_tasks:
                 import asyncio as _aio
 
-                # Contract-first Cato retrofit: when
+                # Contract-first dashboard retrofit: when
                 # ``_try_contract_first_decomposition`` synthesizes
                 # design ghost tasks, it stashes the pre-generated
                 # contract content on the creator instance. Pass it
@@ -2168,7 +2168,7 @@ class NaturalLanguageProjectCreator(NaturalLanguageTaskCreator):
 
         except Exception as e:
             # Planning phase completed but project creation failed downstream.
-            # Write task_outcomes with success=False so Cato shows the real
+            # Write task_outcomes with success=False so the dashboard shows the real
             # outcome instead of a ghost "success" bar (Codex P2 fix).
             if (
                 _planning_id is not None
@@ -4498,7 +4498,7 @@ async def _run_design_phase(
     GH-314 : Moved Phase A to background (accidentally orphaned Phase B).
     GH-320 : Reconnected Phase A → Phase B handoff (this function).
     GH-320 PR after #333 : ``pre_generated_content`` parameter for
-        contract-first Cato retrofit — Phase A skipped when contracts
+        contract-first dashboard retrofit — Phase A skipped when contracts
         are already generated upstream.
     """
     # Codex P1 on PR #516 — placeholder context leaks into background
@@ -4597,7 +4597,7 @@ async def _run_design_phase_body(
     """
     design_content: Dict[str, Any] = {}
     if pre_generated_content is not None:
-        # Contract-first Cato retrofit path. Phase A artifacts and
+        # Contract-first dashboard retrofit path. Phase A artifacts and
         # decisions were already generated upstream by
         # ``_generate_contracts_by_domain`` in
         # ``_try_contract_first_decomposition``. Use them directly

@@ -2,7 +2,7 @@
 MCP tools for the Marcus cost tracking dashboard (#409).
 
 Exposes :func:`get_cost_summary` so agents and external clients (notably
-the Cato dashboard) can query the cost store without direct DB access.
+the dashboard) can query the cost store without direct DB access.
 
 The tool dispatches to :class:`src.cost_tracking.cost_aggregator.CostAggregator`
 and returns dicts shaped like the API responses documented in #409.
@@ -39,7 +39,7 @@ async def get_cost_summary(
     project_id : str, optional
         Marcus project ID. When provided, returns project totals
         plus a list of run summaries belonging to the project. Used
-        by Cato when drilling from a project view into its runs.
+        by the dashboard when drilling from a project view into its runs.
     state : Any
         Marcus server state. Must expose ``cost_store`` (set up at
         server init, see

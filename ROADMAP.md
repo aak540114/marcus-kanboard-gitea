@@ -84,19 +84,18 @@ Started as "PM Agent" in June 2025, rebranded to Marcus in October.
 - [x] Agent performance metrics and bottleneck detection
       (Epictetus coordination effectiveness analysis, commit 8d1f8b9e / #263)
 - [x] Board health monitoring and alerting
-      (Quality dashboard in Cato v0.3.0, commit 5f8e54d)
+      (Quality dashboard, commit 5f8e54d)
 - [x] Auto-terminate agents when experiment completes (#389, commit 1b331117)
 - [x] Validation hardening — eliminate criteria hallucinations + BLOCKED
       deadlocks (#421, commit 8e95ca28)
 - [x] Coordination/correctness decoupling (commit 4ef01f3a)
-- [ ] ~~Unified Cato dashboard bundled with Marcus~~ **DROPPED 2026-04** —
-      Cato stays a sibling product. See `MVP_CATO_ALIGNMENT_EVALUATION.md`
-      and the proposed Marcus Studio desktop shell (#443) for any future
-      "single install" surface.
+- [ ] ~~Unified dashboard bundled with Marcus~~ **DROPPED 2026-04** —
+      the dashboard stays a sibling product. See the proposed Marcus Studio
+      desktop shell (#443) for any future "single install" surface.
 - [ ] ~~Single install: `pip install marcus && marcus start`~~ **DROPPED 2026-04** —
-      depended on the Cato submodule decision above.
+      depended on the dashboard submodule decision above.
 - [ ] ~~Real-time event broadcasting (SSE)~~ **DEFERRED 2026-04** —
-      Cato continues reading SQLite + Planka directly. SSE rebuilt only
+      the dashboard continues reading SQLite + Planka directly. SSE rebuilt only
       when Marcus Studio (#443) needs it.
 - [ ] ~~Jira kanban provider~~ **DEFERRED 2026-04** — revisit when a real user asks.
 - [ ] ~~Linear kanban provider~~ **DEFERRED 2026-04** — same.
@@ -169,9 +168,9 @@ Pairs two milestones:
 
 ### Sprint 2 — Open Protocol (MFP v0.1) *(2026-07-23 → 2026-09-23, 2 months)*
 **Goal:** MFP v0.1 published as a versioned, language-agnostic
-coordination protocol. Marcus is the *reference implementation*. Cato
-consumes MFP read API instead of filesystem coupling. Conformance test
-suite passes.
+coordination protocol. Marcus is the *reference implementation*. The
+dashboard consumes MFP read API instead of filesystem coupling. Conformance
+test suite passes.
 
 Milestone: **v0.5.0 — MFP v0.1 + Board Rewind** (8 issues).
 
@@ -297,7 +296,7 @@ Build Kits (`.mkb` packages) capture completed projects as reusable templates
 - [ ] BuildKitCustomizer — intelligent modifications via agents
 - [ ] Context injection (Build Kit context -> agent context)
 - [ ] CLI: `marcus buildkit create`, `marcus buildkit customize`
-- [ ] Build Kit browser in Cato dashboard
+- [ ] Build Kit browser in the dashboard
 
 ### Seed Build Kits
 | Kit | Price | Stack |

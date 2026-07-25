@@ -90,7 +90,7 @@ TOOL_GROUPS: Dict[str, Set[str]] = {
         "get_ticket_dev_environment_url",
     },
     "analytics": {
-        # All tools for comprehensive analytics (Cato)
+        # All tools for comprehensive analytics
         # This includes all tools from all groups plus analytics-specific ones
         "ping",
         "authenticate",

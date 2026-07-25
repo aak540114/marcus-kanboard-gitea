@@ -465,7 +465,7 @@ class TestPublicApiSurfaceReminder:
         Locking the title (``Public API surface``) so a future
         prompt edit doesn't drift to ``Public API``, ``API surface``,
         or any other variant — keeping a stable identifier across
-        runs lets Cato / Epictetus measure compliance reliably.
+        runs lets the dashboard / Epictetus measure compliance reliably.
         """
         task = await self._foundation_task()
         assert "Public API surface" in task.description

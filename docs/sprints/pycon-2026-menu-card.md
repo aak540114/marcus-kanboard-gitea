@@ -45,7 +45,6 @@ Pick a dish. Comment on the issue to claim it. Branch off `develop`, PR back to 
 | **#241** | Scaffold Jira kanban provider stub | 2–3 h | ✨ integration |
 | **#244** | Write "How to add a new MCP tool" guide | 60–90 m | 📘 docs |
 | **#264** | Persist AI config at startup for `marcus status` | 1.5–2.5 h | 🐛 bug |
-| **#284** | Fix Cato board view to match Marcus kanban board | 1.5–2.5 h | 🐛 bug |
 | **#324** | Gate `full-test-suite` CI on push to main + nightly | 1–1.5 h | 🚦 CI |
 | **#382** | Auto-select decomposer strategy | 2–3 h | ✨ feature |
 | **#383** | Synthetic agent for CI and runner validation | 2.5–3 h | 🧪 test |
@@ -59,7 +58,6 @@ Pick a dish. Comment on the issue to claim it. Branch off `develop`, PR back to 
 | **#255** | Backpropagation-style blame attribution | 4–6 h | 🧠 research |
 | **#312** | Make `pip install marcus-ai` a complete install path | 4–6 h | 📦 packaging |
 | **#338** | Generative validator (LLM writes verification code) | 5–8 h | 🧠 research |
-| **#378** | Cato Living Architecture Diagram with GIF export | 5–8 h | 🎨 build |
 
 ## 🌙 Night Cap — open-ended bonus issues
 
@@ -87,4 +85,4 @@ Pick a dish. Comment on the issue to claim it. Branch off `develop`, PR back to 
 
 ## Tier counts
 
-🥗 9 appetizers  ·  🍝 13 main courses  ·  🍮 6 desserts  ·  🌙 7 night caps  ·  **35 issues total**
+🥗 9 appetizers  ·  🍝 12 main courses  ·  🍮 5 desserts  ·  🌙 7 night caps  ·  **33 issues total**

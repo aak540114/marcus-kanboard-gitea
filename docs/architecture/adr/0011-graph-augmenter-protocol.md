@@ -87,7 +87,7 @@ augmenters with `isinstance` when registration happens.
 
 **Why `name: str`:** the chain namespaces telemetry by `augmenter.name`
 so each augmenter's payload sits in its own slice of the result dict.
-Cato consumers read `result.telemetry["outcome_coverage"]`,
+Downstream consumers read `result.telemetry["outcome_coverage"]`,
 `result.telemetry["spec_coverage"]`, etc. without key collisions.
 
 **Why keyword-only `augment` parameters:** prevents positional-arg
@@ -155,7 +155,7 @@ that knows the chain order and registration set.
 - **Observable failures.** Augmenter exceptions log with the
   augmenter's name; no silent regressions.
 - **Telemetry future-proof.** Each augmenter owns its own keyspace.
-  Cato consumers don't break when a new augmenter joins.
+  Downstream consumers don't break when a new augmenter joins.
 - **Order is load-bearing and tested.** `outcome_coverage` runs before
   `spec_coverage` so the spec-feature scan sees outcome-fill tasks.
   Pinned by `test_second_augmenter_sees_first_augmenter_tasks`.
@@ -188,7 +188,7 @@ budgets), this needs revisiting.
 
 **Telemetry namespace shape:** chose `{augmenter.name: dict}` over
 flat merge. Namespace makes per-augmenter event payloads
-addressable from Cato (`result.telemetry["outcome_coverage"]`)
+addressable from downstream consumers (`result.telemetry["outcome_coverage"]`)
 without forcing a unified key schema across all augmenters.
 
 ---

@@ -686,7 +686,7 @@ class LLMAbstraction:
             with an ``operation_override`` for the duration of the call,
             so ``token_events.operation`` records ``operation`` instead
             of whatever default the provider stamps. Used for per-call
-            drill-down in the Cato cost dashboard. See
+            drill-down in the cost dashboard. See
             ``src/cost_tracking/operations.py`` for the canonical
             taxonomy and human-readable descriptions.
 

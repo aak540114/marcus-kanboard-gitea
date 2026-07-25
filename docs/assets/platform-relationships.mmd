@@ -40,7 +40,6 @@ graph TD
 
     subgraph OBS["Observability"]
         direction LR
-        CATO["Cato\nlocalhost:5173"]
         MLF["MLflow\nmlruns/"]
         EPIC["Epictetus\ncode auditor"]
     end
@@ -66,7 +65,6 @@ graph TD
     TOOLS --> PLK
     TOOLS --> GH
     TOOLS --> LIN
-    DB -->|"reads"| CATO
     WK -->|"metrics"| MLF
     MN -->|"metrics"| MLF
     EPIC -->|"quality scores"| MLF

@@ -7,7 +7,7 @@ Every planner-side LLM call should be tagged with one of the keys in
 - **Producer**: call sites pass the key as ``operation=`` to
   :meth:`LLMAbstraction.analyze` (or directly through provider hooks).
   The recorder stamps it onto ``token_events.operation``.
-- **Consumer**: the Cato dashboard fetches this catalog via the
+- **Consumer**: the dashboard fetches this catalog via the
   ``/api/cost/operations`` endpoint and renders the human label and
   description next to each operation in the cost breakdown — so users
   can see *what* the planner spent tokens on, not just *that* it did.

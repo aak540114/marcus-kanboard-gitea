@@ -145,7 +145,7 @@ class TestSafeStructuredCall:
         ]
         assert len(retry_records) == 1
         rec = retry_records[0]
-        # Structured fields are mounted via ``extra=`` so Cato can graph
+        # Structured fields are mounted via ``extra=`` so the dashboard can graph
         # retry frequency per operation.
         assert getattr(rec, "operation") == "my_op"
         assert getattr(rec, "attempt") == 1

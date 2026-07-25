@@ -3,7 +3,7 @@ Unit tests for planning phase observability (GH-357).
 
 Verifies that ``create_project_from_description`` on
 ``NaturalLanguageProjectCreator`` logs ``planning_start`` and
-``planning_end`` agent events so Cato's swim lanes can show how long
+``planning_end`` agent events so the dashboard's swim lanes can show how long
 the Marcus coordination / setup phase takes relative to agent work.
 """
 
@@ -195,7 +195,7 @@ class TestPlanningObservability:
     async def test_logs_planning_start_event(self) -> None:
         """A ``planning_start`` event is logged when project creation begins.
 
-        This lets Cato's swim lanes show the coordination / setup phase
+        This lets the dashboard's swim lanes show the coordination / setup phase
         duration that currently appears as dead time before any task bar
         appears on the timeline.
         """
@@ -217,7 +217,7 @@ class TestPlanningObservability:
         """A ``planning_end`` event is logged when task creation completes.
 
         The span from ``planning_start`` to ``planning_end`` is the
-        coordination overhead visible in Cato swim lanes.
+        coordination overhead visible in the dashboard swim lanes.
         """
         creator = _make_creator()
         tasks = [_make_task("task-1", "Build Widget")]
@@ -236,7 +236,7 @@ class TestPlanningObservability:
     async def test_planning_start_logged_before_planning_end(self) -> None:
         """``planning_start`` must be logged before ``planning_end``.
 
-        Order matters: Cato computes duration as end − start.
+        Order matters: the dashboard computes duration as end − start.
         """
         creator = _make_creator()
         tasks = [_make_task("task-1", "Build Widget")]
@@ -262,7 +262,7 @@ class TestPlanningObservability:
         ), f"planning_start must precede planning_end, got order: {log_order}"
 
     async def test_planning_start_event_includes_project_name(self) -> None:
-        """``planning_start`` payload contains the project name for Cato filtering."""
+        """``planning_start`` payload contains the project name for dashboard filtering."""
         creator = _make_creator()
         tasks = [_make_task("task-1", "Build Widget")]
         captured: list[dict[str, Any]] = []
@@ -288,7 +288,7 @@ class TestPlanningObservability:
     async def test_planning_end_event_includes_task_count(self) -> None:
         """``planning_end`` payload contains the number of tasks created.
 
-        Cato can use this to display a summary annotation on the planning bar.
+        The dashboard can use this to display a summary annotation on the planning bar.
         """
         creator = _make_creator()
         tasks = [_make_task(f"task-{i}", f"Task {i}") for i in range(3)]
@@ -328,7 +328,7 @@ class TestPlanningObservability:
         full ``create_project_from_description`` call completes successfully.
 
         Writing early (before About-card creation, etc.) would record
-        success even when downstream steps fail, skewing Cato analytics.
+        success even when downstream steps fail, skewing dashboard analytics.
         """
         from src.integrations.nlp_task_utils import TaskType
 
@@ -389,7 +389,7 @@ class TestPlanningObservability:
         failure).
 
         Without this, a failed run would show a phantom 'success' bar in
-        Cato's Marcus swim lane, skewing the planning-overhead metric.
+        The dashboard's Marcus swim lane, skewing the planning-overhead metric.
         """
         creator = _make_creator()
         tasks = [_make_task("task-1", "Build Widget")]

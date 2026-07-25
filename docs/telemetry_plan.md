@@ -714,7 +714,7 @@ coordination_event = {
   "features": {
     "kanban_integration_enabled": true,
     "ai_task_decomposition": true,
-    "cato_dashboard": false,
+    "dashboard_enabled": false,
     "custom_agent_types": 0,
     "hooks_configured": 2
   },
@@ -1152,7 +1152,7 @@ CREATE INDEX idx_data_outcome ON telemetry_events
 
 10. **Feature Adoption**:
    - MCP tool usage frequency
-   - Integration enablement rates (Kanban, Cato)
+   - Integration enablement rates (Kanban)
    - Marcus version distribution
 
 11. **System Health**:
@@ -1934,7 +1934,7 @@ async def show_telemetry_consent() -> bool:
 - Coordination quality metrics collecting accurately
 - Opt-in/opt-out flows tested
 - Documentation complete
-- Ready for Week 3 (CATO API integration)
+- Ready for Week 3 (API integration)
 
 ## Infrastructure Deployment
 
@@ -2229,7 +2229,7 @@ class TestTelemetryEndToEnd:
 
 ### Phase 3: Real-Time Streaming
 
-- **WebSocket API**: Real-time event streaming for Cato dashboard
+- **WebSocket API**: Real-time event streaming for the dashboard
 - **Event replay**: Debug agent sessions by replaying telemetry
 - **Live monitoring**: Watch active projects in real-time
 

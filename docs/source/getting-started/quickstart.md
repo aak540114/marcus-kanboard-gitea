@@ -73,18 +73,7 @@ Other useful commands:
 
 ## Step 4 — Choose a visual dashboard (optional)
 
-### Option A: Cato — real-time visualization
-
-Cato is the active Marcus dashboard. Built-in kanban board, live agent activity, board health, run history.
-
-```bash
-# In a sibling directory to marcus/
-git clone https://github.com/lwgray/cato.git
-cd cato && pip install -e . && ./cato start
-# Open http://localhost:5173
-```
-
-### Option B: Planka — drag-and-drop kanban
+### Planka — drag-and-drop kanban
 
 If you want a hosted kanban UI you can drag tasks around in. Requires Docker; Docker is **infrastructure only** (Planka + Postgres). Marcus itself still runs locally via `./marcus start`.
 
@@ -175,7 +164,7 @@ Once Marcus is running, any number of MCP-compatible agents can attach to the sa
 
 ### Posidonius — multi-run experiments and dashboards
 
-[Posidonius](https://github.com/lwgray/posidonius) is the experiment platform for launching and monitoring **multiple Marcus runs** — useful for benchmarking, parameter sweeps, or batches of independent projects. It spawns experiments, tracks them in a web UI, and feeds results back to Cato/Epictetus.
+[Posidonius](https://github.com/lwgray/posidonius) is the experiment platform for launching and monitoring **multiple Marcus runs** — useful for benchmarking, parameter sweeps, or batches of independent projects. It spawns experiments, tracks them in a web UI, and feeds results back to Epictetus.
 
 ```bash
 git clone https://github.com/lwgray/posidonius.git
@@ -203,7 +192,6 @@ When agents start working with Marcus:
 - ✅ Tasks moving through TODO → IN PROGRESS → DONE
 - ✅ Progress updates: 25%, 50%, 75%, 100%
 - ✅ Context flowing between tasks (API specs → implementation → tests)
-- ✅ If you started Cato, all of the above visible at `http://localhost:5173`
 - ✅ If you used Planka, the same flow visible at `http://localhost:3333`
 
 ## Verify everything works

@@ -115,7 +115,7 @@ class TestFirePlanningIntentFidelity:
         self, isolated_home: Path, mock_client: Any
     ) -> None:
         """The internal PLANNING_INTENT_FIDELITY event carries
-        ``project_name`` for Cato.  The PostHog forwarder MUST NOT.
+        ``project_name`` for the dashboard.  The PostHog forwarder MUST NOT.
         Signature pin so a future refactor can't silently start
         accepting (and shipping) the name.
         """

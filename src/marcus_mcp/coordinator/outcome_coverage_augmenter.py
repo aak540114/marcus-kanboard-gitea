@@ -18,7 +18,7 @@ Telemetry-key contract
 * ``coverage_after_fill`` (``Optional[Dict[str, List[str]]]``)
 * ``gap_filled_outcomes`` (``List[str]`` — outcome IDs)
 
-Cato consumers read this slice via
+Downstream consumers read this slice via
 ``decompose_result.telemetry["outcome_coverage"]``.
 """
 

@@ -180,7 +180,7 @@ The article recommends:
 1. **✅ LLMs are probabilistic** - yes, absolutely
 2. **✅ Errors compound in pipelines** - yes, critical insight
 3. **✅ Validation is essential** - yes, Marcus enforces this architecturally
-4. **✅ Production needs observability** - yes, see Cato (Marcus's dashboard)
+4. **✅ Production needs observability** - yes, see the Marcus dashboard
 5. **✅ Test-time compute helps** - yes, compatible with Marcus
 
 Where we **extend** the article:

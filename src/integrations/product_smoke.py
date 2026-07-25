@@ -272,7 +272,7 @@ class VerificationSpec:
         - ``"python -m pytest tests/test_visible_output.py -q"``
     description : str
         Short human label for audit log, error messages, and downstream
-        telemetry consumers (Cato dashboards).  Empty string is
+        telemetry consumers (the dashboard).  Empty string is
         acceptable when the agent omits it; the rejection message
         falls back to ``signal_id`` in that case.
     readiness_probe : Optional[str]

@@ -14,7 +14,7 @@
 3. [Week 2: Workspace Isolation - Phase 1](#week-2-workspace-isolation---phase-1)
 4. [Week 3: Workspace Isolation - Phase 2](#week-3-workspace-isolation---phase-2)
 5. [Week 4: Feature Context & Git Integration](#week-4-feature-context--git-integration)
-6. [Week 5: Telemetry, Research Logging & CATO Integration](#week-5-telemetry-research-logging--cato-integration)
+6. [Week 5: Telemetry, Research Logging & Dashboard Integration](#week-5-telemetry-research-logging--dashboard-integration)
 7. [Week 6: Validation, Documentation & Polish](#week-6-validation-documentation--polish)
 8. [Testing Strategy](#testing-strategy)
 9. [Deployment Checklist](#deployment-checklist)

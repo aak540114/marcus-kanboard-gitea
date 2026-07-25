@@ -217,7 +217,7 @@ Kaia: [searches architecture] For Marcus's coordination model, polling aligns be
 with the board-mediated pattern you already have — agents check the board, not push
 to each other. WebSockets add complexity and a different communication paradigm.
 Polling at 2-5s intervals gives you good responsiveness with simpler debugging.
-The only case for WebSockets: if you need sub-second UI updates for Cato.
+The only case for WebSockets: if you need sub-second UI updates for the dashboard.
 ```
 
 **Architecture review:**

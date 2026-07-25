@@ -624,7 +624,7 @@ class TestRecordEvent:
     ) -> None:
         """Re-inserting an event with the same request_id is idempotent.
 
-        Cato's dashboard polls run_ingest every 30s with a fresh ingester
+        The dashboard polls run_ingest every 30s with a fresh ingester
         whose in-memory dedup set is empty. Without DB-level dedup, every
         poll re-inserts every event and counts double silently. The
         partial UNIQUE index on request_id plus INSERT OR IGNORE
@@ -724,7 +724,7 @@ class TestRecordEvent:
         construction. The migration must short-circuit so it doesn't
         take a write lock on every startup — that's what caused
         ``OperationalError: database is locked`` against a concurrently-
-        polled Cato. Uses ``set_trace_callback`` to capture every SQL
+        polled the dashboard. Uses ``set_trace_callback`` to capture every SQL
         statement issued during init and asserts none of them is the
         dedup DELETE.
         """

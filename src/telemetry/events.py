@@ -559,7 +559,7 @@ def fire_planning_intent_fidelity(
 
     The internal event (emitted by
     ``src.integrations.nlp_tools._emit_planning_intent_fidelity_event``)
-    carries ``project_name`` for Cato.  This forwarder accepts
+    carries ``project_name`` for downstream consumers.  This forwarder accepts
     everything BUT ``project_name`` — the function signature is the
     regression net that prevents accidentally shipping the name.
 

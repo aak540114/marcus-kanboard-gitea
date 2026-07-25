@@ -38,7 +38,7 @@ Validation without criteria is hallucination with citations.
 
 Marcus coordinates: each part knows its role,
 serves the whole, and needs no reminding.
-Cato watches: nothing in any system
+The dashboard watches: nothing in any system
 should be hidden from scrutiny.
 Epictetus audits: self-examination is not optional.
 

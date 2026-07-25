@@ -239,9 +239,9 @@ async def find_optimal_task_for_agent(agent_id: str, state: Any) -> Optional[Tas
 - Rich label and project support
 - Advanced filtering and querying capabilities
 
-## Cato Integration
+## Dashboard Integration
 
-The MCP server is designed to work seamlessly with Cato, Marcus's deployment companion:
+The MCP server is designed to work seamlessly with the dashboard:
 
 ### Service Discovery
 ```python
@@ -258,8 +258,8 @@ Client detection happens inside the `ping()` function in `src/marcus_mcp/tools/s
 
 ```python
 # Automatic client identification (inside ping())
-if "cato" in echo_lower:
-    client_type = "cato"
+if "seneca" in echo_lower:
+    client_type = "seneca"
 elif "claude" in echo_lower or "desktop" in echo_lower:
     client_type = "claude_desktop"
 ```

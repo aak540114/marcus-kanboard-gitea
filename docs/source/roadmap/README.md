@@ -12,7 +12,7 @@ For full detail and weekly updates, see the [canonical ROADMAP](https://github.c
 
 ## How Marcus is positioned today
 
-Marcus is a board-mediated multi-agent coordination platform. The orchestration server is MIT-licensed and free forever. Sibling products (Cato dashboard, Posidonius experiment platform, Epictetus grader) are open-source and modular — install only what you need.
+Marcus is a board-mediated multi-agent coordination platform. The orchestration server is MIT-licensed and free forever. Sibling products (Posidonius experiment platform, Epictetus grader) are open-source and modular — install only what you need.
 
 The long-term commercial vision (Build Kits, marketplace, federation) is documented in the canonical roadmap but rescoped to research-first milestones for the current phase: NeurIPS 2026 coordination-tax submission, validated experiments, contributor growth.
 

@@ -403,14 +403,14 @@ While the Memory system is board-agnostic, it can adapt to different board types
 2. **Sprint Boards**: Learn velocity and burndown patterns
 3. **Custom Workflows**: Adapt to board-specific state transitions
 
-## Cato Integration
+## Dashboard Integration
 
-The Memory system is designed to integrate with Cato (Marcus's reasoning engine):
+The Memory system is designed to integrate with downstream consumers:
 
 1. **Context Provider**: Supplies historical context for decisions
 2. **Constraint Input**: Provides performance constraints for optimization
-3. **Feedback Loop**: Learns from Cato's assignment outcomes
-4. **Prediction Enhancement**: Cato can override Memory predictions with reasoning
+3. **Feedback Loop**: Learns from downstream assignment outcomes
+4. **Prediction Enhancement**: Downstream consumers can override Memory predictions with reasoning
 
 ## Technical Excellence
 

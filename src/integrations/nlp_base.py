@@ -185,7 +185,7 @@ class NaturalLanguageTaskCreator(ABC):
                     )
 
                 # Snapshot the kanban task's human name into costs.db so the
-                # Cato dashboard can render real names in "Tokens by task"
+                # dashboard can render real names in "Tokens by task"
                 # instead of opaque hex IDs (Marcus #530). Lives in the
                 # shared task-creation method so BOTH create_project and
                 # add_feature flows are covered automatically — Codex P2 on
@@ -282,9 +282,9 @@ class NaturalLanguageTaskCreator(ABC):
         if update_dependencies and created_tasks:
             await self._remap_dependencies(tasks, created_tasks)
             # After remap, update the task_metadata rows in marcus.db
-            # so Cato sees the real UUIDs (not the synthetic slug IDs
+            # so the dashboard sees the real UUIDs (not the synthetic slug IDs
             # that were written during the per-task creation loop
-            # above). Without this, Cato's dependency graph contains
+            # above). Without this, the dashboard's dependency graph contains
             # unresolvable slug references and no edges render.
             await self._update_task_metadata_dependencies(created_tasks)
 
@@ -307,8 +307,8 @@ class NaturalLanguageTaskCreator(ABC):
         dependency IDs. After ``_remap_dependencies`` converts those
         to real kanban UUIDs, the in-memory ``created_tasks`` have
         correct dependencies but the ``task_metadata`` rows in
-        marcus.db still contain the slugs. Cato reads
-        ``task_metadata.dependencies`` for its graph so the slugs
+        marcus.db still contain the slugs. Downstream consumers read
+        ``task_metadata.dependencies`` for the graph so the slugs
         produce unresolvable edges.
 
         This helper re-reads each task_metadata row, patches the
@@ -337,7 +337,7 @@ class NaturalLanguageTaskCreator(ABC):
         except Exception as e:
             logger.warning(
                 f"Failed to initialize persistence for task_metadata "
-                f"dependency update (Cato edges may not render): {e}"
+                f"dependency update (dashboard edges may not render): {e}"
             )
             return
 

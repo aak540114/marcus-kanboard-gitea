@@ -21,7 +21,7 @@ Design
    keyword scan is kept only as a non-fatal fallback when this call fails.
 3. check_spec_coverage     — orchestrates 1+2 and returns gap Task objects.
 
-Gap tasks are labeled ``spec_gap`` so Cato and agents can distinguish them
+Gap tasks are labeled ``spec_gap`` so the dashboard and agents can distinguish them
 from normal decomposed tasks. They are inserted into safe_tasks before
 board creation so all agents see them.
 """
@@ -285,7 +285,7 @@ async def check_spec_coverage(
 
     Notes
     -----
-    Gap tasks carry the ``spec_gap`` label so Cato's display role
+    Gap tasks carry the ``spec_gap`` label so the dashboard's display role
     classifier can distinguish them from normal decomposed tasks.
     """
     try:

@@ -96,7 +96,7 @@ class TestApplyMergeFailureToUpdateData:
         """``completed_at`` must be cleared — the task is NOT completed.
 
         Leaving ``completed_at`` populated alongside BLOCKED status
-        would corrupt downstream telemetry (Cato's "completion
+        would corrupt downstream telemetry (the dashboard's "completion
         latency" metrics, etc.) and make audits inconsistent.
         """
         from src.marcus_mcp.tools.task import _apply_merge_failure_to_update_data

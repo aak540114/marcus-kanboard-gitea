@@ -12,7 +12,7 @@ state with nothing on screen.
 Snake-v32 expectation: the outcome-coverage pipeline catches the
 missing rendering task at planning time and synthesizes a gap-fill
 task.  The orchestrator emits a ``PLANNING_INTENT_FIDELITY`` event so
-Cato can surface intent fidelity alongside its other planning swim
+the dashboard can surface intent fidelity alongside its other planning swim
 lanes.
 
 This test exercises the full chain through
@@ -25,7 +25,7 @@ This test exercises the full chain through
 
 Per Kaia's Phase 6 design: assert on the *event payload*, not just
 the augmented task list — that's what locks the wire from the typed
-``TaskGenerationResult`` fields all the way to the Cato-bound event.
+``TaskGenerationResult`` fields all the way to the dashboard-bound event.
 """
 
 from __future__ import annotations
@@ -289,12 +289,12 @@ class TestSnakeV32IntentFidelity:
     async def test_planning_intent_fidelity_event_emitted_with_payload(
         self, monkeypatch: Any
     ) -> None:
-        """The full wire from coverage pipeline to Cato-bound event.
+        """The full wire from coverage pipeline to dashboard-bound event.
 
         Phase 5 emission verified end-to-end (not just at the helper
         seam).  This pins the event payload shape so a future refactor
         renaming a ``TaskGenerationResult`` field would fail this test
-        rather than silently breaking Cato telemetry.
+        rather than silently breaking dashboard telemetry.
         """
         monkeypatch.setenv(ENV_VAR_NAME, "true")
 
@@ -353,7 +353,7 @@ class TestSnakeV32IntentFidelity:
         coverage check would report full coverage on its first call
         and the pipeline would short-circuit — no gap-fill, no
         recoverage, no synthesized tasks.  Score = 1.0 and event
-        still fires (Cato wants the always-1.0 datapoints too).
+        still fires (the dashboard wants the always-1.0 datapoints too).
         """
         monkeypatch.setenv(ENV_VAR_NAME, "true")
 

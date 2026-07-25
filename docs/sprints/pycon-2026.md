@@ -51,7 +51,6 @@ A single-glance map of every dish on the menu. Click an issue number to jump to 
 | [#241](#241--scaffold-jira-kanban-provider-with-kanbaninterface-stub) | Scaffold Jira kanban provider stub | 2–3 hr | ✨ integration |
 | [#244](#244--write-how-to-add-a-new-mcp-tool-developer-guide) | Write "How to add a new MCP tool" guide | 60–90 min | 📘 docs |
 | [#264](#264--persist-ai-config-at-startup-for-accurate-status-reporting) | Persist AI config at startup for `marcus status` | 1.5–2.5 hr | 🐛 bug |
-| [#284](#284--fix-cato-board-view-doesnt-match-marcus-kanban-board) | Fix Cato board view doesn't match Marcus | 1.5–2.5 hr | 🐛 bug |
 | [#324](#324--gate-full-test-suite-ci-job-on-push-to-main--nightly) | Gate `full-test-suite` CI on push to main + nightly | 1–1.5 hr | 🚦 CI |
 | [#382](#382--auto-select-decomposer-strategy) | Auto-select decomposer strategy | 2–3 hr | ✨ feature |
 | [#383](#383--synthetic-agent-for-ci-and-runner-validation) | Synthetic agent for CI and runner validation | 2.5–3 hr | 🧪 test |
@@ -65,7 +64,6 @@ A single-glance map of every dish on the menu. Click an issue number to jump to 
 | [#255](#255--backpropagation-style-blame-attribution) | Backpropagation-style blame attribution | 4–6 hr | 🧠 research |
 | [#312](#312--make-pip-install-marcus-ai-a-complete-install-path) | Make `pip install marcus-ai` a complete install path | 4–6 hr | 📦 packaging |
 | [#338](#338--generative-validator-llm-produces-verification-code) | Generative validator (LLM writes verification code) | 5–8 hr | 🧠 research |
-| [#378](#378--catos-living-architecture-diagram-with-gif-export) | Cato Living Architecture Diagram with GIF export | 5–8 hr | 🎨 build |
 
 ### 🌙 Night Cap — open-ended bonus issues
 
@@ -460,26 +458,6 @@ if result and hasattr(result, "content"):
 
 ---
 
-### #284 · Fix Cato board view doesn't match Marcus kanban board
-
-**Context.** The board view in Cato (the Marcus dashboard) doesn't visually match the Marcus kanban board: column names, task card fields, and status labels differ between the two views. During demos, audiences see two different representations of the same project — damaging trust.
-
-Marcus's canonical column names and order: `TODO → IN_PROGRESS → DONE` (plus `BLOCKED`).
-
-**Where to look**
-- `~/dev/cato/` — Cato dashboard repo
-- `src/core/models.py` — canonical `TaskStatus` enum
-
-**Acceptance criteria**
-- [ ] Cato board columns use the same names + order as Marcus
-- [ ] Task card fields match (title, assignee, status, labels)
-- [ ] A status change in Marcus appears correctly in Cato on next refresh
-- [ ] No browser console errors when the board view loads
-
-**Estimate:** 1.5–2.5 hr
-
----
-
 ### #324 · Gate `full-test-suite` CI job on push to main + nightly
 
 **Context.** The `full-test-suite` job in `.github/workflows/tests.yml:211–217` only triggers on `schedule` (nightly) or `workflow_dispatch`. Every other CI job uses `pytest -m unit` which runs only marker-tagged tests; unmarked tests in `tests/unit/` slip through silently. PRs can merge with a green check while the full suite is red — and historically have, for 100+ consecutive days.
@@ -618,21 +596,6 @@ Marcus's canonical column names and order: `TODO → IN_PROGRESS → DONE` (plus
 
 ---
 
-### #378 · Cato's Living Architecture Diagram with GIF export
-
-**Context.** Add an "Architecture" view to Cato showing Marcus as a living 8-layer system diagram with animated particles flowing between layers as real MCP events fire. Not a static poster — the data is live. GIF export captures a real working session as shareable social proof.
-
-**Acceptance criteria**
-- [ ] Architecture view added to Cato navigation
-- [ ] 8-layer diagram rendered with layer labels matching Marcus docs
-- [ ] Particles animate on live MCP event stream (SSE or WebSocket)
-- [ ] GIF export: captures 10-second session clip
-- [ ] Works without active experiment (static fallback)
-
-**Estimate:** 5–8 hr
-
----
-
 ## 🌙 Night Cap — Late-night bonus issues
 
 *Ambitious explorations. Bring coffee. No pressure to finish at the sprint.*
@@ -654,8 +617,8 @@ Marcus's canonical column names and order: `TODO → IN_PROGRESS → DONE` (plus
 | Tier | Count | Time | Good for |
 |---|---|---|---|
 | 🥗 Appetizer | 9 | 15–45 min | First-time contributors, docs writers |
-| 🍝 Main Course | 13 | 1–2.5 hr | Developers comfortable reading Python |
-| 🍮 Dessert | 6 | 3+ hr | Experienced contributors |
+| 🍝 Main Course | 12 | 1–2.5 hr | Developers comfortable reading Python |
+| 🍮 Dessert | 5 | 3+ hr | Experienced contributors |
 | 🌙 Night Cap | 7 | Open-ended | "I want to go deep" |
 
 **All sprint issues:** [`pycon_2026` label](https://github.com/lwgray/marcus/issues?q=is%3Aopen+label%3Apycon_2026)

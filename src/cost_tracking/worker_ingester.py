@@ -6,7 +6,7 @@ each run a Claude Code CLI subprocess that writes a session log to
 ``~/.claude/projects/<dir>/<session-id>.jsonl``. Every assistant turn lands
 as a JSON record carrying a ``message.usage`` block with input / cache /
 output token counts. This module ingests those logs into the Marcus cost
-store so the Cato dashboard can display per-agent / per-task / per-turn
+store so the dashboard can display per-agent / per-task / per-turn
 spend alongside the planner-side data captured in
 :mod:`src.cost_tracking.cost_recorder`.
 

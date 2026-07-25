@@ -1294,26 +1294,26 @@ The hybrid dependency approach was chosen to balance competing requirements:
 - **Regulatory compliance dependencies** for different domains and regions
 - **Custom workflow generation** for unique organizational processes and methodologies
 
-## Integration with Cato (Learning System)
+## Integration with the Learning System
 
 ### Current Status
 
-**Minimal Direct Integration**: The current dependency system has limited integration with Cato, but the architecture supports future enhancement:
+**Minimal Direct Integration**: The current dependency system has limited integration with the organizational learning system, but the architecture supports future enhancement:
 
 ```python
-# Future Cato integration architecture
-class CatoEnhancedDependencyInferer(HybridDependencyInferer):
-    def __init__(self, cato_client: Optional[CatoClient] = None):
+# Future learning system integration architecture
+class LearningEnhancedDependencyInferer(HybridDependencyInferer):
+    def __init__(self, learning_client: Optional[LearningSystemClient] = None):
         super().__init__()
-        self.cato = cato_client
+        self.learning_system = learning_client
 
     async def infer_dependencies(self, tasks: List[Task]) -> DependencyGraph:
         # Get base hybrid inference
         base_graph = await super().infer_dependencies(tasks)
 
-        # Enhance with Cato organizational learning
-        if self.cato:
-            learned_patterns = await self.cato.get_dependency_patterns(
+        # Enhance with organizational learning
+        if self.learning_system:
+            learned_patterns = await self.learning_system.get_dependency_patterns(
                 project_type=self.context.project_type,
                 tech_stack=self.context.tech_stack,
                 team_size=self.context.team_size
@@ -1324,7 +1324,7 @@ class CatoEnhancedDependencyInferer(HybridDependencyInferer):
         return base_graph
 ```
 
-### Planned Cato Integrations
+### Planned Learning System Integrations
 
 #### 1. Organizational Pattern Learning
 - **Successful project analysis** to identify effective dependency structures
@@ -1350,6 +1350,6 @@ The Task Dependency System represents a sophisticated approach to project coordi
 
 The system's multi-layered safety approach, from mandatory dependency patterns to circular dependency detection, ensures that Marcus can confidently coordinate distributed AI agents without human oversight. Its hybrid intelligence strategy optimizes for both performance and accuracy, making it practical for production use across projects of varying complexity.
 
-As the system evolves with Cato integration and organizational learning capabilities, it will become increasingly valuable as a cornerstone of intelligent project management, transforming Marcus from a simple task dispatcher into a sophisticated project coordination platform that understands and adapts to each team's unique workflow patterns.
+As the system evolves with deeper learning system integration and organizational learning capabilities, it will become increasingly valuable as a cornerstone of intelligent project management, transforming Marcus from a simple task dispatcher into a sophisticated project coordination platform that understands and adapts to each team's unique workflow patterns.
 
 The dependency system's emphasis on safety, performance, and adaptability makes it well-suited for the dynamic requirements of AI-powered development teams, where project complexity and coordination challenges continue to grow. By providing reliable dependency intelligence with graceful degradation and comprehensive error handling, it enables confident scaling of distributed AI development workflows.

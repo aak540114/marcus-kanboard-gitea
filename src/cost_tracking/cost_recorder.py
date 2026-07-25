@@ -51,7 +51,7 @@ def canonical_project_id(project_id: Optional[str]) -> Optional[str]:
     (created via auto-discovery) and the ``.hex`` path is the
     cheapest to keep consistent — ProjectRegistry's dashed strings
     just lose their dashes here. Dashboard joins against the cost DB
-    therefore always operate on the dashless form; Cato's name
+    therefore always operate on the dashless form; the dashboard's name
     overlay reads projects.json and indexes both forms so name
     resolution still works for either source.
 
@@ -155,7 +155,7 @@ class CostRecorder:
         # contract requires callers to serialize) while keeping them OFF
         # the event loop. The store's sqlite connection is synchronous
         # with busy_timeout=5000 and a documented cross-process contender
-        # (Cato sweeps the same DB every 30 s) — a write issued directly
+        # (the dashboard sweeps the same DB every 30 s) — a write issued directly
         # from async provider code can spin inside the busy-timeout for
         # up to 5 s per statement, freezing every coroutine in the
         # server. See _submit_write.

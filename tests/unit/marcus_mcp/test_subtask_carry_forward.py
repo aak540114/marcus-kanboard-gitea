@@ -9,7 +9,7 @@ they stop bloating memory and churning the dependency-inference cache
 signature on the ``request_next_task`` hot path.
 
 This helper trims the in-memory list ONLY — the durable record in
-``data/marcus_state/subtasks.json`` (which Cato reads directly as its
+``data/marcus_state/subtasks.json`` (which the dashboard reads directly as its
 subtask data source) is never touched. See issue #672 for the proper
 fix (move subtask storage into the database).
 """

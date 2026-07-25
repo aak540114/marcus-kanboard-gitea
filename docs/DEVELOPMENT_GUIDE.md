@@ -22,8 +22,8 @@ environment, lets AI coding agents (Claude, Cursor, Codex, etc.) pull
 tasks via MCP, and coordinates dependencies, parallel work, and recovery.
 Greenfield (new project from scratch) is the supported mode today;
 brownfield (existing repos) is on the post-v0.5 roadmap. Marcus is one
-piece of a small platform that also includes Cato (visualization) and
-Posidonius (experiment runner) as sibling repositories.
+piece of a small platform that also includes Posidonius (experiment
+runner) as a sibling repository.
 
 ---
 
@@ -46,14 +46,6 @@ pip install -e .
 
 # 5. Stop
 ./marcus stop
-```
-
-For the visual dashboard, install Cato as a sibling repo:
-
-```bash
-cd ~/dev
-git clone https://github.com/lwgray/cato.git
-cd cato && pip install -e . && ./cato start
 ```
 
 For experiment runs with multiple agents in tmux:
@@ -117,7 +109,7 @@ In order:
 
 1. **#414 — SQLite migration for all data streams** — unifies seven
    file-based JSONL/JSON streams under one queryable store. Unblocks
-   Cato multi-path work.
+   dashboard multi-path work.
 2. **#416 — PostHog telemetry (PyCon 2026 sprint)** — opt-in
    anonymized usage analytics. **Sprinters get first pick** — flag the
    issue before working it solo.
@@ -149,14 +141,14 @@ Surfaced from post-mortems and Kaia architectural reviews:
 |---|---|---|---|
 | 1 | Configuration polish (last 20%) | In progress | `src/config/marcus_config.py`, `src/config/settings.py` |
 | 2 | `UserJourneyTracker` — log user-journey milestones | Not started | Will live under `src/telemetry/` |
-| 3 | Global tab cross-project metrics endpoint | Not started | Lives in Cato; Marcus may need a small helper |
+| 3 | Global tab cross-project metrics endpoint | Not started | Lives in the dashboard; Marcus may need a small helper |
 
 ### Background research workstream
 
 - **Coordination tax experiments** (NeurIPS 2026) — 24-PRD test suite
   infrastructure (commit 2801ea6d).
 - **Epictetus coordination-effectiveness audit** (#263) — automated
-  grading of agent performance, surfaced in Cato's Quality dashboard.
+  grading of agent performance, surfaced in the dashboard's Quality view.
 - **Validation hardening** (#421, #337) — citation-backed validation,
   hallucination elimination, retry ceilings.
 
@@ -177,7 +169,6 @@ see `docs/Playbook.md`.
 | Error framework + retry/circuit-breaker patterns | `CLAUDE.md` → ERROR_HANDLING_FRAMEWORK |
 | Test placement decision tree | `CLAUDE.md` → TEST_WRITING_INSTRUCTIONS |
 | Public docs + getting started | https://marcus-ai.dev and `README.md` |
-| Architecture deep dive | `docs/CATO/` (some are stale — sanity-check against code) |
 | The proposed unified desktop app | Issue [#443](https://github.com/lwgray/marcus/issues/443) and Discussion [#444](https://github.com/lwgray/marcus/discussions/444) |
 | The previous 8-week curriculum plan | `docs/archive/DEVELOPMENT_GUIDE_2025_12_8wk_plan.md` |
 
@@ -188,7 +179,6 @@ see `docs/Playbook.md`.
 | Repo | Path | Role | Transport |
 |---|---|---|---|
 | **Marcus** | `~/dev/marcus` | MCP orchestration server | MCP — stdio + HTTP `:4298` |
-| **Cato** | `~/dev/cato` | Real-time visualization dashboard | FastAPI + React `:4301` |
 | **Posidonius** | `~/dev/posidonius` | Multi-agent experiment runner with MLflow tracking | FastAPI + xterm.js `:8420` |
 | `/marcus` skill | `~/.claude/skills/marcus` | Spawns Marcus experiments from Claude Code | n/a |
 | `/epictetus` skill | `~/.claude/skills/epictetus` | Audits / grades a finished project | n/a |
@@ -204,4 +194,4 @@ into a single installable application is proposed in issue
 1. Search the [issue tracker](https://github.com/lwgray/marcus/issues) — there's a strong chance you're not the first to hit it.
 2. Check the [Discussions](https://github.com/lwgray/marcus/discussions) board — strategic conversations live there, code questions in issues.
 3. Read `CLAUDE.md` — most "how do I do X in Marcus" questions are answered there.
-4. If the doc you're following references a file that doesn't exist or a command that doesn't work, that doc is stale — open a quick PR or issue. Many `docs/CATO/` and `docs/implementation/` files were written against an earlier plan that has since shifted.
+4. If the doc you're following references a file that doesn't exist or a command that doesn't work, that doc is stale — open a quick PR or issue. Many `docs/implementation/` files were written against an earlier plan that has since shifted.

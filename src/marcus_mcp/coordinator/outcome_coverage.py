@@ -1279,7 +1279,7 @@ def _coverage_to_telemetry(
     Keys are pinned to the event payload at
     ``src/integrations/nlp_tools.py:396-399``:
     ``intent_fidelity_score``, ``coverage_before_fill``,
-    ``coverage_after_fill``, ``gap_filled_outcomes``.  Cato consumers
+    ``coverage_after_fill``, ``gap_filled_outcomes``.  Downstream consumers
     read this slice via ``result.telemetry["outcome_coverage"]``.
     """
     return {

@@ -573,7 +573,7 @@ class TestEventLoopOffload:
     """Store writes must never run on a live event loop's thread.
 
     CostStore's sqlite connection is synchronous with busy_timeout=5000
-    and a documented cross-process contender (Cato's 30 s sweeps of the
+    and a documented cross-process contender (the dashboard's 30 s sweeps of the
     same DB) — a write issued directly from async provider code can spin
     inside the busy-timeout for up to 5 s per statement, freezing every
     coroutine in the server. Writes made while a loop is running are

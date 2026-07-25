@@ -261,7 +261,7 @@ class TestCheckSpecCoverage:
 
     @pytest.mark.asyncio
     async def test_gap_task_has_correct_labels(self) -> None:
-        """Gap tasks are labeled spec_gap so Cato/agents recognize them."""
+        """Gap tasks are labeled spec_gap so the dashboard/agents recognize them."""
         with patch(
             "src.integrations.spec_coverage.extract_spec_features",
             new_callable=AsyncMock,

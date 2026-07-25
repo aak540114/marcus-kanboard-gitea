@@ -18,8 +18,8 @@
 
 **Current Status:**
 ```
-✅ Marcus:  0.1.3.1 (synced with git tags)
-✅ Cato:    0.1.1 (aligned with Marcus)
+✅ Marcus:    0.1.3.1 (synced with git tags)
+✅ Dashboard: 0.1.1 (aligned with Marcus)
 ✅ CHANGELOG.md created
 ✅ Version bump automation created
 ✅ GitHub Action gates created
@@ -178,24 +178,24 @@ v0.2.1
 
 ---
 
-## 🔗 Marcus + Cato Coordination
+## 🔗 Marcus + Dashboard Coordination
 
 **Rule:** Independent versioning with compatibility notes.
 
-Marcus and Cato version independently based on their own changes.
+Marcus and the dashboard version independently based on their own changes.
 Changes in one don't always require changes in the other — forcing
 coupled versions creates phantom releases and release friction.
 
 **Compatibility:**
 - Each repo's README notes minimum compatible version of the other
-- Example: "Cato 0.3.0 requires Marcus >= 0.3.0" (for quality_assessments)
+- Example: "Dashboard 0.3.0 requires Marcus >= 0.3.0" (for quality_assessments)
 - MAJOR version stays in sync for the "production-ready" signal (1.0)
 
 **Examples:**
-- Marcus 0.3.1 + Cato 0.3.0 ✅ (Marcus patch, Cato new features)
-- Marcus 0.3.1 + Cato 0.2.1 ✅ (Cato works without Quality tab)
-- Marcus 0.4.0 + Cato 0.3.0 ✅ (Cato still compatible)
-- Marcus 1.0.0 + Cato 1.0.0 ✅ (coordinate MAJOR for stability signal)
+- Marcus 0.3.1 + Dashboard 0.3.0 ✅ (Marcus patch, dashboard new features)
+- Marcus 0.3.1 + Dashboard 0.2.1 ✅ (dashboard works without Quality tab)
+- Marcus 0.4.0 + Dashboard 0.3.0 ✅ (dashboard still compatible)
+- Marcus 1.0.0 + Dashboard 1.0.0 ✅ (coordinate MAJOR for stability signal)
 
 ---
 
@@ -383,7 +383,7 @@ git push origin develop
 1. ✅ **Only version when merging to `main`**
 2. ✅ **Use `./scripts/bump-version.sh`** (automates everything)
 3. ✅ **GitHub Action enforces rules** (can't forget)
-4. ✅ **Keep Cato aligned with Marcus**
+4. ✅ **Keep the dashboard aligned with Marcus**
 
 ### **Quick Commands:**
 ```bash

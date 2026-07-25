@@ -23,7 +23,7 @@ caller gets the same defense:
   giving up.
 * Bail out fast on schema drift / non-truncation parse failures —
   more tokens won't fix those.
-* Emit a structured warning when retry triggers so Cato can graph
+* Emit a structured warning when retry triggers so the dashboard can graph
   retry frequency per operation.
 * Hard-cap prompt length to bound cost on runaway inputs.
 """

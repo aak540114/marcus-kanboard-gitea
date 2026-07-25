@@ -55,7 +55,6 @@
       font-family: 'SF Mono', 'Courier New', monospace;
     }
     .repo-badge.core  { background: #111; color: #fff; }
-    .repo-badge.cato  { background: #444; color: #fff; border-color: #444; }
     .repo-badge.pos   { background: #888; color: #fff; border-color: #888; }
     .repo-legend {
       margin-left: auto;
@@ -391,9 +390,8 @@
   <div class="repo-strip">
     <span class="label">Repos</span>
     <span class="repo-badge core">lwgray/marcus</span>
-    <span class="repo-badge cato">lwgray/cato</span>
     <span class="repo-badge pos">lwgray/posidonius</span>
-    <span class="repo-legend">■ core &nbsp; ■ cato &nbsp; ■ posidonius</span>
+    <span class="repo-legend">■ core &nbsp; ■ posidonius</span>
   </div>
 
   <!-- ══ LAYER 1 — ENTRY POINTS ═══════════════════════════════ -->
@@ -576,19 +574,7 @@
       <span class="lh-desc">See what agents did, how fast, and how well</span>
     </div>
     <div class="layer-body">
-      <div class="comp-row cols-3">
-
-        <div class="comp-card">
-          <div class="comp-name">Cato <span class="repo-badge cato" style="font-size:8px;padding:1px 5px;">lwgray/cato</span></div>
-          <div class="comp-sub">Real-time kanban visualization. 5 view modes. WebSocket live updates. Reads marcus.db directly.</div>
-          <div class="comp-addr">localhost:5173</div>
-          <div class="tech-row">
-            <span class="tech-pill">FastAPI</span>
-            <span class="tech-pill">React</span>
-            <span class="tech-pill">TypeScript</span>
-            <span class="tech-pill">Node 18+</span>
-          </div>
-        </div>
+      <div class="comp-row cols-2">
 
         <div class="comp-card">
           <div class="comp-name">MLflow</div>
@@ -644,7 +630,6 @@
           <li><span class="req">Claude Code</span><span>required for /marcus skill</span></li>
           <li><span class="req">Anthropic key</span><span>or OpenAI / Ollama (free)</span></li>
           <li><span class="req">Git</span><span>required</span></li>
-          <li><span class="req">Node 18+</span><span class="opt-note">Cato frontend only</span></li>
           <li><span class="req">Docker</span><span class="opt-note">Planka kanban only</span></li>
           <li><span class="req">black · isort · mypy</span><span class="opt-note">code style CI</span></li>
           <li><span class="req">pytest</span><span class="opt-note">test suite</span></li>
@@ -659,11 +644,10 @@
         <ul class="contrib-list">
           <li><span class="contrib-num">1</span><div><strong>Kanban Providers</strong> — Jira, Trello, Notion<br><span style="color:#666;font-size:9.5px;">src/marcus_mcp/handlers/project.py</span></div></li>
           <li><span class="contrib-num">2</span><div><strong>Agent Runners</strong> — Codex, Gemini, AutoGen<br><span style="color:#666;font-size:9.5px;">dev-tools/experiments/runners/ · PROTOCOL.md</span></div></li>
-          <li><span class="contrib-num">3</span><div><strong>Cato UI</strong> — views, charts, dark mode<br><span style="color:#666;font-size:9.5px;">lwgray/cato · React + TypeScript</span></div></li>
-          <li><span class="contrib-num">4</span><div><strong>Posidonius</strong> — metrics, auto-advance<br><span style="color:#666;font-size:9.5px;">lwgray/posidonius · FastAPI + Python</span></div></li>
-          <li><span class="contrib-num">5</span><div><strong>MCP Tools</strong> — new coordination tools<br><span style="color:#666;font-size:9.5px;">src/marcus_mcp/handlers/</span></div></li>
-          <li><span class="contrib-num">6</span><div><strong>Decomposers</strong> — new task strategies<br><span style="color:#666;font-size:9.5px;">src/marcus_mcp/coordinator/</span></div></li>
-          <li><span class="contrib-num">7</span><div><strong>Docs &amp; Tutorials</strong> — use cases, guides<br><span style="color:#666;font-size:9.5px;">docs/source/ · marcus-ai.dev</span></div></li>
+          <li><span class="contrib-num">3</span><div><strong>Posidonius</strong> — metrics, auto-advance<br><span style="color:#666;font-size:9.5px;">lwgray/posidonius · FastAPI + Python</span></div></li>
+          <li><span class="contrib-num">4</span><div><strong>MCP Tools</strong> — new coordination tools<br><span style="color:#666;font-size:9.5px;">src/marcus_mcp/handlers/</span></div></li>
+          <li><span class="contrib-num">5</span><div><strong>Decomposers</strong> — new task strategies<br><span style="color:#666;font-size:9.5px;">src/marcus_mcp/coordinator/</span></div></li>
+          <li><span class="contrib-num">6</span><div><strong>Docs &amp; Tutorials</strong> — use cases, guides<br><span style="color:#666;font-size:9.5px;">docs/source/ · marcus-ai.dev</span></div></li>
         </ul>
       </div>
     </div>

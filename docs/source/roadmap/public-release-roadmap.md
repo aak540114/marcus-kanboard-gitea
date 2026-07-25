@@ -38,7 +38,7 @@
 | **Future Sight** (2) | `predict_completion_time`, `predict_blockage_probability` | "When will we finish?" |
 | **Quick Start** (2) | `create_project`, `authenticate` | "Set up in 5 minutes" |
 
-#### **MVP Dashboard (Cato)**
+#### **MVP Dashboard**
 1. **Project Health Card** - Status, progress %, team overview, timeline prediction
 2. **Smart Task Queue** - AI-recommended next tasks for you
 3. **Agent Dashboard** - Your AI agents' progress and status
@@ -113,7 +113,7 @@ Labels:
 - priority: critical, high, medium, low
 - type: bug, feature, enhancement, documentation
 - status: needs-triage, in-progress, blocked, ready-for-review
-- component: marcus, cato, docs, ci/cd
+- component: marcus, docs, ci/cd
 - phase: mvp, phase-2, phase-3, phase-4
 ```
 
@@ -160,13 +160,11 @@ jobs:
       - name: Build Docker Images
         run: |
           docker build -t marcus:${{ github.sha }} ./marcus
-          docker build -t cato:${{ github.sha }} ./cato
 
       - name: Push to Registry
         if: github.ref == 'refs/heads/main'
         run: |
           docker push marcus:${{ github.sha }}
-          docker push cato:${{ github.sha }}
 
   deploy:
     needs: build
@@ -186,7 +184,7 @@ jobs:
 |-----------|----------------|---------|
 | **Unit Tests** | 80% minimum | Component correctness |
 | **Integration Tests** | Critical workflows | End-to-end functionality |
-| **API Tests** | All 51 endpoints | Marcus-Cato communication |
+| **API Tests** | All 51 endpoints | Marcus-dashboard communication |
 | **Performance Tests** | Key scenarios | < 2s response time |
 | **Security Tests** | Auth/access control | Prevent vulnerabilities |
 | **User Acceptance Tests** | Core user journeys | User experience validation |
@@ -197,7 +195,7 @@ jobs:
 ```gherkin
 Feature: New User Onboarding
   Scenario: First-time user gets value quickly
-    Given: Fresh Marcus + Cato installation
+    Given: Fresh Marcus installation
     When: User follows quickstart guide
     Then: Dashboard shows project status in < 5 minutes
     And: First task assignment works correctly
@@ -308,7 +306,7 @@ Feature: System Reliability
 
 4. **Plugin Development**
    - Extending Marcus with custom tools
-   - Creating new Cato dashboard components
+   - Creating new dashboard components
    - Provider development (Kanban, etc.)
    - Hook system usage
 
@@ -417,7 +415,7 @@ Feature: System Reliability
 
 #### **Weeks 3-6: MVP Development**
 - [ ] 18 MVP tools implemented and tested
-- [ ] Core Cato dashboard functional
+- [ ] Core dashboard functional
 - [ ] 5-minute onboarding flow works
 - [ ] Alpha testing with 3 internal teams
 
@@ -503,7 +501,7 @@ Feature: System Reliability
 
 ## 🎉 Vision: 6 Months After Launch
 
-**Marcus + Cato is the go-to solution for teams who want intelligent project management without complexity.**
+**Marcus is the go-to solution for teams who want intelligent project management without complexity.**
 
 **Success Looks Like**:
 - **5,000+ active installations** across diverse projects

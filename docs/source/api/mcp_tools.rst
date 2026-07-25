@@ -5,7 +5,7 @@ Marcus implements MCP (Model Context Protocol) server tools that AI agents
 and human operators use to coordinate and execute tasks.
 
 Tools are role-restricted: **agent tools** are available to coding agents;
-**human tools** are available to human operators and Cato. Both sets are
+**human tools** are available to human operators and the dashboard. Both sets are
 available to authenticated clients with the ``human`` role.
 
 Agent Tools
@@ -82,7 +82,7 @@ Project Monitoring
 Human Operator Tools
 --------------------
 
-These tools are available to human operators (Cato, CLI) but **not** to coding agents.
+These tools are available to human operators (dashboard, CLI) but **not** to coding agents.
 
 Agent Administration
 ~~~~~~~~~~~~~~~~~~~~

@@ -291,7 +291,7 @@ sqlite3 ${MARCUS_ROOT}/data/kanban.db "
   WHERE t1.project_id = '${PROJECT_ID}'
 "
 
-# Task timeline from Cato API (if available)
+# Task timeline from the dashboard API (if available)
 curl -s http://localhost:4301/api/tasks/${TASK_ID}/conversation
 ```
 

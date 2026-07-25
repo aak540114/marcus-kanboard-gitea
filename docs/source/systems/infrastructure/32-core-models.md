@@ -343,9 +343,9 @@ Models abstract away provider-specific details:
 
 ## Integration Points
 
-### Cato Integration
+### Dashboard Integration
 
-Currently, the Core Models system does not have direct Cato integration, as Cato appears to be a future enhancement. However, the models are designed to support AI coaching systems through:
+Currently, the Core Models system does not have direct dashboard integration, as this appears to be a future enhancement. However, the models are designed to support AI coaching systems through:
 
 **Context Awareness:**
 ```python
@@ -362,7 +362,7 @@ task_context = {
 - `BlockerReport` patterns for learning opportunities
 - `ProjectRisk` analysis for proactive coaching
 
-**Future Cato Integration Points:**
+**Future Dashboard Integration Points:**
 - Agent performance coaching based on `WorkerStatus` metrics
 - Task difficulty prediction using `Task` historical data
 - Risk mitigation coaching through `ProjectRisk` patterns

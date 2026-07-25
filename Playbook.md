@@ -18,7 +18,7 @@
 > - Parallel multi-instance experiment isolation (commit 0da35ed3)
 > - Epictetus coordination-effectiveness audit (#263)
 > - Validation hardening (#421, #337)
-> - Cato Quality dashboard integration
+> - Quality dashboard integration
 >
 > Months 3–4 (Build Kits / `.mkb` packaging) and Months 5–6 (Brownfield /
 > RAG over existing repos) of this Playbook are **not started** and
@@ -42,7 +42,7 @@
 >
 > | Item | Original commitment | Decision | Notes |
 > |---|---|---|---|
-> | **Build Kits system** (.mkb format, packager, customizer, validator, CLI commands, Cato browser, 10 seed kits) | Months 3–4 | **DEFER** | Spec stays as long-term direction. Strip the Months 3–4 framing — Build Kits start whenever a deliberate product push begins, not on a fixed calendar. The detailed implementation sections (Packager / Validator / Customizer code samples below in this doc) should be read as a future-work appendix, not a near-term plan. |
+> | **Build Kits system** (.mkb format, packager, customizer, validator, CLI commands, dashboard browser, 10 seed kits) | Months 3–4 | **DEFER** | Spec stays as long-term direction. Strip the Months 3–4 framing — Build Kits start whenever a deliberate product push begins, not on a fixed calendar. The detailed implementation sections (Packager / Validator / Customizer code samples below in this doc) should be read as a future-work appendix, not a near-term plan. |
 > | **Marketplace infrastructure** (agent registry, Stripe Connect, escrow, disputes, reputation, discovery, payment routing, reviews, multi-instance hire flow) | Months 5–10 | **KEEP** | Spec preserved as-is for the eventual build. Strategy and shape unchanged. Remains gated on Build Kits proving a creator economy is viable; no near-term commitment to start. |
 > | **Federation Protocol (MFP)** (HTTPS + signed JWT, instance discovery, cross-instance task delegation, reputation portability, payment routing, state sync) | Months 7–8 | **DEFER** | Spec stays as-is. Strip the Months 7–8 framing. Active commitment from Studio #443 §13 stands: dormant identity infrastructure (Ed25519 keypair + JWT issuer) lands when Marcus Studio M0 ships, full wire-protocol activation deferred. |
 >
@@ -215,7 +215,7 @@ API Layer:
 
 #### Frontend
 ```yaml
-Dashboard (Cato):
+Dashboard:
   Framework: React 18+ with TypeScript
   UI Library: Material-UI (MUI)
   State Management: Zustand
@@ -485,7 +485,7 @@ marcus/
 │   │   └── commands/              # CLI commands
 │   └── config/
 │       └── marcus_config.py       # Configuration system
-├── dashboard/                     # Cato (git submodule)
+├── dashboard/                     # visualization dashboard (separate)
 │   ├── backend/
 │   └── frontend/
 │       └── src/
@@ -525,11 +525,11 @@ marcus/
 
 **Deliverables:**
 - ✅ Configuration system (Week 1 - polish only)
-- ✅ Telemetry & CATO API integration (Week 2)
+- ✅ Telemetry & dashboard API integration (Week 2)
   - Includes REST APIs for Launch tab
   - Includes terminal streaming for Terminals tab
 - ✅ Production validations & Docker (Week 3)
-- ✅ Unified Cato Dashboard (Weeks 4-7)
+- ✅ Unified Dashboard (Weeks 4-7)
   - Git submodule setup (Week 4)
   - Unified installation (Week 5)
   - Unified startup command (Week 6)
@@ -537,7 +537,7 @@ marcus/
 - ✅ Web Console (Week 8 - optional development tool)
 
 **What Was Removed from Original Plan:**
-- Feature entities (not needed for Cato dashboard)
+- Feature entities (not needed for the dashboard)
 - Git worktrees (deferred - not needed for 5-agent MVP)
 - Feature context aggregation (deferred to Build Kits phase)
 
@@ -2089,7 +2089,7 @@ Team Structure:
    - Database design
 
 3. Frontend Engineer
-   - Dashboard (Cato)
+   - Dashboard
    - CLI refinement
    - UX/UI
 
@@ -2486,7 +2486,6 @@ Total: $2.1M-2.6M for 12 months
 **Technical Documents:**
 - DEVELOPMENT_GUIDE.md (Implementation guide)
 - docs/implementation/WEEK_*_PLAN.md (Week-by-week plans)
-- docs/CATO/CATO_MCP_INTEGRATION_PLAN.md (Dashboard integration)
 
 **API Documentation:**
 - docs/api/README.md (MCP tools)

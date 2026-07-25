@@ -25,7 +25,7 @@ filesystem, and running Marcus in Docker would create path mismatches.
 
 ```
 Docker:  Planka + Postgres (infrastructure)
-Local:   Marcus + Cato + Agents (share the host filesystem)
+Local:   Marcus + Agents (share the host filesystem)
 ```
 
 ## Detailed Workflows

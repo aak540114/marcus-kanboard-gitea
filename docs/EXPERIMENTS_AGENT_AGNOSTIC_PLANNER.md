@@ -200,7 +200,7 @@ For the **multi-domain recipe PRD** with all fixes applied:
 
 4. **Strong-model regression check.** New prompt has not been validated against haiku/Llama. Risk that DEFAULT TO EMPTY bias overcorrects on projects where strong models were correctly producing rich coverage. Trial-comparable run pending.
 
-5. **Cato-side observability for intent fidelity score asymmetry.** Weak models will under-report `intent_fidelity_score` after gap-fill due to the same DEFAULT TO EMPTY bias affecting `coverage_after`. Observability degradation, not coordination defect, but creates a confound for cross-provider comparison studies.
+5. **Dashboard-side observability for intent fidelity score asymmetry.** Weak models will under-report `intent_fidelity_score` after gap-fill due to the same DEFAULT TO EMPTY bias affecting `coverage_after`. Observability degradation, not coordination defect, but creates a confound for cross-provider comparison studies.
 
 ---
 

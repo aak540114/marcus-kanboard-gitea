@@ -363,7 +363,7 @@ class TestGapSynthesis:
     async def test_telemetry_carries_gap_features(self) -> None:
         """``telemetry["spec_gap_features"]`` lists synthesized task names.
 
-        Cato consumers can show "spec_coverage filled gaps for: A, B, C"
+        Downstream consumers can show "spec_coverage filled gaps for: A, B, C"
         without having to introspect the augmented_tasks list.
         """
         from src.marcus_mcp.coordinator.spec_coverage_augmenter import (

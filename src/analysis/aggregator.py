@@ -235,7 +235,7 @@ class ProjectHistoryAggregator:
     - Cross-referenced decisions and artifacts
     - Complete task history with instructions
     - Timeline reconstruction
-    - Caching for performance (60s TTL like Cato)
+    - Caching for performance (60s TTL like the dashboard)
     """
 
     def __init__(self, marcus_root: Optional[Path] = None):

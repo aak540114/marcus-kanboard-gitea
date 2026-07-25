@@ -347,21 +347,21 @@ def get_board_cost_factors(board_config: Dict) -> Dict:
     }
 ```
 
-## Integration with Cato
+## Integration with External Reasoning Systems
 
 ### Current State
 
-The cost tracking system is designed to be Cato-agnostic, but could integrate for:
+The cost tracking system is designed to be agnostic to any specific external reasoning system, but could integrate for:
 
-1. **Cost Attribution**: Track costs per Cato reasoning session
+1. **Cost Attribution**: Track costs per external reasoning session
 2. **Model Selection**: Route to different models based on cost constraints
 3. **Quality Correlation**: Analyze cost vs. reasoning quality trade-offs
 
-### Future Cato Integration
+### Future Reasoning-System Integration
 
 ```python
-# Potential Cato integration
-class CatoCostTracker:
+# Potential external reasoning-system integration
+class ExternalReasoningCostTracker:
     def track_reasoning_session(self, session_id: str, steps: List[Dict]):
         total_tokens = sum(step.get('tokens', 0) for step in steps)
         reasoning_depth = len(steps)

@@ -1050,7 +1050,7 @@ class TestRunDesignPhaseHandoff:
 class TestRunDesignPhasePreGeneratedContent:
     """
     Test ``_run_design_phase`` with the contract-first
-    ``pre_generated_content`` parameter (Cato retrofit, GH-320 PR
+    ``pre_generated_content`` parameter (dashboard retrofit, GH-320 PR
     after #333).
 
     When the contract-first decomposer synthesizes design ghost
@@ -1203,7 +1203,7 @@ class TestRunDesignPhasePreGeneratedContent:
         Phase B must call ``log_artifact`` and ``log_decision``
         against the pre-generated content, joined to
         ``state.project_tasks`` by ghost task name. This is the
-        whole point of the retrofit: Cato observability fires
+        whole point of the retrofit: dashboard observability fires
         because the artifacts and decisions land in
         ``state.task_artifacts`` and ``state.context.decisions``
         keyed by the real kanban UUID of the ghost.
@@ -1250,7 +1250,7 @@ class TestRunDesignPhasePreGeneratedContent:
         # log_artifact called against the ghost's real kanban UUID
         assert mock_log_artifact.called, (
             "log_artifact must be called against pre-generated "
-            "contract artifacts — without this Cato never sees them."
+            "contract artifacts — without this the dashboard never sees them."
         )
         artifact_call = mock_log_artifact.call_args
         assert artifact_call.kwargs["task_id"] == "real_ghost_uuid"
@@ -1262,7 +1262,7 @@ class TestRunDesignPhasePreGeneratedContent:
         # log_decision called against the same ghost UUID
         assert mock_log_decision.called, (
             "log_decision must be called against pre-generated "
-            "contract decisions — without this Cato never sees "
+            "contract decisions — without this the dashboard never sees "
             "decision history for contract-first projects."
         )
         decision_call = mock_log_decision.call_args

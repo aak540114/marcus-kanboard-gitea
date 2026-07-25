@@ -12,7 +12,7 @@
 9. [Future Evolution](#future-evolution)
 10. [Task Complexity Handling](#task-complexity-handling)
 11. [Board-Specific Considerations](#board-specific-considerations)
-12. [Cato Integration](#cato-integration)
+12. [Dashboard Integration](#dashboard-integration)
 
 ## System Overview
 
@@ -744,13 +744,13 @@ See `docs/source/systems/intelligence/07-ai-intelligence-engine-FUTURE.md` for t
 - Fallback methods work same regardless
 - Recommendations to improve board quality
 
-## Cato Integration
+## Dashboard Integration
 
 ### Current Integration
 
 **Marcus Role**: Provides AI analysis capabilities via MCP tools.
 
-**Cato Role**: Consumes analysis results for visualization and UI.
+**Dashboard Role**: Consumes analysis results for visualization and UI.
 
 **Data Exchange**: JSON-formatted analysis results via MCP protocol.
 
@@ -767,7 +767,7 @@ result = await ai_engine.analyze_blocker(...)
     "estimated_hours": 2.0
 }
 
-# Cato displays in UI
+# The dashboard displays in UI
 ```
 
 ### Shared Context

@@ -422,19 +422,19 @@ def detect_task_complexity(task):
     return sum(complexity_indicators) >= 2
 ```
 
-## Integration with Cato
+## Integration with External Coordinators
 
-**Current Integration**: Limited - Cato operates as a separate agent coordinator
+**Current Integration**: Limited - coordination is handled by a separate agent coordinator
 
 **Planned Integration**:
-- Cato as meta-coordinator managing mode switches
-- Operational Modes as Cato's decision-making engine
+- An external meta-coordinator managing mode switches
+- Operational Modes serving as the meta-coordinator's decision-making engine
 - Cross-system dependency tracking
 - Unified agent skill modeling
 
 **Architecture Vision**:
 ```
-Cato (Meta-Coordinator)
+External Meta-Coordinator
     ↓
 Operational Modes (Decision Engine)
     ↓
