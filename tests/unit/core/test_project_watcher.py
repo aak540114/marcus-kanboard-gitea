@@ -278,3 +278,115 @@ class TestIsProvisionedRetry:
             await w.poll_once()
             await w.poll_once()
         assert events.publish.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# notify_project() — the instant push path
+# ---------------------------------------------------------------------------
+
+
+class TestNotifyProject:
+    """``notify_project(pid)`` provisions a single project on demand.
+
+    This is the push counterpart to the background poll: the Kanboard
+    plugin calls Marcus the instant a project page loads, and Marcus
+    fetches just that one project and emits ``project.created`` if it
+    still needs provisioning — reusing the same idempotent
+    ``_needs_emit`` / persistence machinery as ``poll_once``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_emits_for_new_unprovisioned_project(self, watcher, events):
+        """A never-seen project id emits project.created and returns True."""
+        project = {"id": 11, "name": "New", "description": "d"}
+        with patch.object(
+            ProjectWatcher, "_fetch_project", AsyncMock(return_value=project)
+        ):
+            emitted = await watcher.notify_project(11)
+        assert emitted is True
+        events.publish.assert_awaited_once()
+        assert 11 in watcher._known_ids
+
+    @pytest.mark.asyncio
+    async def test_no_emit_when_already_known(self, watcher, events):
+        """Without an is_provisioned callback, a known id does not re-emit."""
+        project = {"id": 12, "name": "Known", "description": ""}
+        with patch.object(
+            ProjectWatcher, "_fetch_project", AsyncMock(return_value=project)
+        ):
+            first = await watcher.notify_project(12)
+            second = await watcher.notify_project(12)
+        assert first is True
+        assert second is False
+        assert events.publish.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_no_emit_when_already_provisioned(self, state_file, events):
+        """An already-provisioned project emits nothing (idempotent poke)."""
+        w = ProjectWatcher(
+            kanboard_url="http://x/jsonrpc.php",
+            api_token="t",
+            events=events,
+            state_path=state_file,
+            is_provisioned=lambda pid: True,
+        )
+        project = {"id": 13, "name": "Has repo", "description": ""}
+        with patch.object(
+            ProjectWatcher, "_fetch_project", AsyncMock(return_value=project)
+        ):
+            emitted = await w.notify_project(13)
+        assert emitted is False
+        events.publish.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_reemits_while_unprovisioned_even_if_known(
+        self, state_file, events
+    ):
+        """With is_provisioned False, a repeat poke retries (re-emits)."""
+        w = ProjectWatcher(
+            kanboard_url="http://x/jsonrpc.php",
+            api_token="t",
+            events=events,
+            state_path=state_file,
+            is_provisioned=lambda pid: False,
+        )
+        project = {"id": 14, "name": "Retry", "description": ""}
+        with patch.object(
+            ProjectWatcher, "_fetch_project", AsyncMock(return_value=project)
+        ):
+            await w.notify_project(14)
+            await w.notify_project(14)
+        assert events.publish.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_project_not_found(self, watcher, events):
+        """A missing/unknown project id emits nothing and returns False."""
+        with patch.object(
+            ProjectWatcher, "_fetch_project", AsyncMock(return_value=None)
+        ):
+            emitted = await watcher.notify_project(999)
+        assert emitted is False
+        events.publish.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_returns_false_for_nonpositive_id(self, watcher, events):
+        """A non-positive id is rejected without any RPC or emit."""
+        with patch.object(
+            ProjectWatcher, "_fetch_project", AsyncMock()
+        ) as fetch:
+            emitted = await watcher.notify_project(0)
+        assert emitted is False
+        fetch.assert_not_awaited()
+        events.publish.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_persists_known_ids(self, watcher, state_file):
+        """A successful poke writes the id to the state file."""
+        project = {"id": 15, "name": "Persist", "description": ""}
+        with patch.object(
+            ProjectWatcher, "_fetch_project", AsyncMock(return_value=project)
+        ):
+            await watcher.notify_project(15)
+        with open(state_file) as f:
+            data = json.load(f)
+        assert 15 in data["known_ids"]

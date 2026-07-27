@@ -203,6 +203,92 @@ class ProjectWatcher:
             logger.error("Failed to fetch Kanboard projects: %s", exc)
             return None
 
+    async def notify_project(self, project_id: int) -> bool:
+        """Provision a single project immediately, out of band with the poll.
+
+        This is the push counterpart to :meth:`poll_once`. The Kanboard
+        plugin calls Marcus the instant a project page loads, so Marcus can
+        create the Gitea repo (and reconcile columns) right away instead of
+        waiting for the next background poll. It fetches just that one
+        project and emits ``project.created`` only when the project still
+        :meth:`_needs_emit` — so repeated pokes for an already-provisioned
+        project are cheap no-ops, and an un-provisioned one is retried.
+
+        Parameters
+        ----------
+        project_id : int
+            The Kanboard project id to provision now. Non-positive ids are
+            rejected without any RPC call.
+
+        Returns
+        -------
+        bool
+            ``True`` if a ``project.created`` event was emitted for this
+            call, ``False`` otherwise (already provisioned, unknown id, no
+            HTTP client yet, or the project could not be fetched).
+        """
+        if project_id <= 0:
+            return False
+
+        project = await self._fetch_project(project_id)
+        if project is None:
+            return False
+
+        pid = int(project.get("id", 0))
+        if not pid:
+            return False
+
+        emitted = False
+        if self._needs_emit(pid):
+            await self._emit_project_created(project)
+            emitted = True
+        self._known_ids.add(pid)
+        self._save_known_ids()
+        return emitted
+
+    async def _fetch_project(self, project_id: int) -> Optional[Dict[str, Any]]:
+        """Call Kanboard's ``getProjectById`` RPC for a single project.
+
+        Parameters
+        ----------
+        project_id : int
+            The Kanboard project id to look up.
+
+        Returns
+        -------
+        Optional[Dict[str, Any]]
+            The project dict, or ``None`` on any error, when the HTTP
+            client is not running, or when Kanboard reports no such
+            project (``getProjectById`` returns ``null``/``false``).
+        """
+        if self._client is None:
+            return None
+        payload: Dict[str, Any] = {
+            "jsonrpc": "2.0",
+            "method": "getProjectById",
+            "id": 1,
+            "params": {"project_id": project_id},
+        }
+        try:
+            r = await self._client.post(
+                self._rpc_url, json=payload, auth=self._auth
+            )
+            r.raise_for_status()
+            body = r.json()
+            if "error" in body:
+                logger.error("Kanboard RPC error: %s", body["error"])
+                return None
+            result = body.get("result")
+            # getProjectById returns null/false for an unknown id.
+            if not isinstance(result, dict):
+                return None
+            return result
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Failed to fetch Kanboard project %d: %s", project_id, exc
+            )
+            return None
+
     async def _emit_project_created(self, project: Dict[str, Any]) -> None:
         """Publish a ``project.created`` event.
 

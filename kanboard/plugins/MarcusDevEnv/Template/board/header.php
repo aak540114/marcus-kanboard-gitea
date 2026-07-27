@@ -37,6 +37,11 @@ $descUrl          = $marcusUrl . '/project-description?project_id=' . urlencode(
 $gateApiBase      = $marcusUrl . '/api/gate-setting';
 $devEnvSettingUrl = $marcusUrl . '/api/dev-env-setting';
 $projectRepoUrl   = $marcusUrl . '/api/project-repo?project_id=' . urlencode((string) $projectId);
+// Carry the token in the query string (not a header) so the instant
+// new-project signal stays a CORS-simple GET — no preflight — even under
+// MARCUS_AGENT_TOKEN, exactly like $descUrl / $eventsStreamUrl.
+$projectSeenUrl   = $marcusUrl . '/api/project-seen?project_id=' . urlencode((string) $projectId)
+                  . ($marcusToken !== '' ? '&token=' . urlencode($marcusToken) : '');
 $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
     . ($marcusToken !== '' ? '?token=' . urlencode($marcusToken) : '');
 ?>
@@ -276,6 +281,7 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
     var GATE_URL         = <?= json_encode($gateApiBase) ?>;
     var DEV_ENV_SETTING_URL = <?= json_encode($devEnvSettingUrl) ?>;
     var PROJECT_REPO_URL = <?= json_encode($projectRepoUrl) ?>;
+    var PROJECT_SEEN_URL = <?= json_encode($projectSeenUrl) ?>;
     var EVENTS_STREAM_URL = <?= json_encode($eventsStreamUrl) ?>;
     var PROJECT_ID       = <?= json_encode((int) $projectId) ?>;
     var MARCUS_TOKEN     = <?= json_encode($marcusToken) ?>;
@@ -297,6 +303,23 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
             return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
         });
     }
+
+    /* ── Instant new-project signal (push, replaces the poll) ─────────────
+       Kanboard has no server-side "project created" event or webhook, so the
+       moment a human opens a project page — which Kanboard does immediately
+       after creating one — tell Marcus this project exists. Marcus then
+       creates its Gitea repo + reconciles its columns right away instead of
+       waiting for its slow backstop poll. Idempotent on Marcus's side (a
+       no-op once the project is provisioned). Header-less GET with the token
+       in the query string, so it stays a CORS-simple request (no preflight)
+       even under MARCUS_AGENT_TOKEN. */
+    (function () {
+        if (!PROJECT_ID || !PROJECT_SEEN_URL) { return; }
+        try {
+            fetch(PROJECT_SEEN_URL, { cache: 'no-store' })
+                .catch(function () { /* backstop poll will catch it */ });
+        } catch (e) { /* never let this break the header */ }
+    })();
 
     /* ── Live board refresh (push, no polling) ───────────────────────── */
     // Hold ONE Server-Sent Events connection to Marcus. Marcus pushes a

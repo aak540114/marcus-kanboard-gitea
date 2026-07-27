@@ -3871,10 +3871,22 @@ async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
             def is_provisioned(pid: int) -> bool:
                 return project_sync.get_repo_for_project(pid) is not None
 
+        # The MarcusDevEnv plugin pushes new projects instantly via
+        # /api/project-seen (ProjectWatcher.notify_project), so this poll is
+        # now only a slow safety-net backstop — it catches projects created
+        # via Kanboard's API/DB import or while the plugin was disabled, and
+        # retries failed repo creations. Default 5 min; override with
+        # PROJECT_POLL_INTERVAL (seconds).
+        try:
+            poll_interval = float(os.environ.get("PROJECT_POLL_INTERVAL", "300"))
+        except ValueError:
+            poll_interval = 300.0
+
         watcher = ProjectWatcher(
             kanboard_url=kb_url,
             api_token=kb_token,
             events=server.events,
+            poll_interval=poll_interval,
             state_path="./data/known_projects.json",
             is_provisioned=is_provisioned,
         )
@@ -5017,6 +5029,64 @@ function save() {{
                 )
             )
 
+        async def project_seen(request: Request) -> JSONResponse:
+            """Provision a Kanboard project the instant its page is opened.
+
+            Kanboard has no server-side "project created" event or webhook,
+            so the MarcusDevEnv plugin calls this route from the project
+            header (which renders the moment a human lands on a newly-created
+            project). Marcus then fetches that one project and — if it still
+            needs provisioning — creates its Gitea repo and reconciles its
+            columns immediately, instead of waiting for the slow background
+            poll. Repeated calls (the header renders on every project view)
+            are cheap idempotent no-ops once the project is provisioned.
+
+            Query params
+            ------------
+            project_id : str  (required, numeric Kanboard id)
+
+            Response body
+            -------------
+            ``{"ok": bool, "emitted": bool}`` — ``emitted`` is ``True`` when
+            this call fired a ``project.created`` event (i.e. the project
+            was not yet provisioned). ``ok`` is ``False`` only when project
+            auto-provisioning is disabled (Kanboard not configured).
+            """
+            def _cors(r: JSONResponse) -> JSONResponse:
+                r.headers["Access-Control-Allow-Origin"] = "*"
+                r.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+                return r
+
+            project_id = request.query_params.get("project_id", "").strip()
+            if not project_id:
+                return _cors(
+                    JSONResponse(
+                        {"error": "project_id query parameter is required"},
+                        status_code=400,
+                    )
+                )
+            try:
+                pid = int(project_id)
+            except ValueError:
+                return _cors(
+                    JSONResponse(
+                        {"error": "project_id must be a numeric Kanboard id"},
+                        status_code=400,
+                    )
+                )
+
+            watcher = getattr(server, "_project_watcher", None)
+            if watcher is None:
+                # Kanboard/auto-provisioning not wired — best-effort no-op.
+                return _cors(JSONResponse({"ok": False, "emitted": False}))
+
+            emitted = False
+            try:
+                emitted = await watcher.notify_project(pid)
+            except Exception as exc:  # noqa: BLE001 - never 500 the plugin
+                logger.warning("project_seen(%d) failed: %s", pid, exc)
+            return _cors(JSONResponse({"ok": True, "emitted": emitted}))
+
         async def events_stream(request: Request) -> StreamingResponse:
             """Server-Sent Events stream that pushes a "refresh" the instant
             Marcus changes anything (a comment posted, a card moved, a state
@@ -5159,6 +5229,11 @@ function save() {{
                 Route("/api/active-agents", active_agents, methods=["GET"]),
                 Route("/api/ticket-links", ticket_links, methods=["GET"]),
                 Route("/api/project-repo", project_repo, methods=["GET"]),
+                Route(
+                    "/api/project-seen",
+                    project_seen,
+                    methods=["GET", "OPTIONS"],
+                ),
                 Route("/api/events/stream", events_stream, methods=["GET"]),
                 Route("/project-description", project_description_page, methods=["GET"]),
                 Route("/api/project-description", project_description_api, methods=["GET", "PUT"]),

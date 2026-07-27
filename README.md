@@ -11,7 +11,7 @@ A production deployment of **[Marcus](https://github.com/lwgray/marcus)** — th
 | Feature | Description |
 |---|---|
 | **Kanboard provider** | Full Kanboard JSON-RPC integration — tickets, columns, comments, assignments |
-| **Gitea integration** | `GiteaManager` + `ProjectSyncWorkflow` (`src/integrations/gitea_manager.py`, `src/workflows/project_sync_workflow.py`) auto-create a Gitea repo per Kanboard project — proactively via a `ProjectWatcher` poll, and on-demand the first time an agent calls `get_work_context` — no manual repo setup. |
+| **Gitea integration** | `GiteaManager` + `ProjectSyncWorkflow` (`src/integrations/gitea_manager.py`, `src/workflows/project_sync_workflow.py`) auto-create a Gitea repo per Kanboard project. Creation is **instant**: the moment you create a project, Kanboard opens its page, and the MarcusDevEnv plugin pings `/api/project-seen` so Marcus provisions the repo (and Marcus's columns) right away — Kanboard has no server-side "project created" event, so this browser ping is what replaces waiting on a poll. A slow `ProjectWatcher` backstop poll (default 5 min, `PROJECT_POLL_INTERVAL`) still catches API/DB-created projects and retries failures, and the repo is also created on-demand the first time an agent calls `get_work_context` — no manual repo setup. |
 | **Parallel agents** | `HumanGatedWorkflow` keeps up to `MARCUS_MAX_PARALLEL_AGENTS` (default 3) tickets in progress at once, each held by a distinct agent "slot". A busy slot is never preempted, so an agent actively working is never interrupted; extra assigned tickets simply wait for a free slot. |
 | **Orchestrate mode (`marcus_work`)** | Marcus is the manager, the agent is a worker. Prompt any agent to "connect to Marcus and do what it says": it loops on ONE tool, `marcus_work`, which hands out the next ticket that's **assigned to a human (anyone) and in Ready**, returns exact instructions, LLM-summarizes each worker report onto the ticket as a comment (~every 10 s, driven by the worker's callbacks), and completes the ticket through the project's gate on `DONE`. |
 | **Ticket decomposition** | Marcus splits a big ticket into 2–5 independent sub-tickets — created on the **parent's board**, linked "is a child of", inheriting the parent's owner and Ready status — so multiple agents work them in parallel; the parent parks in Blocked until its children finish. Automatic when a ticket with 4+ acceptance criteria is handed to a worker, or on demand via a **`@marcus decompose`** comment. Needs an LLM configured (`claude_subscription` works). |
@@ -82,8 +82,9 @@ Human (browser)
   │  creates project, ticket           │  assigns, sets "Ready"
   ▼                                    ▼
 kanboard (container, host port 8080) ← Kanboard JSON-RPC API (internal port 80)
-  │  ProjectWatcher polls               │  BoardWatcher polls (30s) + webhook (instant)
-  ▼  getAllProjects()                   ▼  getAllTasks()
+  │  plugin push (instant) +            │  BoardWatcher polls (30s) + webhook (instant)
+  │  ProjectWatcher backstop (5m)       │
+  ▼  /api/project-seen, getAllProjects  ▼  getAllTasks()
 marcus (container, host port 4298) ─── marcus (container)
   │  GiteaManager + ProjectWatcher     │  BranchManager + HumanGatedWorkflow
   ▼  POST /api/v1/user/repos           ▼  git push branch
@@ -439,6 +440,7 @@ When `MARCUS_AGENT_TOKEN` is set (automatic once you allow remote access — see
 | `/api/dev-env/status?ticket_id=<id>` | GET | Returns `{running, serving, url}` — `running` = container alive; `serving` = the app is actually listening (probed *inside* the container, so it's correct even when Marcus itself runs in a container) |
 | `/api/dev-env-setting` | GET/PUT | Global `max_parallel_containers` limit (`null` = unlimited) — see [Hot-reload dev environments](#hot-reload-dev-environments) |
 | `/api/active-agents` | GET | All tickets currently claimed by an AI agent |
+| `/api/project-seen?project_id=<id>` | GET | Instant "this project exists" ping from the MarcusDevEnv plugin when a project page opens — Marcus provisions its Gitea repo + columns immediately (Kanboard has no project-created event). Idempotent; auth via `?token=` |
 | `/api/events/stream` | GET | Server-Sent Events stream — pushes a `refresh` event the instant Marcus/an agent changes anything; the MarcusDevEnv plugin reloads the page on it (auth via `?token=`, since EventSource can't send headers) |
 | `/api/ticket-links?ticket_id=<id>` | GET | Dependency graph (`depends_on`/`blocks`/`relates_to`) plus the ticket's `repo_web_url` and `branch_web_url` |
 | `/api/project-repo?project_id=<id>` | GET | Browser URL of the project's Gitea repo (`null` until provisioned) — backs the board's Repository button |
