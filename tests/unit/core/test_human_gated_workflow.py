@@ -3253,6 +3253,27 @@ class TestAgentPresenceAndUsage:
         workflow._mark_progress_activity("7")  # ticket has a live heartbeat
         assert workflow.get_active_agent_ids() == []
 
+    def test_progress_activity_marks_real_agent_connected(
+        self, workflow, lifecycle
+    ):
+        """A real agent whose ticket is kept live only by progress/push
+        activity (it never separately polled marcus_work) still counts as
+        connected AND active.
+
+        Regression: the golden 'working' ring is refreshed by branch pushes
+        (via the Gitea webhook) and progress reports, but the connected/
+        working counts used to come only from marcus_work polls — so an
+        agent that committed and pushed lit the ring yet showed 0 connected
+        / 0 working. Marking progress must also mark the owning real agent
+        connected.
+        """
+        rec = lifecycle.get_or_create("8", "kanboard")
+        rec.ai_agent_id = "worker-C"           # a real agent, claimed
+        # ONLY progress activity — no explicit _mark_agent_seen("worker-C").
+        workflow._mark_progress_activity("8")
+        assert "worker-C" in workflow.get_connected_agent_ids()
+        assert workflow.get_active_agent_ids() == ["worker-C"]
+
     def test_claimed_but_idle_ticket_is_not_active(self, workflow, lifecycle):
         rec = lifecycle.get_or_create("6", "kanboard")
         rec.ai_agent_id = "worker-B"          # claimed but NO progress heartbeat

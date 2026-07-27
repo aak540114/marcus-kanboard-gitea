@@ -80,11 +80,15 @@ logger = logging.getLogger(__name__)
 #: silence (the agent finished, crashed, or stalled) lets the highlight lapse.
 _WORKING_WINDOW_SECONDS = 40.0
 
-#: How long after an agent's last ``marcus_work`` poll it still counts as
-#: "connected". An agent polls every ~10s whether or not it has work, so this
-#: (shorter than the working window is fine) tolerates a couple of missed
-#: polls; a longer silence means the agent has disconnected/stopped.
-_AGENT_POLL_WINDOW = 30.0
+#: How long after an agent's last contact it still counts as "connected".
+#: MUST be >= _WORKING_WINDOW_SECONDS: any agent whose ticket is still lit as
+#: "working" has to also count as connected, otherwise the board shows a lit
+#: golden ring but 0 connected/working agents. Real agents contact Marcus via
+#: several channels at different cadences (a marcus_work poll, a progress
+#: report, or a branch push — each refreshes this stamp), and a work chunk
+#: between contacts can easily exceed 30s, so keep this generous; a longer
+#: silence means the agent has disconnected/stopped.
+_AGENT_POLL_WINDOW = 60.0
 
 #: Hard caps applied to the agent-supplied ``usage`` payload — it is fully
 #: untrusted (any connected agent can send anything) and flows into stored
@@ -1539,10 +1543,26 @@ class HumanGatedWorkflow:
         """Stamp *now* as this ticket's last agent-progress report.
 
         Called wherever an agent reports it is working (a progress comment,
-        a marcus_work report). Drives the board's "actively worked" golden
-        highlight — see :meth:`get_working_ticket_ids`.
+        a marcus_work report, a branch push). Drives the board's "actively
+        worked" golden highlight — see :meth:`get_working_ticket_ids`.
+
+        Because a progress report or a branch push is itself live contact
+        from the ticket's agent, this also refreshes that agent's
+        "connected" heartbeat. Without it, a real agent that commits and
+        pushes (its highlight refreshed via the Gitea webhook) but polls
+        ``marcus_work`` only occasionally would light the golden ring yet
+        show 0 connected / 0 working agents. Internal ``marcus-<slot>``
+        auto-start reservations are NOT live agents, so they are excluded
+        (an internal reservation must never be counted as a connected
+        agent — see :meth:`get_active_agent_ids`).
         """
         self._progress_activity[f"{self._provider}:{ticket_id}"] = time.monotonic()
+
+        record = self._lifecycle.get(ticket_id, self._provider)
+        if record is not None:
+            agent_id = str(record.ai_agent_id or "")
+            if agent_id and not agent_id.startswith("marcus-"):
+                self._mark_agent_seen(agent_id)
 
     def _clear_progress_activity(self, ticket_id: str) -> None:
         """Drop a ticket's heartbeat so its highlight clears at once.
