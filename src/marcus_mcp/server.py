@@ -3727,9 +3727,15 @@ def _dev_env_starting_page(ticket_id: str, provider: str, url: str) -> str:
         if (s.serving) {{ done = true; window.location.replace(s.url || URL); return; }}
         if (s.running) {{ everRunning = true; }}
         else if (everRunning) {{
+          var cmd = s.command
+            ? " Marcus ran this dev-server command, inferred from the "
+              + "Tech Stack: [ " + s.command + " ] — if that does not match "
+              + "how the app starts, add an explicit dev-server command line "
+              + "to the project description."
+            : "";
           stop("Preview could not start",
-               "The container exited before the app came up. Check the "
-               + "project's Tech Stack / dev-server command, then retry.",
+               "The container exited before the app came up." + cmd
+               + " Then retry.",
                "Try again", location.href);
           return;
         }}
@@ -4735,11 +4741,21 @@ function save() {{
                         )
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("Dev env serving check failed: %s", exc)
+            # The dev-server command Marcus resolved from the ticket's Tech
+            # Stack and ran. Surfaced so the "Preview could not start" page
+            # can show exactly what was attempted (the usual reason a
+            # container exits is this inferred command not matching the app).
+            last_command = None
+            if dev_mgr and ticket_id:
+                get_cmd = getattr(dev_mgr, "get_last_command", None)
+                if get_cmd is not None:
+                    last_command = get_cmd(ticket_id, provider)
             response = JSONResponse(
                 {
                     "running": info is not None,
                     "serving": serving,
                     "url": info.url if info else None,
+                    "command": last_command,
                 }
             )
             response.headers["Access-Control-Allow-Origin"] = "*"

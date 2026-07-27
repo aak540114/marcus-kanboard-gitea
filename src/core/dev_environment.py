@@ -433,6 +433,12 @@ class DevEnvironmentManager:
         self._envs: Dict[str, DevEnvironmentInfo] = (
             {}
         )  # key = f"{provider}:{ticket_id}"
+        # key = f"{provider}:{ticket_id}" → the dev-server command Marcus
+        # resolved (from the project's Tech Stack) and ran in the container.
+        # Kept even after the env is pruned so the "Preview could not start"
+        # page can show exactly what was run — the usual reason a container
+        # exits is that this inferred command didn't match the app's layout.
+        self._last_command: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -701,6 +707,29 @@ class DevEnvironmentManager:
             Running environment info, or ``None``.
         """
         return self._envs.get(f"{provider}:{ticket_id}")
+
+    def get_last_command(self, ticket_id: str, provider: str) -> Optional[str]:
+        """Return the dev-server command last run for a ticket, or ``None``.
+
+        This is the command Marcus resolved from the project's Tech Stack
+        (e.g. ``flask run --host 0.0.0.0 --port 3000``) and ran in the
+        container. Retained after the environment is pruned so the
+        "Preview could not start" page can show what was attempted.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Provider ticket identifier.
+        provider : str
+            Kanban provider name.
+
+        Returns
+        -------
+        Optional[str]
+            The last resolved dev-server command, or ``None`` if none was
+            ever started for this ticket.
+        """
+        return self._last_command.get(f"{provider}:{ticket_id}")
 
     def is_serving(self, ticket_id: str, provider: str) -> bool:
         """Return ``True`` only once the app actually accepts connections.
@@ -1232,6 +1261,12 @@ class DevEnvironmentManager:
             install_cmd = ""
             start_cmd = self.config.dev_command.format(port=3000)
             use_hm_reload = False
+
+        # Remember the resolved dev-server command so the "Preview could not
+        # start" page can show exactly what Marcus inferred from the Tech
+        # Stack and ran (survives the env being pruned when the container
+        # dies).
+        self._last_command[f"{provider}:{ticket_id}"] = start_cmd
 
         entrypoint = self._build_entrypoint(
             branch_name, install_cmd, start_cmd, use_hm_reload, extra_apt

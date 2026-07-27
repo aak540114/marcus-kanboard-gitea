@@ -1323,3 +1323,25 @@ class TestIsServing:
             side_effect=OSError("docker not found"),
         ):
             assert DevEnvironmentManager._container_port_open("c") is False
+
+
+class TestLastCommand:
+    """Tests for get_last_command() — the resolved dev-server command shown
+    on the 'Preview could not start' page."""
+
+    def test_none_by_default(self) -> None:
+        """No command is recorded until a dev environment is started."""
+        mgr = DevEnvironmentManager(DevEnvironmentConfig())
+        assert mgr.get_last_command("1", "kanboard") is None
+
+    def test_returns_stored_command(self) -> None:
+        """The last resolved command is returned per provider:ticket key, and
+        survives the env being pruned (it lives in its own map)."""
+        mgr = DevEnvironmentManager(DevEnvironmentConfig())
+        mgr._last_command["kanboard:7"] = "flask run --host 0.0.0.0 --port 3000"
+        assert (
+            mgr.get_last_command("7", "kanboard")
+            == "flask run --host 0.0.0.0 --port 3000"
+        )
+        # Different ticket → still None.
+        assert mgr.get_last_command("8", "kanboard") is None
