@@ -40,17 +40,34 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-_SENTINEL_RE = re.compile(
-    r"<!-- MARCUS_COMMENT .*?-->",
-    re.DOTALL,
+# Marcus comments are identified by their visible ``### Marcus …`` section
+# title — a human-readable signature that needs NO hidden markup. Kanboard
+# escapes raw HTML, so the old ``<!-- MARCUS_COMMENT … -->`` /
+# ``<!-- END_MARCUS_COMMENT -->`` sentinels rendered as literal text on the
+# card; they have been removed. Detection and type are derived from the
+# title instead (nothing machine-readable is embedded in the body).
+_TITLE_RE = re.compile(r"^\s*#{1,6}\s+Marcus\b.*$", re.MULTILINE)
+
+#: Maps a distinctive phrase in a comment's ``### Marcus …`` title to its
+#: type. Order matters: more specific phrases (round verification) come
+#: before the generic ones they contain.
+_TITLE_TYPE_MAP = (
+    ("Acceptance Criteria", "ac_generated"),
+    ("Work Started", "started"),
+    ("Progress Update", "progress"),
+    ("Revision Request", "revision_requested"),
+    ("Ready for Review", "ready_for_review"),
+    ("Dev Environment", "dev_env_started"),
+    ("Merged to", "merged"),
+    ("PASSED", "verification_round_passed"),
+    ("Round", "verification_round_failed"),
+    ("Issues Found", "verification_failed"),
+    ("Error", "error"),
 )
-_TYPE_RE = re.compile(r'type="([^"]+)"')
-_TICKET_RE = re.compile(r'ticket_id="([^"]+)"')
 _FOOTER = (
     "\n\n---\n"
     "*Posted automatically by Marcus AI agent. "
-    "Reply to this ticket to interact with the agent.*\n"
-    "<!-- END_MARCUS_COMMENT -->"
+    "Reply to this ticket to interact with the agent.*"
 )
 
 
@@ -124,10 +141,12 @@ class CommentFormatter:
 
     @staticmethod
     def _header(comment_type: CommentType, ticket_id: str) -> str:
-        return (
-            f'<!-- MARCUS_COMMENT type="{comment_type.value}" '
-            f'ticket_id="{ticket_id}" -->'
-        )
+        # No hidden sentinel is emitted any more — Kanboard escapes raw HTML,
+        # so it rendered as literal ``<!-- MARCUS_COMMENT … -->`` text on the
+        # card. Marcus comments are recognised by their visible ``### Marcus``
+        # title instead (see CommentParser). Kept as a no-op so the many
+        # formatter templates below need no change.
+        return ""
 
     @classmethod
     def ac_generated(
@@ -611,12 +630,21 @@ class CommentParser:
 
     @staticmethod
     def is_marcus_comment(text: str) -> bool:
-        """Return ``True`` if *text* is a Marcus-generated comment."""
-        return bool(_SENTINEL_RE.search(text))
+        """Return ``True`` if *text* is a Marcus-generated comment.
+
+        Recognised by the visible ``### Marcus …`` section title every
+        Marcus comment opens with — no hidden markup is used (Kanboard
+        would render it as literal text on the card).
+        """
+        return bool(_TITLE_RE.search(text))
 
     @staticmethod
     def parse(text: str) -> Optional[ParsedComment]:
         """Extract metadata from a Marcus comment.
+
+        The comment type is derived from the visible ``### Marcus …`` title.
+        ``ticket_id`` is no longer embedded in the body (it was only ever
+        used by tests), so it is returned empty.
 
         Parameters
         ----------
@@ -628,25 +656,22 @@ class CommentParser:
         Optional[ParsedComment]
             Parsed comment, or ``None`` if the comment is not from Marcus.
         """
-        header_match = _SENTINEL_RE.search(text)
-        if not header_match:
+        title_match = _TITLE_RE.search(text)
+        if not title_match:
             return None
+        title = title_match.group(0)
 
-        header = header_match.group(0)
-        type_match = _TYPE_RE.search(header)
-        ticket_match = _TICKET_RE.search(header)
-
-        if not type_match or not ticket_match:
-            return None
-
-        try:
-            comment_type = CommentType(type_match.group(1))
-        except ValueError:
+        comment_type: Optional[CommentType] = None
+        for phrase, type_value in _TITLE_TYPE_MAP:
+            if phrase in title:
+                comment_type = CommentType(type_value)
+                break
+        if comment_type is None:
             return None
 
         return ParsedComment(
             comment_type=comment_type,
-            ticket_id=ticket_match.group(1),
+            ticket_id="",
             raw_body=text,
         )
 

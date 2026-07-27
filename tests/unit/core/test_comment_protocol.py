@@ -13,24 +13,28 @@ from src.core.comment_protocol import (
 class TestCommentFormatter:
     """Tests for CommentFormatter class methods."""
 
-    def test_ac_generated_contains_sentinel(self):
-        """ac_generated comment contains MARCUS_COMMENT sentinel."""
+    def test_ac_generated_has_no_visible_html_markers(self):
+        """Comments carry NO raw HTML sentinels (Kanboard renders them as
+        literal text on the card) — Marcus is recognised by its title."""
         body = CommentFormatter.ac_generated(
             ticket_id="PROJ-1",
             ac_markdown="- [ ] Deploy service",
         )
-        assert "<!-- MARCUS_COMMENT" in body
-        assert "<!-- END_MARCUS_COMMENT -->" in body
+        assert "<!-- MARCUS_COMMENT" not in body
+        assert "<!-- END_MARCUS_COMMENT -->" not in body
+        assert CommentParser.is_marcus_comment(body) is True
 
-    def test_ac_generated_type_attribute(self):
-        """ac_generated comment has type='ac_generated'."""
+    def test_ac_generated_type_derived_from_title(self):
+        """The comment's type is recoverable from its visible title."""
         body = CommentFormatter.ac_generated("PROJ-1", "- [ ] test")
-        assert 'type="ac_generated"' in body
+        parsed = CommentParser.parse(body)
+        assert parsed is not None
+        assert parsed.comment_type == CommentType.AC_GENERATED
 
-    def test_ac_generated_ticket_id_attribute(self):
-        """ac_generated comment embeds ticket_id."""
+    def test_ac_generated_has_marcus_title(self):
+        """Every Marcus comment opens with a '### Marcus …' title."""
         body = CommentFormatter.ac_generated("PROJ-99", "- [ ] test")
-        assert 'ticket_id="PROJ-99"' in body
+        assert "### Marcus" in body
 
     def test_ac_generated_human_created_note(self):
         """Note is included when was_human_created=True."""
@@ -177,7 +181,8 @@ class TestCommentParser:
         parsed = CommentParser.parse(body)
         assert parsed is not None
         assert parsed.comment_type == CommentType.AC_GENERATED
-        assert parsed.ticket_id == "T-2"
+        # ticket_id is no longer embedded in the body (unused in production).
+        assert parsed.ticket_id == ""
 
     def test_parse_progress(self):
         """parse() correctly identifies progress comments."""
