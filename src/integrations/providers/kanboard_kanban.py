@@ -21,6 +21,7 @@ KanboardKanban
 import base64
 import logging
 import mimetypes
+import secrets
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
 
@@ -97,6 +98,11 @@ MARCUS_DEFAULT_COLUMNS: List[str] = [
     "Done",
 ]
 
+#: Username of the dedicated Kanboard bot user Marcus posts comments as, so
+#: its comments carry a consistent "M" avatar instead of the "?" placeholder
+#: Kanboard shows for the anonymous system user (user_id=0).
+_MARCUS_BOT_USERNAME = "marcus"
+
 # Kanboard seeds a fresh project with these columns
 # (app/Model/BoardModel.php::getDefaultColumns). Rename the two that have a
 # Marcus equivalent — rather than delete+recreate — so their position and
@@ -154,6 +160,11 @@ class KanboardKanban(KanbanInterface):
 
         self._client: Optional[httpx.AsyncClient] = None
         self._rpc_id: int = 0
+        # Kanboard user id Marcus posts comments as — a dedicated "marcus"
+        # bot user, resolved/created lazily on first comment and cached here
+        # so its comments show an "M" avatar instead of the "?" placeholder
+        # that user_id=0 (anonymous) renders as.
+        self._comment_user_id: Optional[int] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -663,9 +674,68 @@ class KanboardKanban(KanbanInterface):
         logger.info("Reconciled columns for Kanboard project %d", pid)
         return True
 
+    async def _resolve_comment_user_id(self) -> int:
+        """Resolve the Kanboard user id Marcus posts comments as.
+
+        Marcus posts as a dedicated ``marcus`` bot user so its comments carry
+        a consistent "M" avatar instead of the "?" placeholder Kanboard shows
+        for ``user_id=0`` (the anonymous system user). The user is looked up
+        by name and created on first use if absent (the API token owner is an
+        admin, so it may create users); the id is cached for the session. Any
+        failure falls back to ``0`` so posting a comment never breaks.
+
+        Returns
+        -------
+        int
+            The ``marcus`` user's id, or ``0`` when it cannot be resolved or
+            created.
+        """
+        if self._comment_user_id is not None:
+            return self._comment_user_id
+        try:
+            user = await self._rpc(
+                "getUserByName", username=_MARCUS_BOT_USERNAME
+            )
+            if user:
+                uid = int(user.get("id", 0) or 0)
+                if uid:
+                    self._comment_user_id = uid
+                    return uid
+            # Absent → create it. A random password is fine: this bot never
+            # logs in interactively; it exists only to own Marcus's comments.
+            created = await self._rpc(
+                "createUser",
+                username=_MARCUS_BOT_USERNAME,
+                password=secrets.token_hex(24),
+                name="Marcus",
+            )
+            uid = int(created or 0)
+            if not uid:
+                # createUser can return false if it lost a race with a
+                # concurrent create — re-look-up by name.
+                user = await self._rpc(
+                    "getUserByName", username=_MARCUS_BOT_USERNAME
+                )
+                uid = int((user or {}).get("id", 0) or 0) if user else 0
+            if uid:
+                self._comment_user_id = uid
+                return uid
+        except Exception as exc:  # noqa: BLE001 - never block a comment on this
+            logger.warning(
+                "Could not resolve/create the '%s' bot user (comments will "
+                "post as anonymous): %s",
+                _MARCUS_BOT_USERNAME,
+                exc,
+            )
+        return 0
+
     async def add_comment(self, task_id: str, comment: str) -> bool:
         """
         Append a text comment to a task.
+
+        Posted as the dedicated ``marcus`` bot user (see
+        :meth:`_resolve_comment_user_id`) so the comment shows an "M" avatar
+        rather than Kanboard's "?" anonymous placeholder.
 
         Parameters
         ----------
@@ -685,7 +755,7 @@ class KanboardKanban(KanbanInterface):
             result = await self._rpc(
                 "createComment",
                 task_id=int(task_id),
-                user_id=0,  # 0 = system/API user
+                user_id=await self._resolve_comment_user_id(),
                 content=comment,
             )
             return bool(result)

@@ -523,6 +523,74 @@ class TestAddComment:
         with pytest.raises(RuntimeError, match="connect()"):
             await kanban.add_comment("1", "hello")
 
+    @staticmethod
+    def _params_of(kanban, method):
+        """Return the params dict of the first RPC call to *method*."""
+        for c in kanban._client.post.call_args_list:
+            if c.kwargs["json"]["method"] == method:
+                return c.kwargs["json"]["params"]
+        return None
+
+    @pytest.mark.asyncio
+    async def test_posts_as_existing_marcus_bot_user(self, kanban):
+        """When a 'marcus' user exists, the comment is posted as its id."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response({"id": 7, "username": "marcus"}),  # getUserByName
+                _rpc_response(101),  # createComment
+            ]
+        )
+        assert await kanban.add_comment("1", "hello") is True
+        assert kanban._comment_user_id == 7
+        assert self._params_of(kanban, "createComment")["user_id"] == 7
+
+    @pytest.mark.asyncio
+    async def test_creates_marcus_bot_user_when_absent(self, kanban):
+        """When no 'marcus' user exists, it is created and used."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response(None),  # getUserByName → not found
+                _rpc_response(9),  # createUser → new id
+                _rpc_response(102),  # createComment
+            ]
+        )
+        assert await kanban.add_comment("1", "hello") is True
+        assert kanban._comment_user_id == 9
+        methods = [
+            c.kwargs["json"]["method"] for c in kanban._client.post.call_args_list
+        ]
+        assert "createUser" in methods
+        assert self._params_of(kanban, "createComment")["user_id"] == 9
+
+    @pytest.mark.asyncio
+    async def test_comment_user_id_cached_across_comments(self, kanban):
+        """The bot user is resolved once, then reused (no repeat lookup)."""
+        kanban._client = AsyncMock()
+        kanban._comment_user_id = 7  # already resolved
+        kanban._client.post = AsyncMock(return_value=_rpc_response(200))
+        assert await kanban.add_comment("1", "a") is True
+        methods = [
+            c.kwargs["json"]["method"] for c in kanban._client.post.call_args_list
+        ]
+        assert "getUserByName" not in methods  # used the cache
+        assert self._params_of(kanban, "createComment")["user_id"] == 7
+
+    @pytest.mark.asyncio
+    async def test_comment_falls_back_to_anonymous_on_lookup_error(self, kanban):
+        """If resolving the bot user fails, the comment still posts (as 0)."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                RuntimeError("user lookup boom"),  # getUserByName
+                _rpc_response(103),  # createComment
+            ]
+        )
+        assert await kanban.add_comment("1", "hello") is True
+        assert kanban._comment_user_id is None  # not cached → retried next time
+        assert self._params_of(kanban, "createComment")["user_id"] == 0
+
 
 # ---------------------------------------------------------------------------
 # get_comments tests
@@ -956,7 +1024,8 @@ class TestAssignTask:
     async def test_falls_back_to_comment_when_user_not_found(self, kanban):
         """assign_task() falls back to a comment when user lookup fails."""
         kanban._client = AsyncMock()
-        # getUserByName returns None
+        kanban._comment_user_id = 7  # Marcus bot user already resolved (cached)
+        # getUserByName(assignee) returns None → fall back to a comment.
         kanban._client.post = AsyncMock(
             side_effect=[_rpc_response(None), _rpc_response(99)]
         )
