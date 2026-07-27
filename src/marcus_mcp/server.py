@@ -3733,10 +3733,22 @@ def _dev_env_starting_page(ticket_id: str, provider: str, url: str) -> str:
               + "how the app starts, add an explicit dev-server command line "
               + "to the project description."
             : "";
+          var logsNote = s.logs
+            ? " The container's last log lines are shown below."
+            : "";
           stop("Preview could not start",
                "The container exited before the app came up." + cmd
-               + " Then retry.",
+               + logsNote + " Then retry.",
                "Try again", location.href);
+          if (s.logs) {{
+            var pre = document.createElement("pre");
+            pre.textContent = s.logs;
+            pre.style.cssText = "text-align:left;max-height:40vh;overflow:auto;"
+              + "background:#111;color:#ddd;padding:12px;border-radius:8px;"
+              + "margin:16px auto 0;max-width:90vw;white-space:pre-wrap;"
+              + "font:12px/1.5 monospace;";
+            document.body.appendChild(pre);
+          }}
           return;
         }}
         setTimeout(poll, 1500);
@@ -4746,16 +4758,21 @@ function save() {{
             # can show exactly what was attempted (the usual reason a
             # container exits is this inferred command not matching the app).
             last_command = None
+            last_logs = None
             if dev_mgr and ticket_id:
                 get_cmd = getattr(dev_mgr, "get_last_command", None)
                 if get_cmd is not None:
                     last_command = get_cmd(ticket_id, provider)
+                get_logs = getattr(dev_mgr, "get_last_logs", None)
+                if get_logs is not None:
+                    last_logs = get_logs(ticket_id, provider)
             response = JSONResponse(
                 {
                     "running": info is not None,
                     "serving": serving,
                     "url": info.url if info else None,
                     "command": last_command,
+                    "logs": last_logs,
                 }
             )
             response.headers["Access-Control-Allow-Origin"] = "*"

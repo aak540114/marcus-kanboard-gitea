@@ -1345,3 +1345,74 @@ class TestLastCommand:
         )
         # Different ticket → still None.
         assert mgr.get_last_command("8", "kanboard") is None
+
+
+class TestExitDiagnostics:
+    """--rm dropped: a dead container's logs are captured for the error page."""
+
+    @pytest.fixture
+    def docker_manager(self, tmp_path):
+        config = DevEnvironmentConfig(
+            repo_path=str(tmp_path),
+            use_docker=True,
+            auto_detect=False,
+            dev_command="npm run dev -- --port {port}",
+            port_range=(19910, 19960),
+        )
+        return DevEnvironmentManager(
+            config=config, settings_manager=DevEnvSettingsManager(data_dir=tmp_path)
+        )
+
+    def test_get_last_logs_none_by_default(self, docker_manager):
+        """No logs recorded until a container is found dead."""
+        assert docker_manager.get_last_logs("1", "kanboard") is None
+
+    @pytest.mark.asyncio
+    async def test_capture_logs_combines_stdout_and_stderr(self, docker_manager):
+        """_capture_logs merges stdout + stderr (crashes print to stderr)."""
+        with patch(
+            "subprocess.run",
+            return_value=MagicMock(returncode=0, stdout="hello\n", stderr="boom\n"),
+        ):
+            logs = await docker_manager._capture_logs("c1")
+        assert "hello" in logs and "boom" in logs
+
+    @pytest.mark.asyncio
+    async def test_capture_logs_empty_on_error(self, docker_manager):
+        """A docker error yields an empty string, not an exception."""
+        with patch("subprocess.run", side_effect=OSError("docker missing")):
+            logs = await docker_manager._capture_logs("c1")
+        assert logs == ""
+
+    @pytest.mark.asyncio
+    async def test_prune_captures_logs_and_force_removes(self, docker_manager):
+        """A dead container's logs are captured and it is force-removed."""
+        with patch(
+            "subprocess.run", return_value=MagicMock(returncode=0, stderr="")
+        ):
+            await docker_manager.start("T-40", "kanboard", "feature/z")
+
+        def _side_effect(cmd, **kwargs):
+            if cmd[:2] == ["docker", "inspect"]:
+                return MagicMock(returncode=0, stdout="false\n", stderr="")
+            if cmd[:2] == ["docker", "logs"]:
+                return MagicMock(
+                    returncode=0, stdout="", stderr="ModuleNotFoundError: flask\n"
+                )
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("subprocess.run", side_effect=_side_effect) as mock_run:
+            pruned = await docker_manager.prune_if_dead("T-40", "kanboard")
+
+        assert pruned is True
+        logs = docker_manager.get_last_logs("T-40", "kanboard")
+        assert logs is not None and "ModuleNotFoundError" in logs
+        # The dead container was force-removed.
+        rm_calls = [
+            c.args[0][:3]
+            for c in mock_run.call_args_list
+            if c.args and c.args[0][:2] == ["docker", "rm"]
+        ]
+        assert ["docker", "rm", "-f"] in rm_calls
+        # The env is pruned from the registry.
+        assert docker_manager.get_info("T-40", "kanboard") is None

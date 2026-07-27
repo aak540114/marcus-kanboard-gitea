@@ -439,6 +439,12 @@ class DevEnvironmentManager:
         # page can show exactly what was run — the usual reason a container
         # exits is that this inferred command didn't match the app's layout.
         self._last_command: Dict[str, str] = {}
+        # key = f"{provider}:{ticket_id}" → the last lines of a dead
+        # container's logs, captured by prune_if_dead the moment it detects
+        # the container exited (containers no longer run with --rm, so they
+        # linger in 'exited' state long enough to read). Shown on the
+        # "Preview could not start" page so the human can see WHY it exited.
+        self._exit_logs: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -731,6 +737,28 @@ class DevEnvironmentManager:
         """
         return self._last_command.get(f"{provider}:{ticket_id}")
 
+    def get_last_logs(self, ticket_id: str, provider: str) -> Optional[str]:
+        """Return the exited container's captured logs for a ticket, or None.
+
+        Populated by :meth:`prune_if_dead` when a preview container is found
+        dead — the tail of its stdout/stderr, so the "Preview could not
+        start" page can show why it exited.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Provider ticket identifier.
+        provider : str
+            Kanban provider name.
+
+        Returns
+        -------
+        Optional[str]
+            Captured log tail, or ``None`` if no dead container was recorded
+            for this ticket (or its logs were empty/unreadable).
+        """
+        return self._exit_logs.get(f"{provider}:{ticket_id}") or None
+
     def is_serving(self, ticket_id: str, provider: str) -> bool:
         """Return ``True`` only once the app actually accepts connections.
 
@@ -936,8 +964,12 @@ class DevEnvironmentManager:
         if result.returncode == 0 and result.stdout.strip() == "true":
             return False
 
-        # Dead: a --rm container vanishes entirely (inspect exits non-zero);
-        # a stopped one reports Running=false. Either way nothing serves.
+        # Dead: the container exited (Running=false) or is already gone
+        # (inspect non-zero). Since it no longer runs with --rm, an exited
+        # container lingers — grab its logs to explain WHY it exited, THEN
+        # force-remove it so containers don't accumulate.
+        self._exit_logs[key] = await self._capture_logs(info.container_name)
+        await self._force_remove(info.container_name)
         del self._envs[key]
         self._allocator.release(info.port)
         logger.warning(
@@ -1281,7 +1313,12 @@ class DevEnvironmentManager:
                 "docker",
                 "run",
                 "-d",
-                "--rm",
+                # NB: no --rm. A crashed container must survive in 'exited'
+                # state so prune_if_dead can read its logs and explain WHY the
+                # preview never came up. It is force-removed after its logs are
+                # captured (prune_if_dead / _stop_docker / reconcile_orphans),
+                # and any lingering same-named container is cleared just below
+                # before this run, so containers do not accumulate.
                 "--name",
                 container_name,
                 "-p",
@@ -1291,7 +1328,7 @@ class DevEnvironmentManager:
                 # the preview gets an isolated working tree and can never
                 # mutate the shared host repo. /app is deliberately NOT a bind
                 # mount — it lives in the container's writable layer and is
-                # discarded with --rm.
+                # discarded when the container is removed.
                 "-v",
                 f"{_resolve_host_repo_path(repo_path)}:/src:ro",
                 "-w",
@@ -1305,6 +1342,11 @@ class DevEnvironmentManager:
                 entrypoint,
             ]
         )
+
+        # Without --rm, a previous container of the same name (e.g. one left
+        # 'exited' after its logs were captured) would fail this run with a
+        # name collision — clear it first (best-effort).
+        await self._force_remove(container_name)
 
         loop = asyncio.get_event_loop()
         try:
@@ -1355,7 +1397,6 @@ class DevEnvironmentManager:
                     timeout=_DOCKER_CMD_TIMEOUT,
                 ),
             )
-            return True
         except subprocess.TimeoutExpired:
             logger.warning(
                 "docker stop timed out for %s after %ds (Docker daemon "
@@ -1364,6 +1405,73 @@ class DevEnvironmentManager:
                 _DOCKER_CMD_TIMEOUT,
             )
             return False
+        # Containers no longer run with --rm, so a graceful `docker stop`
+        # leaves them in 'exited' state — remove explicitly so they don't
+        # accumulate.
+        await self._force_remove(container_name)
+        return True
+
+    async def _capture_logs(self, container_name: str, tail: int = 40) -> str:
+        """Return the last *tail* lines of a container's logs (best-effort).
+
+        Used to explain WHY a preview container exited. Combines the
+        container's stdout and stderr (a crashing dev server usually prints
+        to stderr) and caps the size for the JSON response / page. Returns an
+        empty string if the container is gone or Docker errors.
+
+        Parameters
+        ----------
+        container_name : str
+            Name of the (exited) container to read.
+        tail : int
+            Maximum number of trailing log lines to fetch.
+
+        Returns
+        -------
+        str
+            The captured log tail, or ``""`` on any failure.
+        """
+        loop = asyncio.get_event_loop()
+        try:
+            result = await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    ["docker", "logs", "--tail", str(tail), container_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=_DOCKER_CMD_TIMEOUT,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - daemon down/binary missing
+            logger.warning(
+                "Could not capture logs for %s: %s", container_name, exc
+            )
+            return ""
+        combined = (result.stdout or "") + (result.stderr or "")
+        return combined.strip()[-4000:]
+
+    async def _force_remove(self, container_name: str) -> None:
+        """Force-remove a container by name (best-effort, ignores errors).
+
+        Parameters
+        ----------
+        container_name : str
+            Name of the container to ``docker rm -f``.
+        """
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    ["docker", "rm", "-f", container_name],
+                    capture_output=True,
+                    timeout=_DOCKER_CMD_TIMEOUT,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort cleanup
+            logger.debug(
+                "docker rm -f %s failed (ignored): %s", container_name, exc
+            )
 
     # ------------------------------------------------------------------
     # Local process implementation
