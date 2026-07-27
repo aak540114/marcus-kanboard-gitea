@@ -746,12 +746,90 @@ class TestMoveTaskToColumn:
         assert "closeTask" not in self._rpc_methods(kanban)
 
     @pytest.mark.asyncio
+    async def test_stale_column_map_refreshed_then_moves(self, kanban):
+        """A column missing from the CACHED map (stale after a reconciliation)
+        is found after a refresh — no full reconcile needed."""
+        kanban._client = AsyncMock()
+        kanban._column_map = {}  # stale / empty
+        kanban._column_status_map = {}
+
+        async def _refresh():
+            kanban._column_map = {"waiting for human": 5}
+            kanban._column_status_map = {5: TaskStatus.WAITING_FOR_HUMAN}
+
+        with patch.object(
+            kanban, "_refresh_columns", side_effect=_refresh
+        ), patch.object(kanban, "ensure_columns", new=AsyncMock()) as ensure:
+            kanban._client.post = AsyncMock(
+                side_effect=[
+                    _rpc_response(True),  # moveTaskPosition
+                    _rpc_response(
+                        _make_raw_task(task_id=5, column_id=5, is_active=1)
+                    ),
+                ]
+            )
+            result = await kanban.move_task_to_column("5", "Waiting for Human")
+        assert result is True
+        ensure.assert_not_awaited()  # a refresh alone fixed it
+
+    @pytest.mark.asyncio
+    async def test_missing_column_reconciled_then_moves(self, kanban):
+        """A project still on Kanboard defaults (no 'waiting for human') gets
+        reconciled to Marcus's columns, then the move succeeds."""
+        kanban._client = AsyncMock()
+        kanban._column_map = {}
+        kanban._column_status_map = {}
+        state = {"reconciled": False}
+
+        async def _refresh():
+            if state["reconciled"]:
+                kanban._column_map = {"waiting for human": 5}
+                kanban._column_status_map = {5: TaskStatus.WAITING_FOR_HUMAN}
+
+        async def _ensure(_pid):
+            state["reconciled"] = True
+            return True
+
+        with patch.object(
+            kanban, "_refresh_columns", side_effect=_refresh
+        ), patch.object(
+            kanban, "ensure_columns", side_effect=_ensure
+        ) as ensure:
+            kanban._client.post = AsyncMock(
+                side_effect=[
+                    _rpc_response(True),
+                    _rpc_response(
+                        _make_raw_task(task_id=5, column_id=5, is_active=1)
+                    ),
+                ]
+            )
+            result = await kanban.move_task_to_column("5", "Waiting for Human")
+        assert result is True
+        ensure.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_column_never_resolves(self, kanban):
+        """A truly unknown column returns False (loudly) after reconcile."""
+        kanban._client = AsyncMock()
+        kanban._column_map = {}
+        kanban._column_status_map = {}
+        with patch.object(
+            kanban, "_refresh_columns", new=AsyncMock()
+        ), patch.object(kanban, "ensure_columns", new=AsyncMock()):
+            result = await kanban.move_task_to_column("5", "Nonexistent Column")
+        assert result is False
+
+    @pytest.mark.asyncio
     async def test_returns_false_for_unknown_column(self, kanban):
-        """move_task_to_column() returns False for an unknown column name."""
+        """move_task_to_column() returns False for a column that stays unknown
+        even after a refresh + reconcile attempt."""
         kanban._client = AsyncMock()
         kanban._column_map = {"backlog": 1}
         kanban._column_status_map = {1: TaskStatus.TODO}
-        result = await kanban.move_task_to_column("5", "NonExistentColumn")
+        with patch.object(
+            kanban, "_refresh_columns", new=AsyncMock()
+        ), patch.object(kanban, "ensure_columns", new=AsyncMock()):
+            result = await kanban.move_task_to_column("5", "NonExistentColumn")
         assert result is False
 
     @pytest.mark.asyncio

@@ -438,6 +438,32 @@ class KanboardKanban(KanbanInterface):
         # Fall back to recording the assignee as a comment
         return await self.add_comment(task_id, f"[Marcus] Assigned to: {assignee_id}")
 
+    def _resolve_column_id(self, column_name: str) -> Optional[int]:
+        """Look up a column id by name in the cached map.
+
+        Case-insensitive, with a substring fallback so ``in progress`` still
+        matches a ``Work in progress`` column. Returns ``None`` when nothing
+        matches, so the caller can refresh/reconcile and retry.
+
+        Parameters
+        ----------
+        column_name : str
+            Target column name.
+
+        Returns
+        -------
+        Optional[int]
+            The Kanboard column id, or ``None`` if no column matches.
+        """
+        key = column_name.lower()
+        column_id = self._column_map.get(key)
+        if column_id is not None:
+            return column_id
+        for name, cid in self._column_map.items():
+            if key in name or name in key:
+                return cid
+        return None
+
     async def move_task_to_column(self, task_id: str, column_name: str) -> bool:
         """
         Move a task to a named column.
@@ -457,17 +483,47 @@ class KanboardKanban(KanbanInterface):
         if self._client is None:
             raise RuntimeError("Call connect() before move_task_to_column()")
 
-        column_id = self._column_map.get(column_name.lower())
+        column_id = self._resolve_column_id(column_name)
         if column_id is None:
-            # Try partial match
-            for name, cid in self._column_map.items():
-                if column_name.lower() in name or name in column_name.lower():
-                    column_id = cid
-                    break
+            # The cached column map can be STALE: a board reconciliation
+            # (Backlog→Todo, Work in progress→In Progress, add "Waiting for
+            # Human", …) may have run after connect(). Refresh from Kanboard
+            # and retry before giving up.
+            await self._refresh_columns()
+            column_id = self._resolve_column_id(column_name)
 
         if column_id is None:
+            # The project may still be on Kanboard's DEFAULT columns — a
+            # project a human created in the UI that was never reconciled to
+            # Marcus's layout. Reconcile it now and retry once. This is the
+            # usual reason a card silently refused to move to "in progress"
+            # or "waiting for human": the target column simply did not exist.
             logger.warning(
-                "Kanboard column '%s' not found in project %d. " "Available: %s",
+                "Kanboard column '%s' missing in project %d (have: %s) — "
+                "reconciling the board to Marcus's columns and retrying.",
+                column_name,
+                self._project_id,
+                list(self._column_map.keys()),
+            )
+            try:
+                await self.ensure_columns(self._project_id)
+                await self._refresh_columns()
+                column_id = self._resolve_column_id(column_name)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Column reconciliation for project %d failed: %s",
+                    self._project_id,
+                    exc,
+                )
+
+        if column_id is None:
+            # Loud, not silent: a swallowed failure here is exactly what
+            # leaves a card stuck in its column while Marcus's internal state
+            # (and its comments) march on.
+            logger.error(
+                "Cannot move task %s: column '%s' not found in project %d "
+                "even after reconciliation. Available columns: %s",
+                task_id,
                 column_name,
                 self._project_id,
                 list(self._column_map.keys()),
