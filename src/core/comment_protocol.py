@@ -201,6 +201,8 @@ class CommentFormatter:
         branch_name: str,
         assignee: str,
         ac_items: Optional[List[str]] = None,
+        *,
+        resumed_commits: Optional[List[str]] = None,
     ) -> str:
         """Comment posted when the AI agent begins work.
 
@@ -214,6 +216,16 @@ class CommentFormatter:
             Human who assigned the ticket.
         ac_items : Optional[List[str]]
             Acceptance criteria items for reference.
+        resumed_commits : Optional[List[str]]
+            One-line summaries of commits already on ``branch_name`` from a
+            PRIOR work session — i.e. the branch already existed on the
+            remote when Marcus picked this ticket up, so it resumed the
+            existing branch instead of cutting a fresh one (see
+            ``BranchManager.create_branch``). When non-empty, the comment
+            says so explicitly, so a human reading it — and the next agent,
+            which sees this comment via ``get_work_context``'s
+            ``recent_comments`` — knows to review that history and continue
+            building on it rather than assume a greenfield ticket.
 
         Returns
         -------
@@ -228,11 +240,32 @@ class CommentFormatter:
                 + "\n"
             )
 
+        if resumed_commits:
+            shown = resumed_commits[:10]
+            remaining = len(resumed_commits) - len(shown)
+            more = f"\n- …and {remaining} more" if remaining > 0 else ""
+            resume_section = (
+                f"\n**Resuming existing work** — this branch already has "
+                f"{len(resumed_commits)} commit(s) from a previous session:\n"
+                + "\n".join(f"- `{c}`" for c in shown)
+                + more
+                + "\n\nReview this history before continuing — build on it, "
+                "don't redo it.\n"
+            )
+            picked_up = (
+                f"Picked up by Marcus AI agent on behalf of "
+                f"**{assignee}** — continuing prior work.\n\n"
+            )
+        else:
+            resume_section = ""
+            picked_up = f"Picked up by Marcus AI agent on behalf of **{assignee}**.\n\n"
+
         body = (
             f"{cls._header(CommentType.STARTED, ticket_id)}\n"
             f"### Marcus Agent — Work Started\n\n"
-            f"Picked up by Marcus AI agent on behalf of **{assignee}**.\n\n"
+            f"{picked_up}"
             f"**Branch:** `{branch_name}`\n"
+            f"{resume_section}"
             f"{ac_section}"
             f"\nProgress updates will be posted as comments. "
             f"You can edit the acceptance criteria in the ticket description "

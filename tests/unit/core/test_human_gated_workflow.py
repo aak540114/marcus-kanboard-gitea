@@ -211,6 +211,66 @@ class TestAssignedTrigger:
         assert rec.assignee == "dave"
 
 
+class TestStartAiWorkResumesPriorWork:
+    """A claimed ticket is not assumed brand new: if its branch ALREADY had
+    commits (BranchManager.create_branch resumed it from the remote rather
+    than cutting it fresh — see test_git_branch_manager.py), the "started"
+    comment says so explicitly, so a human — and the next agent, which sees
+    this comment via get_work_context's recent_comments — reviews the
+    existing work and builds on it instead of assuming a greenfield ticket.
+    """
+
+    @pytest.mark.asyncio
+    async def test_fresh_ticket_posts_plain_started_comment(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """No prior commits on the branch → the ordinary "Work Started"
+        comment, no resume language."""
+        mock_branch.get_branch_commits = AsyncMock(return_value=[])
+        lifecycle.get_or_create("20", "kanboard")
+        lifecycle.transition("20", "kanboard", TicketState.READY)
+
+        event = _make_event(
+            {"ticket_id": "20", "assignee": "alice", "provider": "kanboard"}
+        )
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            return_value="ticket/kanboard/20",
+        ):
+            await workflow._on_ticket_assigned(event)
+
+        body = mock_kanban.add_comment.call_args.args[1]
+        assert "resum" not in body.lower()
+
+    @pytest.mark.asyncio
+    async def test_resumed_ticket_posts_resume_comment(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """The branch already had commits (BranchManager resumed it from the
+        remote) → the comment names the commit count and tells the reader
+        to review before continuing."""
+        mock_branch.get_branch_commits = AsyncMock(
+            return_value=["abc1234 add login form", "def5678 wire up auth"]
+        )
+        lifecycle.get_or_create("21", "kanboard")
+        lifecycle.transition("21", "kanboard", TicketState.READY)
+
+        event = _make_event(
+            {"ticket_id": "21", "assignee": "alice", "provider": "kanboard"}
+        )
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            return_value="ticket/kanboard/21",
+        ):
+            await workflow._on_ticket_assigned(event)
+
+        body = mock_kanban.add_comment.call_args.args[1]
+        low = body.lower()
+        assert "resum" in low
+        assert "2 commit" in low
+        assert "abc1234 add login form" in body
+
+
 # ---------------------------------------------------------------------------
 # Trigger: status changes to ready/in_progress with human owner → AI starts
 # ---------------------------------------------------------------------------

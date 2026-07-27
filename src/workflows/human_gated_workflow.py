@@ -979,7 +979,10 @@ class HumanGatedWorkflow:
             "You are a worker; Marcus is the manager. Do EXACTLY this:\n"
             "1. `git clone` the `context.clone_url` into a new directory and "
             "cd into it; `git checkout -B <context.branch_name> "
-            "origin/<context.branch_name>`.\n"
+            "origin/<context.branch_name>`. If `git log` shows existing "
+            "commits on this branch, this ticket was worked on before — "
+            "review that history first and continue building on it, don't "
+            "redo it from scratch.\n"
             "2. Implement every item in `context.acceptance_criteria` — make "
             "real code changes. After EACH change: `git commit` then "
             "`git push origin <context.branch_name>`. Push every commit (not "
@@ -3043,6 +3046,19 @@ class HumanGatedWorkflow:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not update kanban column to in_progress: %s", exc)
 
+        # This ticket is not necessarily brand new: create_branch RESUMES an
+        # existing remote branch rather than overwriting it (see its
+        # docstring), so check whether it already had commits from a prior
+        # session — best-effort; a lookup failure must never block starting
+        # the ticket, it just means the comment reads as a fresh start.
+        resumed_commits: List[str] = []
+        try:
+            resumed_commits = await branch_mgr.get_branch_commits(branch_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not check %s for prior commits: %s", branch_name, exc
+            )
+
         # Post "started" comment.
         ac_items = self._get_ac_items(record)
         comment = CommentFormatter.started(
@@ -3050,9 +3066,21 @@ class HumanGatedWorkflow:
             branch_name=branch_name,
             assignee=record.assignee or "AI agent",
             ac_items=ac_items,
+            resumed_commits=resumed_commits,
         )
         await self._post_comment(ticket_id, comment)
-        logger.info("AI work started for ticket %s (branch %s)", ticket_id, branch_name)
+        if resumed_commits:
+            logger.info(
+                "AI work RESUMED for ticket %s (branch %s already had %d "
+                "commit(s) from a prior session)",
+                ticket_id,
+                branch_name,
+                len(resumed_commits),
+            )
+        else:
+            logger.info(
+                "AI work started for ticket %s (branch %s)", ticket_id, branch_name
+            )
 
     async def _generate_and_post_ac(
         self,

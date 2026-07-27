@@ -22,6 +22,7 @@ mlruns/
 
 # Runtime state — generated, never commit
 data/
+repos/
 *.db
 .coverage
 htmlcov/

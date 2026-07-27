@@ -186,6 +186,19 @@ services:
       - ./src:/app/src
       - ./data:/app/data
       - ./logs:/app/logs
+      # Marcus's OWN working clones of each project (ProjectSyncWorkflow's
+      # local_repos_base, default "./repos" — see src/workflows/
+      # project_sync_workflow.py). This is where BranchManager.create_branch
+      # cuts/resumes each ticket's branch. Without this mount it lives in
+      # the container's writable layer and is wiped on every redeploy
+      # (`docker compose up -d --build`, `down`+`up`, etc.) — the container
+      # restarting mid-session did not lose it, but a redeploy did. That
+      # made create_branch's "not in Marcus's local clone" case the NORMAL
+      # case after every deploy, not an edge case; create_branch now
+      # resumes correctly from the remote either way (see its docstring),
+      # but persisting this avoids the extra fetch+re-clone on every
+      # restart in the first place.
+      - ./repos:/app/repos
       # CostStore opens ~/.marcus/costs.db (src/marcus_mcp/server.py);
       # container runs as root so $HOME=/root. Kept under ./data so all
       # Marcus state lives under one host directory.

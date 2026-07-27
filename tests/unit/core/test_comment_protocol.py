@@ -72,6 +72,47 @@ class TestCommentFormatter:
         assert "Deploy service" in body
         assert "Write tests" in body
 
+    def test_started_without_resumed_commits_has_no_resume_language(self):
+        """A genuinely new ticket's comment says nothing about resuming."""
+        body = CommentFormatter.started(
+            ticket_id="T-5",
+            branch_name="b",
+            assignee="bob",
+        )
+        assert "resum" not in body.lower()
+
+    def test_started_with_resumed_commits_flags_prior_work(self):
+        """A ticket whose branch already had commits (resumed, not fresh)
+        tells the reader there is prior work to review before continuing."""
+        body = CommentFormatter.started(
+            ticket_id="T-6",
+            branch_name="b",
+            assignee="bob",
+            resumed_commits=["abc1234 add login form", "def5678 wire up auth"],
+        )
+        low = body.lower()
+        assert "resum" in low
+        assert "2 commit" in low
+        assert "abc1234 add login form" in body
+        assert "def5678 wire up auth" in body
+        assert "review" in low
+
+    def test_started_resumed_commits_truncated_with_count(self):
+        """A long commit history is truncated with an explicit '…and N more'
+        rather than dumping every commit into the comment."""
+        commits = [f"{i:07x} commit {i}" for i in range(15)]
+        body = CommentFormatter.started(
+            ticket_id="T-7",
+            branch_name="b",
+            assignee="bob",
+            resumed_commits=commits,
+        )
+        assert "15 commit" in body.lower()
+        assert "and 5 more" in body.lower()
+        # Only the first 10 are listed verbatim.
+        assert commits[9] in body
+        assert commits[10] not in body
+
     def test_progress_bar_renders(self):
         """progress comment renders a text progress bar."""
         body = CommentFormatter.progress(

@@ -173,9 +173,17 @@ so a private repo just clones):
 git clone <clone_url from get_work_context> my-ticket-workspace
 cd my-ticket-workspace
 git checkout -B <branch_name from get_work_context> origin/<branch_name>
+git log --oneline main..HEAD   # anything here? this ticket was worked on before
 ```
 
 Now read the `description` and `acceptance_criteria` before writing any code.
+
+> **This ticket may not be brand new.** Marcus resumes a ticket's existing
+> branch rather than overwriting it, so `git log` above may show commits
+> from a previous session (yours or another agent's) — check the "started"
+> comment on the ticket too, it says explicitly when this is a resume.
+> Review that history first and continue building on it; don't redo it from
+> scratch.
 
 > If `clone_url` came back without credentials (your Marcus sets
 > `MARCUS_EMBED_GIT_CREDENTIALS=false`), configure a git credential helper or

@@ -148,27 +148,75 @@ class BranchManager:
         from_branch: Optional[str] = None,
         force: bool = False,
     ) -> bool:
-        """Create a new local branch.
+        """Create a ticket's branch, resuming it if it already exists.
+
+        A ticket is not necessarily "brand new" just because Marcus's OWN
+        local git clone doesn't have its branch: an agent's prior commits
+        live on the REMOTE, and this clone is not guaranteed to be
+        persistent (e.g. it can be recreated on every container redeploy).
+        Assuming "not local = never worked on" and cutting a fresh branch
+        from ``from_branch`` would silently discard that history, and the
+        follow-up push would then be rejected as a non-fast-forward the
+        instant the remote has anything Marcus's fresh local branch
+        doesn't — surfacing as "branch already exists" / a failed ticket
+        claim, even though the fix is simply to resume what is already
+        there.
+
+        So (unless ``force=True``) the REMOTE is checked first: if it
+        already has ``branch_name``, the local branch is reset to match it
+        (``git checkout -B branch_name FETCH_HEAD``) and returned as
+        resumed — existing commits are kept, not overwritten. Only when the
+        remote genuinely has no such branch does this fall back to the
+        original behaviour: reuse the local branch if Marcus's own clone
+        already has it, otherwise cut a fresh one from ``from_branch``.
 
         Parameters
         ----------
         branch_name : str
-            Name for the new branch.
+            Name for the branch.
         from_branch : Optional[str]
-            Starting point; defaults to ``config.main_branch``.
+            Starting point when no prior work exists anywhere; defaults to
+            ``config.main_branch``.
         force : bool
-            Overwrite an existing local branch if it exists.
+            Ignore any existing remote/local branch and always cut a fresh
+            one from ``from_branch`` — used by callers that explicitly want
+            to start over (e.g. after an already-merged ticket is reopened).
 
         Returns
         -------
         bool
-            ``True`` if the branch was created (or already existed).
+            ``True`` if the branch was created, resumed, or already existed.
         """
         base = from_branch or self.config.main_branch
 
+        if not force:
+            fetch_rc, _, _ = await self._git(
+                "fetch", self.config.remote, branch_name
+            )
+            if fetch_rc == 0:
+                rc, _, stderr = await self._git(
+                    "checkout", "-B", branch_name, "FETCH_HEAD"
+                )
+                if rc != 0:
+                    logger.error(
+                        "Branch %s exists on %s but checkout failed: %s",
+                        branch_name,
+                        self.config.remote,
+                        stderr,
+                    )
+                    return False
+                logger.info(
+                    "Branch %s already exists on %s — resuming prior work "
+                    "instead of creating fresh from %s",
+                    branch_name,
+                    self.config.remote,
+                    base,
+                )
+                return await self._publish(branch_name, force=force)
+
         already_local = await self.branch_exists(branch_name)
         if not already_local or force:
-            # Ensure we have the latest main, then cut the branch from it.
+            # No prior work anywhere (or force=True): cut the branch fresh.
             await self._git("fetch", self.config.remote, base)
             checkout = "-B" if force else "-b"
             rc, _, stderr = await self._git(
@@ -183,21 +231,41 @@ class BranchManager:
         else:
             logger.info("Branch %s already exists locally", branch_name)
 
-        # Publish the branch to the remote so it is visible on Gitea and the
-        # agent (and human reviewers) can see and push to it.
-        #
-        # Two deliberate changes from the old behaviour, both of which caused
-        # a "Marcus never created the branch on Gitea" symptom:
-        #   1. Push even when the branch already existed LOCALLY. A prior run
-        #      could have created it locally but failed to push; the old early
-        #      `return True` then meant it was never retried, so the branch
-        #      lived only in Marcus's clone forever.
-        #   2. PROPAGATE a push failure (return False) instead of discarding
-        #      the result. A silently-dropped push left a local-only branch
-        #      while callers proceeded as if it were on the remote — the agent
-        #      then couldn't `git checkout origin/<branch>`, worked on a
-        #      local-only branch, and its own pushes had no upstream, so its
-        #      commits never reached Gitea.
+        return await self._publish(branch_name, force=force)
+
+    async def _publish(self, branch_name: str, *, force: bool = False) -> bool:
+        """Push *branch_name* to the remote when ``push_on_create`` is set.
+
+        Shared tail of :meth:`create_branch`'s resume and create paths, so
+        every branch — whichever path produced it — is reliably published
+        the same way (a resumed branch's push is a provable no-op, since the
+        local ref now exactly matches what was just fetched).
+
+        Two deliberate properties, both fixing a "Marcus never created the
+        branch on Gitea" symptom the old code had:
+        1. Pushes even when the branch already existed LOCALLY. A prior run
+           could have created it locally but failed to push; skipping the
+           push here would mean it's never retried, so the branch would
+           live only in Marcus's clone forever.
+        2. PROPAGATES a push failure as ``False`` instead of discarding the
+           result. A silently-dropped push left a local-only branch while
+           callers proceeded as if it were on the remote — the agent then
+           couldn't ``git checkout origin/<branch>``, worked on a
+           local-only branch, and its own pushes had no upstream, so its
+           commits never reached Gitea.
+
+        Parameters
+        ----------
+        branch_name : str
+            Local branch to publish.
+        force : bool
+            Passed through to :meth:`push` as ``--force-with-lease``.
+
+        Returns
+        -------
+        bool
+            ``True`` if published (or ``push_on_create`` is disabled).
+        """
         if self.config.push_on_create:
             pushed = await self.push(branch_name, force=force)
             if not pushed:

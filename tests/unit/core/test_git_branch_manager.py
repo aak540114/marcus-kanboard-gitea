@@ -126,6 +126,32 @@ class TestMergeFetchesAgentBranch:
         )
 
 
+def _fake_git_no_remote_branch(overrides=None):
+    """Build a fake_git where `fetch origin <branch>` fails (branch absent
+    on the remote) — the common baseline for the "genuinely new ticket"
+    tests below, which must never trip the resume path.
+
+    Parameters
+    ----------
+    overrides : Optional[Callable[[tuple], Optional[tuple]]]
+        Called with each call's args first; if it returns a non-None
+        result, that result is used instead of the default.
+    """
+
+    async def fake_git(*args):
+        if overrides is not None:
+            result = overrides(args)
+            if result is not None:
+                return result
+        if args[0] == "fetch" and args[-1] == "ticket/kanboard/7":
+            return (1, "", "couldn't find remote ref")
+        if args[0] == "show-ref":
+            return (1, "", "")
+        return (0, "", "")
+
+    return fake_git
+
+
 class TestCreateBranchPublishesToRemote:
     """create_branch must reliably PUBLISH the branch to the remote (Gitea).
 
@@ -140,14 +166,7 @@ class TestCreateBranchPublishesToRemote:
     async def test_new_branch_is_pushed_to_remote(self):
         """A freshly created branch is pushed with -u to the remote."""
         mgr = _mgr()
-        # show-ref (branch_exists) → 1 (absent); everything else → 0.
-
-        async def fake_git(*args):
-            if args[0] == "show-ref":
-                return (1, "", "")
-            return (0, "", "")
-
-        mgr._git = AsyncMock(side_effect=fake_git)
+        mgr._git = AsyncMock(side_effect=_fake_git_no_remote_branch())
 
         ok = await mgr.create_branch("ticket/kanboard/7")
 
@@ -160,14 +179,12 @@ class TestCreateBranchPublishesToRemote:
         """If the push fails, create_branch returns False (not a silent True)."""
         mgr = _mgr()
 
-        async def fake_git(*args):
-            if args[0] == "show-ref":
-                return (1, "", "")          # branch absent locally
+        def overrides(args):
             if args[0] == "push":
-                return (1, "", "denied")    # push rejected
-            return (0, "", "")
+                return (1, "", "denied")
+            return None
 
-        mgr._git = AsyncMock(side_effect=fake_git)
+        mgr._git = AsyncMock(side_effect=_fake_git_no_remote_branch(overrides))
 
         ok = await mgr.create_branch("ticket/kanboard/7")
 
@@ -175,16 +192,17 @@ class TestCreateBranchPublishesToRemote:
 
     @pytest.mark.asyncio
     async def test_existing_local_branch_is_still_pushed(self):
-        """A branch that already exists LOCALLY is still pushed to the remote
-        (a prior run may have created it without a successful push)."""
+        """A branch that already exists LOCALLY (and NOT yet on the remote)
+        is still pushed (a prior run may have created it without a
+        successful push)."""
         mgr = _mgr()
 
-        async def fake_git(*args):
+        def overrides(args):
             if args[0] == "show-ref":
-                return (0, "", "")          # branch already present locally
-            return (0, "", "")
+                return (0, "", "")  # branch already present locally
+            return None
 
-        mgr._git = AsyncMock(side_effect=fake_git)
+        mgr._git = AsyncMock(side_effect=_fake_git_no_remote_branch(overrides))
 
         ok = await mgr.create_branch("ticket/kanboard/7")
 
@@ -200,10 +218,42 @@ class TestCreateBranchPublishesToRemote:
         mgr = BranchManager(
             BranchManagerConfig(repo_path="/tmp/fake-repo", push_on_create=False)
         )
+        mgr._git = AsyncMock(side_effect=_fake_git_no_remote_branch())
+
+        ok = await mgr.create_branch("ticket/kanboard/7")
+
+        assert ok is True
+        assert not any(c[0] == "push" for c in _calls(mgr._git))
+
+
+class TestCreateBranchResumesFromRemote:
+    """A ticket branch that already exists on the remote — from a PRIOR
+    session, an agent's earlier commits, or simply because Marcus's own
+    local clone is not guaranteed to be persistent (e.g. recreated on a
+    redeploy) — must be RESUMED, not silently overwritten.
+
+    Regression: create_branch only ever checked LOCAL branch existence. When
+    the local clone didn't have the branch (however that happened) it always
+    cut a fresh branch from main and then tried to push it — which Git
+    rejects as a non-fast-forward whenever the remote already has commits
+    the fresh local branch doesn't, i.e. exactly "fails because it already
+    exists". The fix: always check the REMOTE for this exact branch first,
+    and resume it (checkout -B <branch> FETCH_HEAD) instead of creating
+    fresh, whenever the remote already has it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_resumes_when_remote_branch_exists_and_local_absent(self):
+        """Remote has the branch (prior agent commits); local clone does
+        not. The branch is checked out from FETCH_HEAD, NOT created fresh
+        from main — no non-fast-forward push."""
+        mgr = _mgr()
 
         async def fake_git(*args):
+            if args[0] == "fetch" and args[-1] == "ticket/kanboard/7":
+                return (0, "", "")  # remote HAS this branch
             if args[0] == "show-ref":
-                return (1, "", "")
+                return (1, "", "")  # not present in Marcus's local clone
             return (0, "", "")
 
         mgr._git = AsyncMock(side_effect=fake_git)
@@ -211,7 +261,100 @@ class TestCreateBranchPublishesToRemote:
         ok = await mgr.create_branch("ticket/kanboard/7")
 
         assert ok is True
-        assert not any(c[0] == "push" for c in _calls(mgr._git))
+        calls = _calls(mgr._git)
+        # Resumed from the remote tip...
+        assert ("checkout", "-B", "ticket/kanboard/7", "FETCH_HEAD") in calls
+        # ...never cut fresh from main.
+        assert not any(
+            c[0] == "checkout" and "origin/main" in c for c in calls
+        )
+
+    @pytest.mark.asyncio
+    async def test_resumes_even_when_local_branch_already_exists(self):
+        """Remote has NEWER commits than Marcus's own (stale) local branch —
+        resuming from the remote (not the stale local ref) is what makes the
+        follow-up push provably a no-op instead of a non-fast-forward
+        rejection."""
+        mgr = _mgr()
+
+        async def fake_git(*args):
+            if args[0] == "fetch" and args[-1] == "ticket/kanboard/7":
+                return (0, "", "")
+            if args[0] == "show-ref":
+                return (0, "", "")  # ALSO present locally (but stale)
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+
+        ok = await mgr.create_branch("ticket/kanboard/7")
+
+        assert ok is True
+        calls = _calls(mgr._git)
+        assert ("checkout", "-B", "ticket/kanboard/7", "FETCH_HEAD") in calls
+
+    @pytest.mark.asyncio
+    async def test_resume_checkout_failure_returns_false(self):
+        """A failed checkout of the fetched remote tip is a hard failure,
+        not silently swallowed."""
+        mgr = _mgr()
+
+        async def fake_git(*args):
+            if args[0] == "fetch" and args[-1] == "ticket/kanboard/7":
+                return (0, "", "")
+            if args[0] == "checkout":
+                return (1, "", "error: pathspec conflict")
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+
+        ok = await mgr.create_branch("ticket/kanboard/7")
+
+        assert ok is False
+
+    @pytest.mark.asyncio
+    async def test_resume_still_verifies_push(self):
+        """The resumed branch still goes through the same push step (a
+        provable no-op, since local now exactly matches FETCH_HEAD) — one
+        code path, not a special-cased early return."""
+        mgr = _mgr()
+
+        async def fake_git(*args):
+            if args[0] == "fetch" and args[-1] == "ticket/kanboard/7":
+                return (0, "", "")
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+
+        ok = await mgr.create_branch("ticket/kanboard/7")
+
+        assert ok is True
+        assert ("push", "-u", "origin", "ticket/kanboard/7") in _calls(mgr._git)
+
+    @pytest.mark.asyncio
+    async def test_force_bypasses_resume_and_creates_fresh(self):
+        """force=True means 'start over' — it must NOT resume the remote
+        branch, even if one exists (this is what rebase_on_main/other
+        explicit-recreate callers rely on)."""
+        mgr = _mgr()
+        calls_seen = []
+
+        async def fake_git(*args):
+            calls_seen.append(args)
+            if args[0] == "fetch" and args[-1] == "ticket/kanboard/7":
+                return (0, "", "")  # remote has it — must be ignored
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+
+        ok = await mgr.create_branch("ticket/kanboard/7", force=True)
+
+        assert ok is True
+        # No resume fetch of the ticket branch itself, and no FETCH_HEAD
+        # checkout — force always cuts fresh from base.
+        assert not any(
+            c[0] == "fetch" and c[-1] == "ticket/kanboard/7" for c in calls_seen
+        )
+        assert ("checkout", "-B", "ticket/kanboard/7", "origin/main") in calls_seen
 
 
 class TestSyncBranch:
