@@ -2886,6 +2886,71 @@ class TestDecomposition:
         assert lifecycle.get("100", "kanboard").state == TicketState.BLOCKED
         # ...and its Kanboard card is moved to the Blocked column.
         mock_kanban.move_task_to_column.assert_any_await("100", "blocked")
+        # Each child's card is moved to Ready (not left in Kanboard's
+        # createTask default column) — this is the visible "inherits
+        # status from parent" behaviour on the board itself.
+        mock_kanban.move_task_to_column.assert_any_await("201", "ready")
+        mock_kanban.move_task_to_column.assert_any_await("202", "ready")
+
+    @pytest.mark.asyncio
+    async def test_child_move_to_ready_failure_is_logged(
+        self, workflow, lifecycle, mock_kanban, caplog
+    ):
+        """A child's card failing to move to Ready is surfaced at WARNING —
+        not swallowed. Marcus's internal lifecycle state still ends up
+        READY (unaffected by the board-side failure), but a human has no
+        way to notice a stuck card without this log."""
+        self._big_ticket(lifecycle)
+
+        async def fake_llm(prompt):
+            return (
+                '{"subtasks": [{"title": "Backend", "description": "api", '
+                '"acceptance_criteria": "- [ ] api"}, {"title": "Frontend", '
+                '"description": "ui", "acceptance_criteria": "- [ ] ui"}]}'
+            )
+        workflow._llm_generate = fake_llm
+
+        created = {"n": 200}
+
+        async def fake_create(data):
+            created["n"] += 1
+            t = MagicMock()
+            t.id = str(created["n"])
+            t.name = data["name"]
+            return t
+
+        mock_kanban.create_task = AsyncMock(side_effect=fake_create)
+        mock_kanban.create_task_link = AsyncMock(return_value=True)
+        parent = MagicMock(description="do a lot")
+        parent.name = "Big"
+        parent.source_context = {"kanboard_task": {"project_id": 3}}
+        mock_kanban.get_task_by_id = AsyncMock(return_value=parent)
+
+        # Child 201's move to Ready fails; 202's succeeds.
+        async def move(ticket_id, column):
+            return not (ticket_id == "201" and column == "ready")
+
+        mock_kanban.move_task_to_column = AsyncMock(side_effect=move)
+
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            children = await workflow.decompose_ticket("100")
+
+        assert children == ["201", "202"]
+        # Internal lifecycle state is still READY regardless of the
+        # board-side move outcome for either child.
+        assert lifecycle.get("201", "kanboard").state == TicketState.READY
+        assert lifecycle.get("202", "kanboard").state == TicketState.READY
+        assert any(
+            "201" in r.message and "ready" in r.message.lower()
+            for r in caplog.records
+        )
+        # 202 (which DID move successfully) is not spuriously warned about.
+        assert not any(
+            "202" in r.message and "ready" in r.message.lower()
+            for r in caplog.records
+        )
 
     @pytest.mark.asyncio
     async def test_atomic_ticket_not_decomposed(

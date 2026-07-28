@@ -1241,10 +1241,30 @@ class HumanGatedWorkflow:
                     + f"\n<!-- Sub-ticket of #{ticket_id} -->"
                 ),
             )
+            # Check the result: move_task_to_column returns False (no
+            # exception) when the board has no matching column or the task
+            # actually lives in a different Kanboard project than expected
+            # — exactly how a child silently stayed in Kanboard's default
+            # "Todo" column instead of visibly inheriting Ready from its
+            # parent. Surface that at WARNING so it's diagnosable instead
+            # of vanishing at debug level (matches the parent's own
+            # move-to-blocked handling below).
+            child_moved = False
             try:
-                await self._kanban.move_task_to_column(child_id, "ready")
+                child_moved = await self._kanban.move_task_to_column(
+                    child_id, "ready"
+                )
             except Exception as exc:  # noqa: BLE001
-                logger.debug("Could not move sub-ticket to ready: %s", exc)
+                logger.warning(
+                    "Could not move sub-ticket %s to ready: %s", child_id, exc
+                )
+            if not child_moved:
+                logger.warning(
+                    "Sub-ticket %s did NOT move to the 'Ready' column (stayed "
+                    "in Kanboard's default column). It is READY in Marcus's "
+                    "lifecycle regardless.",
+                    child_id,
+                )
             if owner:
                 try:
                     self._lifecycle.set_assignee(child_id, self._provider, owner)
