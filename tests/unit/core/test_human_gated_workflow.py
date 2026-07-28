@@ -3658,3 +3658,58 @@ class TestProjectAccessGate:
         result = await workflow.orchestrate_work(agent_id="worker-Y")
 
         assert result["status"] == "no_work"
+
+    @pytest.mark.asyncio
+    async def test_disabled_project_does_not_generate_ac_on_new_ticket(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """A brand-new ticket in a disabled project must not get an
+        AI-generated acceptance-criteria comment or description edit —
+        _on_ticket_new's AC-generation path is a Kanboard write (add_comment
+        + update_task) just like _start_ai_work's branch/claim, and must be
+        gated the same way."""
+        self._wire_task_project(mock_kanban, 9)
+        mock_project_access.is_enabled = MagicMock(return_value=False)
+        workflow._generate_and_post_ac = AsyncMock()
+        event = _make_event(
+            {
+                "ticket_id": "50",
+                "provider": "kanboard",
+                "task": {
+                    "id": "50",
+                    "title": "New ticket, disabled project",
+                    "description": "",
+                    "status": "todo",
+                },
+            }
+        )
+
+        await workflow._on_ticket_new(event)
+
+        workflow._generate_and_post_ac.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_enabled_project_generates_ac_on_new_ticket(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """Sanity check: an enabled project's new ticket still gets AC
+        generated as before (the gate must not block the normal path)."""
+        self._wire_task_project(mock_kanban, 11)
+        mock_project_access.is_enabled = MagicMock(return_value=True)
+        workflow._generate_and_post_ac = AsyncMock()
+        event = _make_event(
+            {
+                "ticket_id": "51",
+                "provider": "kanboard",
+                "task": {
+                    "id": "51",
+                    "title": "New ticket, enabled project",
+                    "description": "",
+                    "status": "todo",
+                },
+            }
+        )
+
+        await workflow._on_ticket_new(event)
+
+        workflow._generate_and_post_ac.assert_called_once()

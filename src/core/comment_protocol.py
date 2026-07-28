@@ -46,7 +46,14 @@ from typing import Any, Dict, List, Optional
 # ``<!-- END_MARCUS_COMMENT -->`` sentinels rendered as literal text on the
 # card; they have been removed. Detection and type are derived from the
 # title instead (nothing machine-readable is embedded in the body).
-_TITLE_RE = re.compile(r"^\s*#{1,6}\s+Marcus\b.*$", re.MULTILINE)
+#
+# Every title Marcus actually generates is "### Marcus Agent — …" or
+# "### Marcus AI Verifier — …" (see CommentFormatter below) — the regex
+# requires "Agent"/"AI" right after "Marcus" specifically so it can't
+# match a human reply that merely opens with a heading addressed TO
+# Marcus (e.g. "# Marcus, please also fix X"), which would otherwise be
+# mistaken for Marcus's own comment and silently dropped.
+_TITLE_RE = re.compile(r"^\s*#{1,6}\s+Marcus\s+(?:Agent|AI)\b.*$", re.MULTILINE)
 
 #: Maps a distinctive phrase in a comment's ``### Marcus …`` title to its
 #: type. Order matters: more specific phrases (round verification) come

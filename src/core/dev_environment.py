@@ -970,7 +970,12 @@ class DevEnvironmentManager:
         # force-remove it so containers don't accumulate.
         self._exit_logs[key] = await self._capture_logs(info.container_name)
         await self._force_remove(info.container_name)
-        del self._envs[key]
+        # A concurrent call for the same key (e.g. two open browser tabs
+        # both polling /api/dev-env-status) can win the race and remove
+        # this entry first during the awaits above — pop rather than a
+        # bare del so the second caller doesn't raise KeyError.
+        if self._envs.pop(key, None) is None:
+            return False
         self._allocator.release(info.port)
         logger.warning(
             "Dev env for %s is dead (container %s no longer running) — "
@@ -1358,12 +1363,21 @@ class DevEnvironmentManager:
             )
         except subprocess.TimeoutExpired:
             self._allocator.release(port)
+            # The client-side call timed out, but the daemon may have
+            # created (or even started) the container anyway — it was
+            # never registered into self._envs, so nothing else will ever
+            # clean it up. Best-effort remove it before raising.
+            await self._force_remove(container_name)
             raise RuntimeError(
                 f"Docker container start timed out after {_DOCKER_CMD_TIMEOUT}s "
                 "(Docker daemon unresponsive?)"
             ) from None
         if result.returncode != 0:
             self._allocator.release(port)
+            # Same leak risk as above: a non-zero exit can still mean the
+            # container was created before it failed (e.g. crashed on
+            # entrypoint) — clear it rather than leaving it orphaned.
+            await self._force_remove(container_name)
             raise RuntimeError(f"Docker container start failed: {result.stderr[:400]}")
 
         return DevEnvironmentInfo(

@@ -190,9 +190,31 @@ class BranchManager:
         base = from_branch or self.config.main_branch
 
         if not force:
-            fetch_rc, _, _ = await self._git(
+            fetch_rc, _, fetch_stderr = await self._git(
                 "fetch", self.config.remote, branch_name
             )
+            if fetch_rc != 0:
+                # A non-zero exit here is normal (and expected) when the
+                # branch simply doesn't exist yet on the remote — git says
+                # so via "couldn't find remote ref". Anything else (a
+                # network blip, an auth hiccup) is a real, worth-surfacing
+                # error that would otherwise silently fall through to
+                # "create fresh" with no trace of why the resume path was
+                # skipped.
+                if "couldn't find remote ref" in fetch_stderr:
+                    logger.debug(
+                        "No existing branch %s on %s (creating fresh)",
+                        branch_name,
+                        self.config.remote,
+                    )
+                else:
+                    logger.warning(
+                        "Could not check %s for branch %s (falling back to "
+                        "local/fresh): %s",
+                        self.config.remote,
+                        branch_name,
+                        fetch_stderr.strip(),
+                    )
             if fetch_rc == 0:
                 rc, _, stderr = await self._git(
                     "checkout", "-B", branch_name, "FETCH_HEAD"
@@ -476,7 +498,7 @@ class BranchManager:
                 remote,
                 main,
             )
-            ok = await self.create_branch(branch_name)
+            ok = await self.create_branch(branch_name, force=True)
             if not ok:
                 return False
             await self._git("checkout", branch_name)

@@ -1691,3 +1691,20 @@ class TestRpcRetry:
         result = await kanban._rpc("moveTaskPosition", task_id=1)
         assert result is True
         assert call_count["n"] == 2
+
+    @pytest.mark.asyncio
+    async def test_does_not_retry_on_read_timeout(self, kanban):
+        """A ReadTimeout (unlike a ConnectError) means the request may
+        already have reached and been processed by the Kanboard server —
+        the client just never saw the response. Blindly retrying a
+        non-idempotent write like createComment risks posting it twice, so
+        this must NOT be retried the way a pre-send ConnectError is."""
+        import httpx
+
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            side_effect=httpx.ReadTimeout("timed out waiting for response")
+        )
+        with pytest.raises(httpx.ReadTimeout):
+            await kanban._rpc("createComment", task_id=1, content="hi")
+        assert kanban._client.post.await_count == 1

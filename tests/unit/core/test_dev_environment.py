@@ -785,6 +785,54 @@ class TestDockerCommandTimeouts:
         alloc.release(port)
 
     @pytest.mark.asyncio
+    async def test_start_docker_timeout_force_removes_container(
+        self, docker_manager
+    ):
+        """A hung `docker run` may still have created the container on the
+        daemon side even though the client-side call timed out (no --rm is
+        passed, so it isn't auto-cleaned). The failure path must force-remove
+        it by name AFTER the failed run — not just the pre-run best-effort
+        clear — or it leaks forever since it was never registered into
+        self._envs."""
+        with patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["docker", "run"], timeout=60),
+        ) as mock_run:
+            with pytest.raises(RuntimeError, match="timed out"):
+                await docker_manager.start("T-45", "kanboard", "ticket/kanboard/t-45")
+
+        rm_calls = [
+            c.args[0][:3]
+            for c in mock_run.call_args_list
+            if c.args and c.args[0][:2] == ["docker", "rm"]
+        ]
+        # One pre-run "clear a stale same-name container" call always
+        # happens; the fix under test adds a SECOND one after the failure.
+        assert rm_calls.count(["docker", "rm", "-f"]) >= 2
+
+    @pytest.mark.asyncio
+    async def test_start_docker_nonzero_exit_force_removes_container(
+        self, docker_manager
+    ):
+        """A `docker run` that reports a non-zero exit can still have left a
+        container behind (e.g. it started then immediately crashed) — the
+        failure path must force-remove it by name before raising, in
+        addition to the pre-run best-effort clear."""
+        with patch(
+            "subprocess.run",
+            return_value=MagicMock(returncode=1, stderr="entrypoint failed"),
+        ) as mock_run:
+            with pytest.raises(RuntimeError, match="Docker container start failed"):
+                await docker_manager.start("T-46", "kanboard", "ticket/kanboard/t-46")
+
+        rm_calls = [
+            c.args[0][:3]
+            for c in mock_run.call_args_list
+            if c.args and c.args[0][:2] == ["docker", "rm"]
+        ]
+        assert rm_calls.count(["docker", "rm", "-f"]) >= 2
+
+    @pytest.mark.asyncio
     async def test_stop_docker_timeout_does_not_raise(self, docker_manager):
         """A hung `docker stop` doesn't raise, but must NOT report success —
         the container's real state is unknown, so bookkeeping (and the
@@ -1416,3 +1464,41 @@ class TestExitDiagnostics:
         assert ["docker", "rm", "-f"] in rm_calls
         # The env is pruned from the registry.
         assert docker_manager.get_info("T-40", "kanboard") is None
+
+    @pytest.mark.asyncio
+    async def test_prune_concurrent_call_does_not_raise_keyerror(
+        self, docker_manager
+    ):
+        """/api/dev-env-status is polled every ~1.5s per open page, so two
+        browser tabs (or a reload racing an in-flight poll) can both call
+        prune_if_dead for the same just-died container. Between reading
+        self._envs and deleting the entry, this method does two awaits
+        (_capture_logs, _force_remove) — a second concurrent call can slip
+        in and finish first. The del must not blow up when another caller
+        already removed the entry."""
+        with patch(
+            "subprocess.run", return_value=MagicMock(returncode=0, stderr="")
+        ):
+            await docker_manager.start("T-41", "kanboard", "feature/race")
+
+        def _inspect_dead(cmd, **kwargs):
+            if cmd[:2] == ["docker", "inspect"]:
+                return MagicMock(returncode=0, stdout="false\n", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        real_force_remove = docker_manager._force_remove
+        key = "kanboard:T-41"
+
+        async def _force_remove_and_simulate_racing_prune(container_name):
+            # Simulate a second concurrent prune_if_dead call reaching
+            # `del self._envs[key]` first, in the window between our own
+            # read of `info` and our own delete.
+            docker_manager._envs.pop(key, None)
+            return await real_force_remove(container_name)
+
+        with patch("subprocess.run", side_effect=_inspect_dead):
+            docker_manager._force_remove = _force_remove_and_simulate_racing_prune
+            pruned = await docker_manager.prune_if_dead("T-41", "kanboard")
+
+        assert pruned in (True, False)  # must not raise KeyError
+        assert docker_manager.get_info("T-41", "kanboard") is None

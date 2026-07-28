@@ -216,6 +216,17 @@ class TestCommentParser:
         """is_marcus_comment returns False for plain human text."""
         assert CommentParser.is_marcus_comment("Please add more tests.") is False
 
+    def test_is_marcus_comment_false_for_human_heading_addressed_to_marcus(self):
+        """A human's revision request that happens to open with a Markdown
+        heading whose first word is 'Marcus' must NOT be mistaken for
+        Marcus's own comment — every real Marcus title is '### Marcus
+        Agent — …' or '### Marcus AI Verifier — …', never bare 'Marcus'
+        followed directly by something else. Getting this wrong means
+        _on_comment_added silently drops the human's revision request
+        (treats it as Marcus's own comment and returns early)."""
+        body = "# Marcus, please also fix the logout redirect\n\nDetails below."
+        assert CommentParser.is_marcus_comment(body) is False
+
     def test_parse_ac_generated(self):
         """parse() correctly identifies ac_generated comments."""
         body = CommentFormatter.ac_generated("T-2", "- [ ] test")

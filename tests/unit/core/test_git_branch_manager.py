@@ -331,6 +331,59 @@ class TestCreateBranchResumesFromRemote:
         assert ("push", "-u", "origin", "ticket/kanboard/7") in _calls(mgr._git)
 
     @pytest.mark.asyncio
+    async def test_transient_fetch_error_is_logged_not_silently_swallowed(
+        self, caplog
+    ):
+        """A non-zero fetch exit means EITHER 'no such branch on the
+        remote' (the common, expected case) OR a transient failure
+        (network blip, auth hiccup) — git's own error text is the only
+        way to tell them apart. Previously the fetch's stderr was
+        discarded entirely and both cases fell through to 'create fresh'
+        with no log trail explaining why the resume path wasn't taken.
+        A transient error must be visible in the logs."""
+        import logging
+
+        mgr = _mgr()
+
+        async def fake_git(*args):
+            if args[0] == "fetch" and args[-1] == "ticket/kanboard/7":
+                return (128, "", "fatal: unable to access 'origin': timed out")
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+
+        with caplog.at_level(logging.WARNING):
+            ok = await mgr.create_branch("ticket/kanboard/7")
+
+        assert ok is True  # still falls through to create-fresh
+        assert any(
+            "timed out" in record.message or "timed out" in record.getMessage()
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_branch_not_found_on_remote_does_not_warn(self, caplog):
+        """The everyday case — a genuinely new ticket whose branch simply
+        doesn't exist yet on the remote — must NOT be logged as a warning;
+        only real errors should be surfaced that way."""
+        import logging
+
+        mgr = _mgr()
+
+        async def fake_git(*args):
+            if args[0] == "fetch" and args[-1] == "ticket/kanboard/8":
+                return (128, "", "fatal: couldn't find remote ref ticket/kanboard/8")
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+
+        with caplog.at_level(logging.WARNING):
+            ok = await mgr.create_branch("ticket/kanboard/8")
+
+        assert ok is True
+        assert not any(record.levelno >= logging.WARNING for record in caplog.records)
+
+    @pytest.mark.asyncio
     async def test_force_bypasses_resume_and_creates_fresh(self):
         """force=True means 'start over' — it must NOT resume the remote
         branch, even if one exists (this is what rebase_on_main/other
@@ -355,6 +408,49 @@ class TestCreateBranchResumesFromRemote:
             c[0] == "fetch" and c[-1] == "ticket/kanboard/7" for c in calls_seen
         )
         assert ("checkout", "-B", "ticket/kanboard/7", "origin/main") in calls_seen
+
+
+class TestRebaseOnMainRecreatesWithForce:
+    """When a ticket is reopened after its branch was already merged (and
+    thus deleted locally), rebase_on_main must recreate it with
+    force=True — create_branch's own docstring names exactly this caller
+    as the intended use case for that flag, since the point is to start
+    fresh rather than resume whatever the remote might still have under
+    the old branch name."""
+
+    @pytest.mark.asyncio
+    async def test_recreate_passes_force_true(self):
+        mgr = _mgr()
+        calls_seen = []
+
+        async def fake_git(*args):
+            calls_seen.append(args)
+            if args[0] == "checkout" and args[1] == "ticket/kanboard/9":
+                return (1, "", "error: pathspec did not match")  # deleted locally
+            if args[0] == "rebase":
+                return (0, "", "")
+            if args[0] == "push":
+                return (0, "", "")
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+
+        ok = await mgr.rebase_on_main("ticket/kanboard/9")
+
+        assert ok is True
+        # force=True cuts fresh from origin/main — it must NOT take the
+        # non-force resume path (checkout -B branch_name FETCH_HEAD),
+        # which would silently keep whatever old history the remote might
+        # still have under this branch name instead of starting over.
+        assert (
+            "checkout",
+            "-B",
+            "ticket/kanboard/9",
+            "origin/main",
+        ) in calls_seen
+        assert not any(
+            c[0] == "checkout" and c[-1] == "FETCH_HEAD" for c in calls_seen
+        )
 
 
 class TestSyncBranch:

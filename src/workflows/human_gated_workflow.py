@@ -333,16 +333,26 @@ class HumanGatedWorkflow:
         # can be auto-started like any other ready+assigned ticket.
         is_subticket = "Sub-ticket of #" in (record.acceptance_criteria or "")
         if not is_subticket:
-            # If there's no Marcus AC block yet, generate one.
+            # If there's no Marcus AC block yet, generate one — but only for
+            # a project a human has explicitly enabled Marcus for (see the
+            # same gate in _start_ai_work). This is a Kanboard write
+            # (add_comment + update_task) just like claiming a ticket, so a
+            # disabled project must not get it either.
             existing_ac = ACParser.extract(description)
             if existing_ac is None:
-                await self._generate_and_post_ac(
-                    ticket_id=ticket_id,
-                    title=title,
-                    description=description,
-                    was_human_created=True,
-                    record=record,
+                kanboard_project_id = await self._resolve_kanboard_project_id(
+                    ticket_id
                 )
+                if kanboard_project_id is None or self._project_access.is_enabled(
+                    kanboard_project_id
+                ):
+                    await self._generate_and_post_ac(
+                        ticket_id=ticket_id,
+                        title=title,
+                        description=description,
+                        was_human_created=True,
+                        record=record,
+                    )
             else:
                 # AC already present (AI-created ticket) — just store the hash.
                 if not record.ac_hash:

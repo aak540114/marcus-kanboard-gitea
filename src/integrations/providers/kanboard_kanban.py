@@ -1278,13 +1278,17 @@ class KanboardKanban(KanbanInterface):
 
         Retries a TRANSIENT failure — an HTTP 5xx (Kanboard's SQLite
         backend can raise "database is locked" as an uncaught PHP
-        exception under write contention) or a network-level error
-        (connection refused/timeout) — up to :data:`_RPC_MAX_ATTEMPTS`
-        times with short exponential backoff. Does NOT retry a 4xx (not
-        transient — retrying just re-hits the same rejection) or a
-        well-formed ``{"error": ...}`` JSON-RPC response (Kanboard
-        successfully processed the request and is telling us it's
-        invalid — retrying achieves nothing).
+        exception under write contention) or a pre-send connection error
+        (``httpx.ConnectError`` — e.g. connection refused) — up to
+        :data:`_RPC_MAX_ATTEMPTS` times with short exponential backoff.
+        Does NOT retry a 4xx (not transient — retrying just re-hits the
+        same rejection), a well-formed ``{"error": ...}`` JSON-RPC
+        response (Kanboard successfully processed the request and is
+        telling us it's invalid — retrying achieves nothing), or any
+        other ``httpx.TransportError`` (``ReadTimeout``/``WriteTimeout``/
+        ``PoolTimeout``/etc.) — those can occur after the request already
+        reached the server, so retrying risks duplicating a non-idempotent
+        write.
 
         Parameters
         ----------
@@ -1306,8 +1310,9 @@ class KanboardKanban(KanbanInterface):
             On HTTP-level failures (4xx immediately; 5xx after exhausting
             retries).
         httpx.TransportError
-            On a persistent connection-level failure after exhausting
-            retries (covers ``ConnectError``/``TimeoutException``/etc.).
+            On a persistent ``ConnectError`` after exhausting retries, or
+            immediately for any other transport-level failure (timeouts,
+            network errors) which is never retried.
         """
         self._rpc_id += 1
         body: Dict[str, Any] = {
@@ -1344,7 +1349,15 @@ class KanboardKanban(KanbanInterface):
                 )
                 await asyncio.sleep(_RPC_RETRY_BASE_DELAY * (2**attempt))
                 continue
-            except httpx.TransportError as exc:
+            except httpx.ConnectError as exc:
+                # ConnectError happens before the request reaches the
+                # server — always safe to retry. Other TransportError
+                # subtypes (ReadTimeout/WriteTimeout/PoolTimeout/
+                # NetworkError) can occur AFTER the request was already
+                # transmitted and possibly processed server-side; blindly
+                # retrying those risks duplicating a non-idempotent write
+                # (e.g. createComment), so they are deliberately not
+                # caught here and propagate immediately instead.
                 if last_attempt:
                     logger.error(
                         "Kanboard API connection error for method '%s': %s",
