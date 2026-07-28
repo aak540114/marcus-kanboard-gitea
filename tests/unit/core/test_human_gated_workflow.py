@@ -107,7 +107,26 @@ def mock_ac_gen():
 
 
 @pytest.fixture
-def workflow(lifecycle, mock_kanban, mock_branch, mock_dev_env, mock_ac_gen):
+def mock_project_access():
+    """Mock ProjectAccessSettingManager, permissive by default.
+
+    The real manager defaults every unconfigured project to DISABLED (see
+    TestProjectAccessGate below for the dedicated tests of that
+    restriction) — but every OTHER test in this file predates the
+    access-gate feature and exercises tickets whose "project" is whatever
+    a given test wires up. Defaulting this mock to always-enabled keeps
+    those tests exercising what they actually test, instead of all
+    incidentally failing at the new gate.
+    """
+    pa = MagicMock()
+    pa.is_enabled = MagicMock(return_value=True)
+    return pa
+
+
+@pytest.fixture
+def workflow(
+    lifecycle, mock_kanban, mock_branch, mock_dev_env, mock_ac_gen, mock_project_access
+):
     """HumanGatedWorkflow wired with mocked dependencies."""
     events = Events()
     wf = HumanGatedWorkflow(
@@ -118,6 +137,7 @@ def workflow(lifecycle, mock_kanban, mock_branch, mock_dev_env, mock_ac_gen):
         branch_manager=mock_branch,
         dev_env_manager=mock_dev_env,
         ac_generator=mock_ac_gen,
+        project_access=mock_project_access,
     )
     with patch(
         "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
@@ -3514,3 +3534,127 @@ class TestUsageSanitization:
         from src.workflows.human_gated_workflow import _ACCOUNT_ID_MAX
         res = await workflow.orchestrate_work(agent_id="A" * 5000)
         assert len(res["agent_id"]) <= _ACCOUNT_ID_MAX
+
+
+class TestProjectAccessGate:
+    """A ticket's Kanboard project must be explicitly enabled for Marcus (via
+    ProjectAccessSettingManager) before Marcus — or any AI agent — claims or
+    starts work on it. Default is OFF: an unconfigured project is refused.
+    """
+
+    def _wire_task_project(self, mock_kanban, project_id):
+        """Make get_task_by_id resolve to a task in *project_id*."""
+        task = MagicMock()
+        task.source_context = {"kanboard_task": {"project_id": project_id}}
+        mock_kanban.get_task_by_id = AsyncMock(return_value=task)
+
+    @pytest.mark.asyncio
+    async def test_disabled_project_refuses_to_start(
+        self, workflow, lifecycle, mock_kanban, mock_branch, mock_project_access
+    ):
+        """A ticket in a project that is NOT enabled never gets a branch,
+        a claim, or a 'Started' comment."""
+        self._wire_task_project(mock_kanban, 9)
+        mock_project_access.is_enabled = MagicMock(return_value=False)
+        lifecycle.get_or_create("30", "kanboard")
+        lifecycle.transition("30", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("30", "kanboard", "alice")
+
+        await workflow._start_ai_work("30", lifecycle.get("30", "kanboard"))
+
+        mock_branch.create_branch.assert_not_called()
+        rec = lifecycle.get("30", "kanboard")
+        assert rec.ai_agent_id is None
+        assert rec.state != TicketState.IN_PROGRESS
+
+    @pytest.mark.asyncio
+    async def test_enabled_project_starts_normally(
+        self, workflow, lifecycle, mock_kanban, mock_branch, mock_project_access
+    ):
+        """An explicitly enabled project's ticket starts exactly as before."""
+        self._wire_task_project(mock_kanban, 9)
+        mock_project_access.is_enabled = MagicMock(return_value=True)
+        lifecycle.get_or_create("31", "kanboard")
+        lifecycle.transition("31", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("31", "kanboard", "alice")
+
+        # Unrelated downstream gate (does the project have a known tech
+        # stack?) — satisfy it so the test can observe MY gate specifically,
+        # not get stopped one step further down for a different reason.
+        with patch(
+            "src.core.project_description.ProjectDescriptionManager.get_stack",
+            return_value={"language": "python"},
+        ):
+            await workflow._start_ai_work("31", lifecycle.get("31", "kanboard"))
+
+        mock_branch.create_branch.assert_called_once()
+        rec = lifecycle.get("31", "kanboard")
+        assert rec.state == TicketState.IN_PROGRESS
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_project_does_not_block(
+        self, workflow, lifecycle, mock_kanban, mock_branch, mock_project_access
+    ):
+        """When the ticket's project can't be determined (non-Kanboard
+        provider, RPC failure — get_task_by_id returns None), the access
+        gate does not apply; existing single-project/non-Kanboard
+        deployments are unaffected."""
+        mock_kanban.get_task_by_id = AsyncMock(return_value=None)
+        mock_project_access.is_enabled = MagicMock(return_value=False)
+        lifecycle.get_or_create("32", "kanboard")
+        lifecycle.transition("32", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("32", "kanboard", "alice")
+
+        await workflow._start_ai_work("32", lifecycle.get("32", "kanboard"))
+
+        mock_branch.create_branch.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_orchestrate_skips_disabled_project_ticket(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """_next_worker_ticket (via orchestrate_work) skips a disabled-
+        project ticket that sorts first and hands out the next eligible
+        one instead of starving the agent forever."""
+
+        async def fake_get_task(ticket_id):
+            task = MagicMock()
+            pid = 9 if ticket_id == "40" else 11
+            task.source_context = {"kanboard_task": {"project_id": pid}}
+            return task
+
+        mock_kanban.get_task_by_id = AsyncMock(side_effect=fake_get_task)
+        mock_project_access.is_enabled = MagicMock(side_effect=lambda pid: pid == 11)
+
+        lifecycle.get_or_create("40", "kanboard")  # project 9 — disabled
+        lifecycle.transition("40", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("40", "kanboard", "alice")
+
+        lifecycle.get_or_create("41", "kanboard")  # project 11 — enabled
+        lifecycle.transition("41", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("41", "kanboard", "bob")
+
+        with patch(
+            "src.core.project_description.ProjectDescriptionManager.get_stack",
+            return_value={"language": "python"},
+        ):
+            result = await workflow.orchestrate_work(agent_id="worker-Z")
+
+        assert result["ticket_id"] == "41"
+        assert lifecycle.get("40", "kanboard").ai_agent_id is None
+
+    @pytest.mark.asyncio
+    async def test_orchestrate_reports_no_work_when_all_disabled(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """Every candidate disabled → orchestrate_work reports no_work
+        rather than getting stuck retrying a ticket it will never start."""
+        self._wire_task_project(mock_kanban, 9)
+        mock_project_access.is_enabled = MagicMock(return_value=False)
+        lifecycle.get_or_create("42", "kanboard")
+        lifecycle.transition("42", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("42", "kanboard", "alice")
+
+        result = await workflow.orchestrate_work(agent_id="worker-Y")
+
+        assert result["status"] == "no_work"

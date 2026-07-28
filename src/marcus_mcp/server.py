@@ -3473,6 +3473,36 @@ def _get_gate_settings_mgr(server: "MarcusServer") -> Any:
     return mgr
 
 
+def _get_project_access_mgr(server: "MarcusServer") -> Any:
+    """Return the shared ProjectAccessSettingManager singleton, once built.
+
+    Must be shared between the ``/api/project-enabled`` routes,
+    ``HumanGatedWorkflow`` (which refuses to start a ticket in a
+    non-enabled project), and ``ProjectWatcher`` (which refuses to
+    auto-provision one) — same reasoning as :func:`_get_gate_settings_mgr`:
+    it loads its JSON file into memory once and never re-reads it, so two
+    separate instances would silently diverge and a human's toggle flip in
+    the Kanboard UI would never reach the components that enforce it.
+
+    Parameters
+    ----------
+    server : MarcusServer
+        The running server instance.
+
+    Returns
+    -------
+    ProjectAccessSettingManager
+        The shared project-access settings manager.
+    """
+    from src.core.project_access_settings import ProjectAccessSettingManager
+
+    mgr = getattr(server, "_project_access_mgr", None)
+    if mgr is None:
+        mgr = ProjectAccessSettingManager()
+        server._project_access_mgr = mgr  # type: ignore[attr-defined]
+    return mgr
+
+
 def _resolve_ticket_branch(server: "MarcusServer", ticket_id: str, provider: str) -> str:
     """Return a ticket's real persisted branch name, falling back to convention.
 
@@ -3907,6 +3937,12 @@ async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
             poll_interval=poll_interval,
             state_path="./data/known_projects.json",
             is_provisioned=is_provisioned,
+            # A project not explicitly enabled by a human (via the
+            # Kanboard board header's "Marcus" toggle / /api/project-
+            # enabled) never gets auto-provisioned — no Gitea repo, no
+            # column reconciliation. Default is disabled; see
+            # ProjectAccessSettingManager.
+            is_enabled=_get_project_access_mgr(server).is_enabled,
         )
         await watcher.start()
         server._project_watcher = watcher  # type: ignore[attr-defined]
@@ -3984,6 +4020,10 @@ async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
         # would keep auto-merging off a stale "ai" gate after a human
         # switched the project back to human-gated in the UI.
         gate_settings=_get_gate_settings_mgr(server),
+        # MUST be the same instance the /api/project-enabled routes AND
+        # ProjectWatcher write through / read from — same reasoning as
+        # gate_settings above.
+        project_access=_get_project_access_mgr(server),
         ac_generator=ac_generator,
         desc_inferrer=desc_inferrer,
         # Summarizes worker reports into one-line ticket comments in
@@ -5120,6 +5160,102 @@ function save() {{
                 logger.warning("project_seen(%d) failed: %s", pid, exc)
             return _cors(JSONResponse({"ok": True, "emitted": emitted}))
 
+        async def project_enabled_api(request: Request) -> JSONResponse:
+            """GET/PUT whether Marcus is allowed to work on a project at all.
+
+            A project not explicitly enabled here is completely off-limits:
+            no Gitea repo, no column reconciliation, no ticket claimed by
+            Marcus or any AI agent. Default is disabled — a human opts a
+            project in via this route (surfaced as the Kanboard board
+            header's "Marcus" toggle). This is a SEPARATE axis from gate
+            mode (/api/gate-setting), which governs HOW Marcus works on a
+            project it is already allowed to touch.
+
+            GET  /api/project-enabled?project_id=<id>
+                Returns: {"project_id": int, "enabled": bool}
+
+            PUT  /api/project-enabled
+                Body (JSON): {"project_id": int, "enabled": bool}
+                Enabling immediately triggers provisioning (Gitea repo +
+                column reconciliation) if not already done, instead of
+                waiting for the slow backstop poll. Disabling blocks NEW
+                ticket claims from the next poll/webhook onward; a ticket
+                an agent is already mid-way through is not force-stopped.
+            """
+            def _cors(r: JSONResponse) -> JSONResponse:
+                r.headers["Access-Control-Allow-Origin"] = "*"
+                r.headers["Access-Control-Allow-Methods"] = "GET, PUT, OPTIONS"
+                return r
+
+            access_mgr = _get_project_access_mgr(server)
+
+            if request.method == "PUT":
+                try:
+                    body = await request.json()
+                except Exception:
+                    return _cors(
+                        JSONResponse({"error": "invalid JSON"}, status_code=400)
+                    )
+                pid_raw = body.get("project_id")
+                enabled = body.get("enabled")
+                if (
+                    not isinstance(pid_raw, int)
+                    or isinstance(pid_raw, bool)
+                    or not isinstance(enabled, bool)
+                ):
+                    return _cors(
+                        JSONResponse(
+                            {
+                                "error": "project_id (int) and enabled (bool) "
+                                "required"
+                            },
+                            status_code=400,
+                        )
+                    )
+                access_mgr.set_project_enabled(pid_raw, enabled)
+                if enabled:
+                    watcher = getattr(server, "_project_watcher", None)
+                    if watcher is not None:
+                        try:
+                            await watcher.notify_project(pid_raw)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "Could not immediately provision newly-"
+                                "enabled project %d: %s (the backstop poll "
+                                "will retry)",
+                                pid_raw,
+                                exc,
+                            )
+                return _cors(
+                    JSONResponse(
+                        {"saved": True, "project_id": pid_raw, "enabled": enabled}
+                    )
+                )
+
+            # GET
+            pid_str = request.query_params.get("project_id", "").strip()
+            if not pid_str:
+                return _cors(
+                    JSONResponse(
+                        {"error": "project_id query parameter is required"},
+                        status_code=400,
+                    )
+                )
+            try:
+                pid = int(pid_str)
+            except ValueError:
+                return _cors(
+                    JSONResponse(
+                        {"error": "project_id must be a numeric Kanboard id"},
+                        status_code=400,
+                    )
+                )
+            return _cors(
+                JSONResponse(
+                    {"project_id": pid, "enabled": access_mgr.is_enabled(pid)}
+                )
+            )
+
         async def events_stream(request: Request) -> StreamingResponse:
             """Server-Sent Events stream that pushes a "refresh" the instant
             Marcus changes anything (a comment posted, a card moved, a state
@@ -5266,6 +5402,11 @@ function save() {{
                     "/api/project-seen",
                     project_seen,
                     methods=["GET", "OPTIONS"],
+                ),
+                Route(
+                    "/api/project-enabled",
+                    project_enabled_api,
+                    methods=["GET", "PUT", "OPTIONS"],
                 ),
                 Route("/api/events/stream", events_stream, methods=["GET"]),
                 Route("/project-description", project_description_page, methods=["GET"]),

@@ -63,6 +63,7 @@ class ProjectWatcher:
         poll_interval: float = 60.0,
         state_path: str = "./data/known_projects.json",
         is_provisioned: Optional[Callable[[int], bool]] = None,
+        is_enabled: Optional[Callable[[int], bool]] = None,
     ) -> None:
         """Initialise the watcher.
 
@@ -77,6 +78,17 @@ class ProjectWatcher:
             scope returning 403) is retried instead of being skipped
             forever after the first sighting. Without it, the legacy
             emit-once-per-id behaviour applies.
+        is_enabled : Optional[Callable[[int], bool]]
+            Predicate returning ``True`` only when a human has explicitly
+            enabled this project for Marcus (see
+            ``ProjectAccessSettingManager``). When supplied, a project for
+            which this returns ``False`` NEVER gets ``project.created``
+            emitted — no auto-created Gitea repo, no column reconciliation
+            — regardless of ``is_provisioned``/known-set state. Re-checked
+            every poll, so a project enabled after the fact starts being
+            provisioned on the very next poll, no restart needed. Without
+            this predicate, every discovered project is treated as
+            allowed (the pre-access-gate default).
         """
         self._rpc_url = kanboard_url
         self._auth = httpx.BasicAuth("jsonrpc", api_token)
@@ -84,6 +96,7 @@ class ProjectWatcher:
         self._poll_interval = poll_interval
         self._state_path = state_path
         self._is_provisioned = is_provisioned
+        self._is_enabled = is_enabled
 
         self._known_ids: Set[int] = self._load_known_ids()
         self._task: Optional[asyncio.Task] = None  # type: ignore[type-arg]
@@ -139,6 +152,14 @@ class ProjectWatcher:
             pid = int(project.get("id", 0))
             if not pid:
                 continue
+            if self._is_enabled is not None and not self._is_enabled(pid):
+                # Never mark a disabled project "known" — that would make
+                # the emit-once-per-id fallback below permanently suppress
+                # it even after a human later enables it, since it would
+                # already be in _known_ids from being seen (and skipped)
+                # while disabled. Skip it entirely; it is retried in full
+                # every poll until enabled.
+                continue
             if self._needs_emit(pid):
                 await self._emit_project_created(project)
             self._known_ids.add(pid)
@@ -148,11 +169,18 @@ class ProjectWatcher:
     def _needs_emit(self, pid: int) -> bool:
         """Whether ``project.created`` should be emitted for *pid* now.
 
+        A project that fails the ``is_enabled`` access-control check never
+        emits, checked first and independent of everything else below — a
+        disabled project must never get auto-provisioned regardless of
+        known-set/is_provisioned state.
+
         With an ``is_provisioned`` predicate, emit whenever the project is
         NOT yet provisioned — so a failed downstream creation is retried
         each poll until it succeeds. Without one, fall back to
         emit-once-per-id via the persisted known set.
         """
+        if self._is_enabled is not None and not self._is_enabled(pid):
+            return False
         if self._is_provisioned is not None:
             return not self._is_provisioned(pid)
         return pid not in self._known_ids
@@ -236,6 +264,12 @@ class ProjectWatcher:
 
         pid = int(project.get("id", 0))
         if not pid:
+            return False
+
+        if self._is_enabled is not None and not self._is_enabled(pid):
+            # Never mark a disabled project "known" — see poll_once's
+            # identical guard for why (this method shares _needs_emit's
+            # emit-once-per-id fallback and its known-set side effect).
             return False
 
         emitted = False

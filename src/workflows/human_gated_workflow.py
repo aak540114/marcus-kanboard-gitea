@@ -62,6 +62,7 @@ from src.core.comment_protocol import CommentFormatter, CommentParser
 from src.core.dev_environment import DevEnvironmentManager
 from src.core.events import Events
 from src.core.gate_settings import GateMode, GateSettingManager
+from src.core.project_access_settings import ProjectAccessSettingManager
 from src.core.git_branch_manager import BranchManager, BranchManagerConfig
 from src.core.models import TaskStatus
 from src.core.ticket_lifecycle import (
@@ -178,6 +179,7 @@ class HumanGatedWorkflow:
         dev_env_manager: Optional[DevEnvironmentManager] = None,
         ac_generator: Optional[ACGenerator] = None,
         gate_settings: Optional[GateSettingManager] = None,
+        project_access: Optional[ProjectAccessSettingManager] = None,
         ai_verifier: Optional[AIVerifier] = None,
         desc_inferrer: Optional[Any] = None,
         llm_generate: Optional[Any] = None,
@@ -198,6 +200,7 @@ class HumanGatedWorkflow:
         self._dev_env = dev_env_manager or DevEnvironmentManager()
         self._ac_gen = ac_generator or ACGenerator()
         self._gate = gate_settings or GateSettingManager()
+        self._project_access = project_access or ProjectAccessSettingManager()
         self._verifier = ai_verifier or AIVerifier()
         # Optional ProjectDescriptionInferrer — when set, a ticket whose
         # project has no usable tech stack gets one inferred from the ticket
@@ -1338,7 +1341,7 @@ class HumanGatedWorkflow:
                 )
         return child_ids
 
-    def _next_worker_ticket(self) -> Optional[str]:
+    async def _next_worker_ticket(self) -> Optional[str]:
         """Return the next human-readied ticket to hand a worker, or ``None``.
 
         HUMAN-TRIGGERED selection: Marcus only hands out tickets that are
@@ -1348,6 +1351,13 @@ class HumanGatedWorkflow:
         Kanboard "0" no-owner sentinel), and is not already held by a worker
         (an internal ``marcus-`` slot claim from the human-gated auto-start is
         fine — the worker adopts it).
+
+        Candidates whose Kanboard project is not enabled for Marcus are
+        skipped (not just refused): _start_ai_work would refuse them too,
+        but since this method returns only ONE ticket — the lowest id — a
+        disabled-project ticket sitting first in sort order would otherwise
+        starve every agent forever, retried every ~10s while legitimately
+        available tickets in enabled projects never get reached.
         """
         def _key(rec: TicketRecord) -> int:
             try:
@@ -1371,7 +1381,18 @@ class HumanGatedWorkflow:
             and not _held_by_worker(r)
         ]
         candidates.sort(key=_key)
-        return candidates[0].ticket_id if candidates else None
+        for candidate in candidates:
+            pid = await self._resolve_kanboard_project_id(candidate.ticket_id)
+            if pid is not None and not self._project_access.is_enabled(pid):
+                logger.debug(
+                    "Skipping ticket %s for worker hand-out: project %d is "
+                    "not enabled for Marcus",
+                    candidate.ticket_id,
+                    pid,
+                )
+                continue
+            return candidate.ticket_id
+        return None
 
     async def orchestrate_work(
         self,
@@ -1496,7 +1517,7 @@ class HumanGatedWorkflow:
             }
 
         # 3. No active ticket → assign the next available one.
-        next_id = self._next_worker_ticket()
+        next_id = await self._next_worker_ticket()
         if next_id is None:
             return {
                 "status": "no_work",
@@ -2909,6 +2930,34 @@ class HumanGatedWorkflow:
                 "reopen handler",
                 ticket_id,
             )
+            return
+
+        # Project access gate: Marcus (and any AI agent) must not claim or
+        # touch a ticket whose Kanboard project has not been explicitly
+        # enabled by a human — see ProjectAccessSettingManager. Checked
+        # before the dependency gate below (no point spending an RPC
+        # resolving dependencies for a ticket Marcus isn't allowed to
+        # touch) and before any claim is taken, so there is nothing to
+        # unwind on the early return besides the release-if-present below
+        # (matches the failed-branch-creation bail-out further down).
+        # Unresolvable project id (non-Kanboard provider, RPC failure)
+        # does not block — the access gate only applies where it can
+        # actually be evaluated.
+        kanboard_project_id = await self._resolve_kanboard_project_id(ticket_id)
+        if kanboard_project_id is not None and not self._project_access.is_enabled(
+            kanboard_project_id
+        ):
+            logger.info(
+                "Refusing to start ticket %s: Kanboard project %d is not "
+                "enabled for Marcus (toggle it on from the project's board "
+                "header).",
+                ticket_id,
+                kanboard_project_id,
+            )
+            try:
+                self._lifecycle.release_ticket(ticket_id, self._provider)
+            except KeyError:
+                pass
             return
 
         # Preemptive dependency gate: never START a ticket whose "is blocked

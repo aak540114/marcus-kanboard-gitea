@@ -35,6 +35,7 @@ $projectId        = $project['id'] ?? '';
 $descUrl          = $marcusUrl . '/project-description?project_id=' . urlencode((string) $projectId)
                   . ($marcusToken !== '' ? '&token=' . urlencode($marcusToken) : '');
 $gateApiBase      = $marcusUrl . '/api/gate-setting';
+$projectEnabledUrl = $marcusUrl . '/api/project-enabled';
 $devEnvSettingUrl = $marcusUrl . '/api/dev-env-setting';
 $projectRepoUrl   = $marcusUrl . '/api/project-repo?project_id=' . urlencode((string) $projectId);
 // Carry the token in the query string (not a header) so the instant
@@ -78,6 +79,40 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
 }
 #marcus-agent-badge:hover + #marcus-agent-tooltip,
 #marcus-agent-badge:focus + #marcus-agent-tooltip { display:block; }
+
+/* ── Project access toggle (master switch) ──────────────────────────────
+   Whether Marcus — and any AI agent — is allowed to touch THIS project's
+   tickets at all. Default OFF: a project a human hasn't explicitly
+   enabled gets no Gitea repo, no column reconciliation, no claimed
+   tickets. Separate from (and shown before) the Human/AI Gate toggle
+   below, which only governs HOW Marcus works once it's already allowed
+   to. */
+.marcus-access-toggle {
+    padding: 4px 12px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 700;
+    border: 1px solid;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.marcus-access-toggle.on {
+    background: #f0fdf4;
+    color: #15803d;
+    border-color: #86efac;
+}
+.marcus-access-toggle.off {
+    background: #fef2f2;
+    color: #b91c1c;
+    border-color: #fca5a5;
+}
+.marcus-access-toggle:disabled {
+    opacity: 0.6;
+    cursor: default;
+}
 
 /* ── Gate toggle ─────────────────────────────────────────────────────── */
 .marcus-gate-wrap {
@@ -207,6 +242,13 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
 
 <div style="padding: 0 16px 2px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
 
+    <!-- Project access toggle (master switch) -->
+    <button id="marcus-access-toggle" class="marcus-access-toggle off"
+            onclick="toggleProjectAccess()" disabled
+            title="Whether Marcus and AI agents may work on this project's tickets at all">
+        &#128274; Marcus: checking&hellip;
+    </button>
+
     <!-- Active agents badge -->
     <div style="position: relative; display: inline-block;">
         <span id="marcus-agent-badge" class="idle" title="">
@@ -279,6 +321,7 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
 (function () {
     var AGENTS_URL       = <?= json_encode($apiUrl) ?>;
     var GATE_URL         = <?= json_encode($gateApiBase) ?>;
+    var PROJECT_ENABLED_URL = <?= json_encode($projectEnabledUrl) ?>;
     var DEV_ENV_SETTING_URL = <?= json_encode($devEnvSettingUrl) ?>;
     var PROJECT_REPO_URL = <?= json_encode($projectRepoUrl) ?>;
     var PROJECT_SEEN_URL = <?= json_encode($projectSeenUrl) ?>;
@@ -303,6 +346,53 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
             return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
         });
     }
+
+    /* ── Project access toggle (master switch) ─────────────────────────
+       Whether Marcus/AI agents may work on THIS project's tickets at
+       all. Independent of — and loaded/toggled separately from — the
+       Human/AI Gate toggle below. Default OFF until a human opts in. */
+    (function () {
+        var btn = document.getElementById('marcus-access-toggle');
+        if (!btn || !PROJECT_ID) { return; }
+
+        function render(enabled) {
+            btn.classList.toggle('on', enabled);
+            btn.classList.toggle('off', !enabled);
+            btn.innerHTML = enabled
+                ? '&#128275; Marcus: ON for this project'
+                : '&#128274; Marcus: OFF for this project';
+            btn.title = enabled
+                ? 'Marcus and AI agents may claim and work this project\'s tickets. Click to disable.'
+                : 'Marcus will not touch this project\'s tickets (no repo, no claims, no agents). Click to enable.';
+        }
+
+        fetch(PROJECT_ENABLED_URL + '?project_id=' + PROJECT_ID, {
+            cache: 'no-store', headers: marcusHeaders(),
+        })
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                render(!!data.enabled);
+                btn.disabled = false;
+            })
+            .catch(function () {
+                render(false);
+                btn.disabled = false;
+            });
+
+        window.toggleProjectAccess = function () {
+            var next = !btn.classList.contains('on');
+            btn.disabled = true;
+            fetch(PROJECT_ENABLED_URL, {
+                method: 'PUT',
+                headers: marcusHeaders({ 'Content-Type': 'application/json' }),
+                body: JSON.stringify({ project_id: PROJECT_ID, enabled: next }),
+            })
+                .then(function (r) { return r.json(); })
+                .then(function () { render(next); })
+                .catch(function () { /* keep current visual state */ })
+                .finally(function () { btn.disabled = false; });
+        };
+    })();
 
     /* ── Instant new-project signal (push, replaces the poll) ─────────────
        Kanboard has no server-side "project created" event or webhook, so the

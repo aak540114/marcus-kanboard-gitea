@@ -390,3 +390,102 @@ class TestNotifyProject:
         with open(state_file) as f:
             data = json.load(f)
         assert 15 in data["known_ids"]
+
+
+class TestIsEnabledGate:
+    """A project not enabled for Marcus (ProjectAccessSettingManager) must
+    never get project.created emitted for it — no auto-created Gitea repo,
+    no column reconciliation — regardless of is_provisioned/known-set state.
+    """
+
+    @pytest.mark.asyncio
+    async def test_disabled_project_never_emits(self, state_file, events):
+        w = ProjectWatcher(
+            kanboard_url="http://x/jsonrpc.php",
+            api_token="t",
+            events=events,
+            state_path=state_file,
+            is_enabled=lambda pid: False,
+        )
+        projects = [{"id": 9, "name": "New", "description": ""}]
+        with patch.object(
+            ProjectWatcher, "_fetch_projects", AsyncMock(return_value=projects)
+        ):
+            await w.poll_once()
+        events.publish.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_enabled_project_emits_normally(self, state_file, events):
+        w = ProjectWatcher(
+            kanboard_url="http://x/jsonrpc.php",
+            api_token="t",
+            events=events,
+            state_path=state_file,
+            is_enabled=lambda pid: True,
+        )
+        projects = [{"id": 9, "name": "New", "description": ""}]
+        with patch.object(
+            ProjectWatcher, "_fetch_projects", AsyncMock(return_value=projects)
+        ):
+            await w.poll_once()
+        events.publish.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_is_enabled_predicate_does_not_gate(self, state_file, events):
+        """Without an is_enabled predicate, behaviour is unchanged (legacy
+        emit-once-per-id / is_provisioned logic applies untouched)."""
+        w = ProjectWatcher(
+            kanboard_url="http://x/jsonrpc.php",
+            api_token="t",
+            events=events,
+            state_path=state_file,
+        )
+        projects = [{"id": 9, "name": "New", "description": ""}]
+        with patch.object(
+            ProjectWatcher, "_fetch_projects", AsyncMock(return_value=projects)
+        ):
+            await w.poll_once()
+        events.publish.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_disabled_project_notify_also_does_not_emit(
+        self, state_file, events
+    ):
+        """The instant-push path (notify_project) respects the same gate."""
+        w = ProjectWatcher(
+            kanboard_url="http://x/jsonrpc.php",
+            api_token="t",
+            events=events,
+            state_path=state_file,
+            is_enabled=lambda pid: False,
+        )
+        project = {"id": 9, "name": "New", "description": ""}
+        with patch.object(
+            ProjectWatcher, "_fetch_project", AsyncMock(return_value=project)
+        ):
+            emitted = await w.notify_project(9)
+        assert emitted is False
+        events.publish.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_re_polls_disabled_project_once_enabled(self, state_file, events):
+        """A project that WAS disabled starts emitting the moment the
+        predicate reports it enabled — the human flipping the toggle takes
+        effect on the very next poll, no restart needed."""
+        state = {"enabled": False}
+        w = ProjectWatcher(
+            kanboard_url="http://x/jsonrpc.php",
+            api_token="t",
+            events=events,
+            state_path=state_file,
+            is_enabled=lambda pid: state["enabled"],
+        )
+        projects = [{"id": 9, "name": "New", "description": ""}]
+        with patch.object(
+            ProjectWatcher, "_fetch_projects", AsyncMock(return_value=projects)
+        ):
+            await w.poll_once()
+            events.publish.assert_not_awaited()
+            state["enabled"] = True
+            await w.poll_once()
+        events.publish.assert_awaited_once()
