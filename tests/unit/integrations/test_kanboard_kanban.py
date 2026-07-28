@@ -1562,3 +1562,132 @@ class TestEnsureColumns:
     async def test_raises_if_not_connected(self, kanban):
         with pytest.raises(RuntimeError, match="connect()"):
             await kanban.ensure_columns(7)
+
+
+# ---------------------------------------------------------------------------
+# _rpc() retry-on-transient-failure tests
+# ---------------------------------------------------------------------------
+
+
+class TestRpcRetry:
+    """_rpc() must retry a TRANSIENT Kanboard failure (5xx / network error —
+    e.g. a fleeting SQLite "database is locked" surfacing as an uncaught PHP
+    exception → HTTP 500) instead of hard-failing the whole operation on the
+    first hiccup. It must NOT retry a clean JSON-RPC error response (Kanboard
+    successfully processed the request and told us it's invalid) or a 4xx —
+    those are not transient, and retrying just delays the same failure.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_sleep(self):
+        """Retries would otherwise really sleep (with backoff) and slow the
+        suite; every test here patches asyncio.sleep to a no-op."""
+        with patch("asyncio.sleep", new=AsyncMock()):
+            yield
+
+    @pytest.mark.asyncio
+    async def test_retries_on_5xx_then_succeeds(self, kanban):
+        """A transient 500 is retried and a subsequent success is returned."""
+        import httpx
+
+        kanban._client = AsyncMock()
+        err_response = MagicMock()
+        err_response.status_code = 500
+        err_response.text = "database is locked"
+        call_count = {"n": 0}
+
+        async def post(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise httpx.HTTPStatusError(
+                    "500", request=MagicMock(), response=err_response
+                )
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.json = MagicMock(return_value={"jsonrpc": "2.0", "result": 42})
+            return resp
+
+        kanban._client.post = AsyncMock(side_effect=post)
+        result = await kanban._rpc("getTask", task_id=1)
+        assert result == 42
+        assert call_count["n"] == 2
+
+    @pytest.mark.asyncio
+    async def test_gives_up_after_max_attempts(self, kanban):
+        """Persistent 5xx failures still eventually raise, bounded."""
+        import httpx
+
+        kanban._client = AsyncMock()
+        err_response = MagicMock()
+        err_response.status_code = 500
+        err_response.text = "database is locked"
+        kanban._client.post = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "500", request=MagicMock(), response=err_response
+            )
+        )
+        with pytest.raises(httpx.HTTPStatusError):
+            await kanban._rpc("getTask", task_id=1)
+        assert kanban._client.post.await_count <= 5  # bounded, not infinite
+        assert kanban._client.post.await_count > 1  # actually retried
+
+    @pytest.mark.asyncio
+    async def test_does_not_retry_on_4xx(self, kanban):
+        """A 4xx (client error — bad auth, malformed request) is not
+        transient; retrying it would just waste time re-hitting the same
+        failure."""
+        import httpx
+
+        kanban._client = AsyncMock()
+        err_response = MagicMock()
+        err_response.status_code = 401
+        err_response.text = "Unauthorized"
+        kanban._client.post = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "401", request=MagicMock(), response=err_response
+            )
+        )
+        with pytest.raises(httpx.HTTPStatusError):
+            await kanban._rpc("getTask", task_id=1)
+        assert kanban._client.post.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_does_not_retry_on_clean_rpc_error(self, kanban):
+        """A well-formed {"error": ...} JSON-RPC response means Kanboard
+        processed the request and rejected it — not a transient failure."""
+        kanban._client = AsyncMock()
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(
+            return_value={
+                "jsonrpc": "2.0",
+                "error": {"code": -32602, "message": "Task not found"},
+            }
+        )
+        kanban._client.post = AsyncMock(return_value=resp)
+        with pytest.raises(RuntimeError, match="Task not found"):
+            await kanban._rpc("getTask", task_id=999)
+        assert kanban._client.post.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_retries_on_network_error(self, kanban):
+        """A transient connection error (daemon momentarily unreachable) is
+        also retried, same as a 5xx."""
+        import httpx
+
+        kanban._client = AsyncMock()
+        call_count = {"n": 0}
+
+        async def post(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise httpx.ConnectError("connection refused")
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.json = MagicMock(return_value={"jsonrpc": "2.0", "result": True})
+            return resp
+
+        kanban._client.post = AsyncMock(side_effect=post)
+        result = await kanban._rpc("moveTaskPosition", task_id=1)
+        assert result is True
+        assert call_count["n"] == 2

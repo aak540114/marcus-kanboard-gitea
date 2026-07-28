@@ -18,6 +18,7 @@ KanboardKanban
     Kanboard JSON-RPC 2.0 implementation of KanbanInterface.
 """
 
+import asyncio
 import base64
 import logging
 import mimetypes
@@ -102,6 +103,18 @@ MARCUS_DEFAULT_COLUMNS: List[str] = [
 #: its comments carry a consistent "M" avatar instead of the "?" placeholder
 #: Kanboard shows for the anonymous system user (user_id=0).
 _MARCUS_BOT_USERNAME = "marcus"
+
+#: _rpc() retries a TRANSIENT failure this many times before giving up.
+#: Kanboard's default SQLite backend can raise "database is locked" as an
+#: uncaught PHP exception (HTTP 500) under write contention — normally
+#: clearing within well under a second — and Marcus's own multi-step
+#: operations (a column move alone can issue half a dozen sequential RPC
+#: calls) make that contention more likely under concurrent agents/webhooks.
+#: A short, bounded retry absorbs that instead of hard-failing the whole
+#: ticket operation on one transient hiccup.
+_RPC_MAX_ATTEMPTS = 4
+#: Base delay before the first retry; doubles each subsequent attempt.
+_RPC_RETRY_BASE_DELAY = 0.3
 
 # Kanboard seeds a fresh project with these columns
 # (app/Model/BoardModel.php::getDefaultColumns). Rename the two that have a
@@ -1263,6 +1276,16 @@ class KanboardKanban(KanbanInterface):
         """
         Make a JSON-RPC 2.0 call and return the ``result`` field.
 
+        Retries a TRANSIENT failure — an HTTP 5xx (Kanboard's SQLite
+        backend can raise "database is locked" as an uncaught PHP
+        exception under write contention) or a network-level error
+        (connection refused/timeout) — up to :data:`_RPC_MAX_ATTEMPTS`
+        times with short exponential backoff. Does NOT retry a 4xx (not
+        transient — retrying just re-hits the same rejection) or a
+        well-formed ``{"error": ...}`` JSON-RPC response (Kanboard
+        successfully processed the request and is telling us it's
+        invalid — retrying achieves nothing).
+
         Parameters
         ----------
         method : str
@@ -1280,7 +1303,11 @@ class KanboardKanban(KanbanInterface):
         RuntimeError
             When the API returns an ``error`` object.
         httpx.HTTPStatusError
-            On HTTP-level failures (4xx, 5xx).
+            On HTTP-level failures (4xx immediately; 5xx after exhausting
+            retries).
+        httpx.TransportError
+            On a persistent connection-level failure after exhausting
+            retries (covers ``ConnectError``/``TimeoutException``/etc.).
         """
         self._rpc_id += 1
         body: Dict[str, Any] = {
@@ -1291,23 +1318,63 @@ class KanboardKanban(KanbanInterface):
         }
         if self._client is None:
             raise RuntimeError("Not connected — call connect() first")
-        try:
-            response = await self._client.post(self._jsonrpc_url, json=body)
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            logger.error(
-                "Kanboard API HTTP error (%s) for method '%s': %s",
-                exc.response.status_code,
-                method,
-                exc.response.text[:300],
-            )
-            raise
 
-        data = response.json()
-        if "error" in data:
-            msg = data["error"].get("message", str(data["error"]))
-            raise RuntimeError(f"Kanboard API error in {method}: {msg}")
-        return data.get("result")
+        for attempt in range(_RPC_MAX_ATTEMPTS):
+            last_attempt = attempt == _RPC_MAX_ATTEMPTS - 1
+            try:
+                response = await self._client.post(self._jsonrpc_url, json=body)
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code < 500 or last_attempt:
+                    logger.error(
+                        "Kanboard API HTTP error (%s) for method '%s': %s",
+                        exc.response.status_code,
+                        method,
+                        exc.response.text[:300],
+                    )
+                    raise
+                logger.warning(
+                    "Kanboard API transient error (%s) for method '%s' — "
+                    "retrying (attempt %d/%d): %s",
+                    exc.response.status_code,
+                    method,
+                    attempt + 1,
+                    _RPC_MAX_ATTEMPTS,
+                    exc.response.text[:200],
+                )
+                await asyncio.sleep(_RPC_RETRY_BASE_DELAY * (2**attempt))
+                continue
+            except httpx.TransportError as exc:
+                if last_attempt:
+                    logger.error(
+                        "Kanboard API connection error for method '%s': %s",
+                        method,
+                        exc,
+                    )
+                    raise
+                logger.warning(
+                    "Kanboard API connection error for method '%s' — "
+                    "retrying (attempt %d/%d): %s",
+                    method,
+                    attempt + 1,
+                    _RPC_MAX_ATTEMPTS,
+                    exc,
+                )
+                await asyncio.sleep(_RPC_RETRY_BASE_DELAY * (2**attempt))
+                continue
+
+            data = response.json()
+            if "error" in data:
+                msg = data["error"].get("message", str(data["error"]))
+                raise RuntimeError(f"Kanboard API error in {method}: {msg}")
+            return data.get("result")
+
+        # Unreachable: the loop above always either returns or raises on
+        # its last_attempt branch.
+        raise RuntimeError(
+            f"Kanboard API call to {method} failed after "
+            f"{_RPC_MAX_ATTEMPTS} attempts"
+        )
 
     async def _refresh_columns(self, project_id: Optional[int] = None) -> None:
         """
