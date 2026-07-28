@@ -29,7 +29,15 @@
 
 services:
   kanboard:
-    image: kanboard/kanboard:latest
+    # Pinned, not :latest. Kanboard's API changes behaviour in ways Marcus
+    # has to reason about — v1.2.50 added the guard that makes
+    # moveTaskPosition reject a project_id that doesn't match the task
+    # (app/Api/Procedure/TaskProcedure.php); before it, such a move was
+    # silently accepted and stamped the card with another board's column
+    # id. Marcus handles both, but ":latest" means the version silently
+    # changes under a running stack on the next pull, so pin it and bump
+    # deliberately.
+    image: kanboard/kanboard:v1.2.53
     container_name: marcus-kanboard
     restart: unless-stopped
     ports:
