@@ -1072,6 +1072,67 @@ class TestMoveTaskToColumn:
         ensure.assert_awaited_once_with(42)
 
     @pytest.mark.asyncio
+    async def test_cross_project_move_that_lands_the_wrong_projects_column(
+        self, kanban
+    ):
+        """Kanboard <= v1.2.49 has NO project guard on moveTaskPosition, so a
+        move issued with the WRONG project_id still writes the task's
+        column_id — to a column belonging to that wrong project.
+
+        Verified against Kanboard's real PHP: TaskProcedure::moveTaskPosition
+        only gained `if ($taskProjectId !== (int) $project_id) return false;`
+        in v1.2.50. Below that, TaskPositionModel::saveTaskPosition runs
+        `UPDATE tasks SET column_id=? WHERE id=?` — scoped by task id ONLY,
+        never by project — so the write lands.
+
+        The result is a task in project 42 whose column_id points at project
+        1's board: the card VANISHES from its own board (its column isn't one
+        of that project's columns). Verifying only `column_id == column_id`
+        sees a match and reports success, so the cross-project retry never
+        fires and the card is left orphaned. The move is only real if the
+        column the task landed on belongs to the task's OWN project.
+        """
+        kanban._client = AsyncMock()
+        kanban._column_map = {"in progress": 2}  # project 1's column
+        kanban._column_status_map = {2: TaskStatus.IN_PROGRESS}
+        assert kanban._project_id == 1
+
+        async def _refresh(project_id=None):
+            if project_id == 42:
+                kanban._project_columns[42] = {"in progress": 7}
+                kanban._column_status_map[7] = TaskStatus.IN_PROGRESS
+
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response(True),  # moveTaskPosition(project 1) — writes!
+                _rpc_response(  # task is in project 42 but on project 1's column 2
+                    _make_raw_task(
+                        task_id=5, column_id=2, project_id=42, is_active=1
+                    )
+                ),
+                _rpc_response(True),  # retry moveTaskPosition(project 42)
+                _rpc_response(  # now on project 42's own column 7
+                    _make_raw_task(
+                        task_id=5, column_id=7, project_id=42, is_active=1
+                    )
+                ),
+            ]
+        )
+        with patch.object(kanban, "_refresh_columns", side_effect=_refresh):
+            result = await kanban.move_task_to_column("5", "In Progress")
+
+        assert result is True
+        move_calls = [
+            c.kwargs["json"]["params"]
+            for c in kanban._client.post.call_args_list
+            if c.kwargs["json"]["method"] == "moveTaskPosition"
+        ]
+        # It must NOT have stopped at the orphaning first attempt.
+        assert len(move_calls) == 2
+        assert move_calls[-1]["project_id"] == 42
+        assert move_calls[-1]["column_id"] == 7
+
+    @pytest.mark.asyncio
     async def test_no_retry_when_task_genuinely_stays_in_wrong_column(
         self, kanban
     ):

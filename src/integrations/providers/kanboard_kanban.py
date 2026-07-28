@@ -666,6 +666,34 @@ class KanboardKanban(KanbanInterface):
         if not raw or int(raw.get("column_id") or 0) != column_id:
             return False, actual_project_id
 
+        # Landing on the requested column is NOT sufficient: the column must
+        # also belong to the task's OWN project. Kanboard only rejects a
+        # cross-project moveTaskPosition from v1.2.50 on (TaskProcedure.php
+        # gained `if ($taskProjectId !== (int) $project_id) return false;`).
+        # On v1.2.49 and earlier the write still lands, because
+        # TaskPositionModel::saveTaskPosition runs
+        # `UPDATE tasks SET column_id=? WHERE id=?` — scoped by task id
+        # only, never by project. The task then carries a column_id from a
+        # DIFFERENT project's board and disappears from its own board
+        # entirely, while this check would have called it a success and
+        # skipped the retry that puts it right. Treat it as a failure so
+        # the caller retries against actual_project_id, which re-homes the
+        # card onto a column its own board actually renders.
+        if actual_project_id is not None and actual_project_id != project_id:
+            logger.warning(
+                "Task %s landed on column %d of project %d but the task "
+                "belongs to project %d — this Kanboard accepted a "
+                "cross-project move (pre-v1.2.50 behaviour) and the card is "
+                "now orphaned off its own board. Retrying against project "
+                "%d to re-home it.",
+                task_id,
+                column_id,
+                project_id,
+                actual_project_id,
+                actual_project_id,
+            )
+            return False, actual_project_id
+
         # Sync the closed/open flag ONLY when it actually differs from the
         # target column's status. Unconditionally calling openTask/closeTask
         # made Kanboard fire a task.open/task.close webhook on every single
