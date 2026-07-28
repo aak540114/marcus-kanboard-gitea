@@ -11,7 +11,8 @@ A production deployment of **[Marcus](https://github.com/lwgray/marcus)** — th
 | Feature | Description |
 |---|---|
 | **Kanboard provider** | Full Kanboard JSON-RPC integration — tickets, columns, comments, assignments |
-| **Gitea integration** | `GiteaManager` + `ProjectSyncWorkflow` (`src/integrations/gitea_manager.py`, `src/workflows/project_sync_workflow.py`) auto-create a Gitea repo per Kanboard project. Creation is **instant**: the moment you create a project, Kanboard opens its page, and the MarcusDevEnv plugin pings `/api/project-seen` so Marcus provisions the repo (and Marcus's columns) right away — Kanboard has no server-side "project created" event, so this browser ping is what replaces waiting on a poll. A slow `ProjectWatcher` backstop poll (default 5 min, `PROJECT_POLL_INTERVAL`) still catches API/DB-created projects and retries failures, and the repo is also created on-demand the first time an agent calls `get_work_context` — no manual repo setup. |
+| **Per-project access gate** | Marcus can see multiple Kanboard projects, but only works tickets in ones a human has explicitly allowed. Every project starts **disabled** — no Gitea repo, no column reconciliation, no AI agent claiming a ticket — until you flip the **"Marcus: OFF/ON for this project"** toggle in that project's board header. Enabling provisions it immediately; disabling blocks new ticket claims from that point on (a ticket an agent is already mid-way through is not force-interrupted). See [Scoping Marcus to specific projects](#scoping-marcus-to-specific-projects). |
+| **Gitea integration** | `GiteaManager` + `ProjectSyncWorkflow` (`src/integrations/gitea_manager.py`, `src/workflows/project_sync_workflow.py`) auto-create a Gitea repo per **[Marcus-enabled](#scoping-marcus-to-specific-projects)** Kanboard project. Creation is **instant** once enabled: opening the project's page pings `/api/project-seen` so Marcus provisions the repo (and Marcus's columns) right away — Kanboard has no server-side "project created" event, so this browser ping is what replaces waiting on a poll. A slow `ProjectWatcher` backstop poll (default 5 min, `PROJECT_POLL_INTERVAL`) still catches API/DB-created projects and retries failures, and the repo is also created on-demand the first time an agent calls `get_work_context` — no manual repo setup. |
 | **Parallel agents** | `HumanGatedWorkflow` keeps up to `MARCUS_MAX_PARALLEL_AGENTS` (default 3) tickets in progress at once, each held by a distinct agent "slot". A busy slot is never preempted, so an agent actively working is never interrupted; extra assigned tickets simply wait for a free slot. |
 | **Orchestrate mode (`marcus_work`)** | Marcus is the manager, the agent is a worker. Prompt any agent to "connect to Marcus and do what it says": it loops on ONE tool, `marcus_work`, which hands out the next ticket that's **assigned to a human (anyone) and in Ready**, returns exact instructions, LLM-summarizes each worker report onto the ticket as a comment (~every 10 s, driven by the worker's callbacks), and completes the ticket through the project's gate on `DONE`. |
 | **Ticket decomposition** | Marcus splits a big ticket into 2–5 independent sub-tickets — created on the **parent's board**, linked "is a child of", inheriting the parent's owner and Ready status — so multiple agents work them in parallel; the parent parks in Blocked until its children finish. Automatic when a ticket with 4+ acceptance criteria is handed to a worker, or on demand via a **`@marcus decompose`** comment. Needs an LLM configured (`claude_subscription` works). |
@@ -52,6 +53,7 @@ The plugin ships in `kanboard/plugins/MarcusDevEnv/` and is automatically active
 ### Board header
 | Widget | What it does |
 |---|---|
+| **Marcus ON/OFF toggle** | The master switch for this project — see [Scoping Marcus to specific projects](#scoping-marcus-to-specific-projects). Off by default; nothing else in this table does anything until you turn it on. |
 | **Agent presence badge** | Two live counts: **connected** (agents polling Marcus for work every ~10 s, counted even when idle) and **working** (agents actively working a claimed ticket — a strict subset). Hover to see each claimed ticket, its agent, and that agent's reported subscription usage. Updates every 15 s. |
 | **Actively-worked card highlight** | Cards an AI agent is working **right now** get a pulsing golden ring. It's driven by a *liveness* signal — the agent reported progress within the last ~40 s — **not** by ticket state/column, so a state-management bug that leaves a card stuck can't make the ring lie. It clears the moment the agent stops (finished, handed off, blocked, or went silent). Re-applied after Kanboard's own board redraws, so it never gets lost. |
 | **Project Description button** | Opens the Marcus-served project description page for this project — the AI agents' shared source of truth for language, framework, and architecture. |
@@ -234,6 +236,18 @@ Dependencies are respected: a ticket that `depends_on` another is held (Blocked)
 
 **Who pays for what.** Each account's *coding* rides its own subscription — that's the parallelism. Marcus's *own* orchestration calls (decomposition, acceptance-criteria generation, report summaries) are a **separate** budget: whatever Marcus itself is configured with (its own `claude` CLI login or an API key — see [AI provider](#ai-provider)). Effectively three LLM identities: A codes, B codes, Marcus coordinates.
 
+### Scoping Marcus to specific projects
+
+A single Marcus install can see **every** Kanboard project on the board. Left unchecked, that means a brand-new project you create just to sketch something out would immediately get its own auto-created Gitea repo, its columns reconciled to Marcus's layout, and any ticket in it picked up by an AI agent — whether or not you meant for Marcus to touch it.
+
+**Every project starts disabled.** Marcus does nothing on a project — no repo, no columns, no claimed tickets, no agent commits — until a human explicitly opts it in. Open that project's board in Kanboard and click the **"🔒 Marcus: OFF for this project"** button in the header (it's the first control, to the left of the active-agents badge); it flips to **"🔓 Marcus: ON for this project"** and Marcus provisions the repo + columns immediately (no waiting on the backstop poll).
+
+A few things worth knowing:
+- **This is a separate control from the Human/AI Gate toggle.** The access toggle decides *whether* Marcus may touch a project at all; the Gate toggle (next to it) decides *how* it works once it's already allowed to (pause for your review vs. work autonomously to done).
+- **Disabling a project is not a kill switch for work already in flight.** It blocks Marcus from claiming any *new* ticket in that project from that point on; an agent partway through an already-claimed ticket is left to finish rather than being force-interrupted mid-commit.
+- **This upgrade is a breaking change on purpose.** If you're updating an existing deployment, every project you were already using goes to disabled the moment you redeploy — including your "main" project. Re-enable it from its board header before expecting Marcus to keep working there.
+- Toggle it from a script instead of the UI with `GET`/`PUT /api/project-enabled?project_id=<id>` (see [HTTP endpoints](#http-endpoints)).
+
 ### Tearing down
 
 ```bash
@@ -346,6 +360,8 @@ To start Marcus again later without re-provisioning anything (e.g. after a reboo
 
 ## Full ticket lifecycle
 
+> Everything below assumes the ticket's project has been [enabled for Marcus](#scoping-marcus-to-specific-projects) — a new project starts disabled, and none of this happens until you flip that toggle.
+
 ```
 Human creates ticket in Kanboard
   → Marcus generates acceptance criteria (AI)
@@ -440,7 +456,9 @@ When `MARCUS_AGENT_TOKEN` is set (automatic once you allow remote access — see
 | `/api/dev-env/status?ticket_id=<id>` | GET | Returns `{running, serving, url}` — `running` = container alive; `serving` = the app is actually listening (probed *inside* the container, so it's correct even when Marcus itself runs in a container) |
 | `/api/dev-env-setting` | GET/PUT | Global `max_parallel_containers` limit (`null` = unlimited) — see [Hot-reload dev environments](#hot-reload-dev-environments) |
 | `/api/active-agents` | GET | All tickets currently claimed by an AI agent |
-| `/api/project-seen?project_id=<id>` | GET | Instant "this project exists" ping from the MarcusDevEnv plugin when a project page opens — Marcus provisions its Gitea repo + columns immediately (Kanboard has no project-created event). Idempotent; auth via `?token=` |
+| `/api/project-seen?project_id=<id>` | GET | Instant "this project exists" ping from the MarcusDevEnv plugin when a project page opens — Marcus provisions its Gitea repo + columns immediately (Kanboard has no project-created event). Idempotent; auth via `?token=`. A no-op for a project not [enabled for Marcus](#scoping-marcus-to-specific-projects) |
+| `/api/project-enabled?project_id=<id>` | GET | Whether Marcus is allowed to work this project's tickets at all — `{"project_id": int, "enabled": bool}`. Default `false` |
+| `/api/project-enabled` | PUT | Body `{"project_id": int, "enabled": bool}` — see [Scoping Marcus to specific projects](#scoping-marcus-to-specific-projects). Setting `enabled: true` immediately provisions the repo/columns instead of waiting on the backstop poll |
 | `/api/events/stream` | GET | Server-Sent Events stream — pushes a `refresh` event the instant Marcus/an agent changes anything; the MarcusDevEnv plugin reloads the page on it (auth via `?token=`, since EventSource can't send headers) |
 | `/api/ticket-links?ticket_id=<id>` | GET | Dependency graph (`depends_on`/`blocks`/`relates_to`) plus the ticket's `repo_web_url` and `branch_web_url` |
 | `/api/project-repo?project_id=<id>` | GET | Browser URL of the project's Gitea repo (`null` until provisioned) — backs the board's Repository button |
