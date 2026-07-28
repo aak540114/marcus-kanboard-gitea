@@ -23,7 +23,7 @@ import logging
 import mimetypes
 import secrets
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import httpx
 
@@ -151,9 +151,16 @@ class KanboardKanban(KanbanInterface):
         self._api_token: str = config["kanboard_api_token"]
         self._project_id: int = int(config.get("kanboard_project_id", 1))
 
-        # column name (lower) → column id — populated in connect()
+        # column name (lower) → column id, for THIS provider's configured
+        # self._project_id — populated in connect()
         self._column_map: Dict[str, int] = {}
-        # column id → TaskStatus — populated in connect()
+        # column name (lower) → column id, for every OTHER Kanboard project
+        # a ticket has turned out to belong to (see move_task_to_column) —
+        # keyed by project_id, populated lazily on first use.
+        self._project_columns: Dict[int, Dict[str, int]] = {}
+        # column id → TaskStatus. Flat (not per-project): Kanboard column
+        # ids are globally unique across the whole install, so one map is
+        # correct for every project once that project's columns are fetched.
         self._column_status_map: Dict[int, TaskStatus] = {}
         # project name — populated in connect()
         self._project_name: str = ""
@@ -449,8 +456,20 @@ class KanboardKanban(KanbanInterface):
         # Fall back to recording the assignee as a comment
         return await self.add_comment(task_id, f"[Marcus] Assigned to: {assignee_id}")
 
-    def _resolve_column_id(self, column_name: str) -> Optional[int]:
-        """Look up a column id by name in the cached map.
+    def _columns_for(self, project_id: int) -> Dict[str, int]:
+        """Return the cached column-name→id map for a given project.
+
+        ``self._column_map`` is this provider's configured
+        ``self._project_id``; ``self._project_columns`` holds every OTHER
+        project a ticket has turned out to belong to (see
+        :meth:`move_task_to_column`), keyed by project id.
+        """
+        if project_id == self._project_id:
+            return self._column_map
+        return self._project_columns.get(project_id, {})
+
+    def _resolve_column_id(self, project_id: int, column_name: str) -> Optional[int]:
+        """Look up a column id by name, scoped to *project_id*.
 
         Case-insensitive, with a substring fallback so ``in progress`` still
         matches a ``Work in progress`` column. Returns ``None`` when nothing
@@ -458,6 +477,8 @@ class KanboardKanban(KanbanInterface):
 
         Parameters
         ----------
+        project_id : int
+            Kanboard project whose column map to search.
         column_name : str
             Target column name.
 
@@ -466,11 +487,12 @@ class KanboardKanban(KanbanInterface):
         Optional[int]
             The Kanboard column id, or ``None`` if no column matches.
         """
+        columns = self._columns_for(project_id)
         key = column_name.lower()
-        column_id = self._column_map.get(key)
+        column_id = columns.get(key)
         if column_id is not None:
             return column_id
-        for name, cid in self._column_map.items():
+        for name, cid in columns.items():
             if key in name or name in key:
                 return cid
         return None
@@ -478,6 +500,14 @@ class KanboardKanban(KanbanInterface):
     async def move_task_to_column(self, task_id: str, column_name: str) -> bool:
         """
         Move a task to a named column.
+
+        A ticket is not guaranteed to belong to this provider's configured
+        ``self._project_id`` — Marcus auto-provisions columns for every
+        Kanboard project it discovers, not just one (see
+        :meth:`get_project_name`'s docstring for the same class of issue).
+        The first attempt targets ``self._project_id``; if that fails, the
+        task's ACTUAL project (discovered along the way, at no extra RPC
+        cost — see :meth:`_try_move_task_to_column`) is retried.
 
         Parameters
         ----------
@@ -494,14 +524,80 @@ class KanboardKanban(KanbanInterface):
         if self._client is None:
             raise RuntimeError("Call connect() before move_task_to_column()")
 
-        column_id = self._resolve_column_id(column_name)
+        moved, actual_project_id = await self._try_move_task_to_column(
+            task_id, column_name, self._project_id
+        )
+        if moved:
+            return True
+        if actual_project_id is None or actual_project_id == self._project_id:
+            return False
+
+        logger.info(
+            "Task %s belongs to Kanboard project %d, not this provider's "
+            "configured project %d — retrying the move there. (Comments "
+            "and task lookups are unaffected by this: they aren't "
+            "project-scoped, only column moves are.)",
+            task_id,
+            actual_project_id,
+            self._project_id,
+        )
+        moved, _ = await self._try_move_task_to_column(
+            task_id, column_name, actual_project_id
+        )
+        return moved
+
+    async def _try_move_task_to_column(
+        self, task_id: str, column_name: str, project_id: int
+    ) -> Tuple[bool, Optional[int]]:
+        """Attempt to move *task_id* to *column_name* within *project_id*.
+
+        Resolves/reconciles *project_id*'s columns (never
+        ``self._project_id`` unconditionally — reconciling the wrong
+        project's board never helps a task that lives elsewhere), issues
+        the move, and ALWAYS verifies it against a fresh ``getTask`` —
+        moveTaskPosition's return value does NOT prove the move happened:
+        Kanboard's underlying ``UPDATE ... WHERE project_id=? AND id=?``
+        still returns true when ``project_id`` doesn't match the task and
+        ZERO rows were affected (PicoDb's ``Table::update()`` returns
+        ``execute() !== false``, not the affected row count) — so a wrong
+        ``project_id`` silently no-ops while reporting success. Trusting
+        that return value was the precise bug behind "Marcus's comments
+        post but cards never move columns": whenever a ticket's actual
+        project differed from this provider's configured one, every move
+        silently did nothing while looking successful.
+
+        The verification ``getTask`` call is the same one already needed
+        for the closed/open flag sync below, so this costs no extra RPC
+        round-trip versus the old "only verify on falsy result" logic — it
+        is simply no longer conditional on trusting ``moveTaskPosition``.
+
+        Parameters
+        ----------
+        task_id : str
+            Kanboard task ID.
+        column_name : str
+            Target column name (case-insensitive).
+        project_id : int
+            Kanboard project to attempt the move within.
+
+        Returns
+        -------
+        Tuple[bool, Optional[int]]
+            ``(moved, actual_project_id)`` — ``moved`` is ``True`` only once
+            verified via ``getTask``. ``actual_project_id`` is the task's
+            real project id, read off that same ``getTask`` response (so a
+            caller can retry against the right project without another RPC
+            call), or ``None`` if it couldn't be determined (e.g. the
+            column never resolved, so no RPC was even attempted).
+        """
+        column_id = self._resolve_column_id(project_id, column_name)
         if column_id is None:
             # The cached column map can be STALE: a board reconciliation
             # (Backlog→Todo, Work in progress→In Progress, add "Waiting for
-            # Human", …) may have run after connect(). Refresh from Kanboard
-            # and retry before giving up.
-            await self._refresh_columns()
-            column_id = self._resolve_column_id(column_name)
+            # Human", …) may have run after it was last fetched. Refresh
+            # from Kanboard and retry before giving up.
+            await self._refresh_columns(project_id)
+            column_id = self._resolve_column_id(project_id, column_name)
 
         if column_id is None:
             # The project may still be on Kanboard's DEFAULT columns — a
@@ -513,17 +609,17 @@ class KanboardKanban(KanbanInterface):
                 "Kanboard column '%s' missing in project %d (have: %s) — "
                 "reconciling the board to Marcus's columns and retrying.",
                 column_name,
-                self._project_id,
-                list(self._column_map.keys()),
+                project_id,
+                list(self._columns_for(project_id).keys()),
             )
             try:
-                await self.ensure_columns(self._project_id)
-                await self._refresh_columns()
-                column_id = self._resolve_column_id(column_name)
+                await self.ensure_columns(project_id)
+                await self._refresh_columns(project_id)
+                column_id = self._resolve_column_id(project_id, column_name)
             except Exception as exc:  # noqa: BLE001
                 logger.error(
                     "Column reconciliation for project %d failed: %s",
-                    self._project_id,
+                    project_id,
                     exc,
                 )
 
@@ -536,31 +632,26 @@ class KanboardKanban(KanbanInterface):
                 "even after reconciliation. Available columns: %s",
                 task_id,
                 column_name,
-                self._project_id,
-                list(self._column_map.keys()),
+                project_id,
+                list(self._columns_for(project_id).keys()),
             )
-            return False
+            return False, None
 
-        result = await self._rpc(
+        await self._rpc(
             "moveTaskPosition",
-            project_id=self._project_id,
+            project_id=project_id,
             task_id=int(task_id),
             column_id=column_id,
             position=1,
             swimlane_id=0,
         )
 
-        raw: Optional[Dict[str, Any]] = None
-        if not result:
-            # Kanboard's TaskPositionModel::movePosition() returns false
-            # both on genuine failures AND when the task is already in the
-            # requested column/position (a no-op move). Distinguish the two:
-            # a task already sitting in the target column is success — the
-            # board is in exactly the requested state — and must still get
-            # the closed/open flag sync below.
-            raw = await self._rpc("getTask", task_id=int(task_id))
-            if not raw or int(raw.get("column_id") or 0) != column_id:
-                return False
+        # ALWAYS verify — see the docstring above for why the RPC's own
+        # return value cannot be trusted.
+        raw = await self._rpc("getTask", task_id=int(task_id))
+        actual_project_id = int((raw or {}).get("project_id") or 0) or None
+        if not raw or int(raw.get("column_id") or 0) != column_id:
+            return False, actual_project_id
 
         # Sync the closed/open flag ONLY when it actually differs from the
         # target column's status. Unconditionally calling openTask/closeTask
@@ -568,16 +659,14 @@ class KanboardKanban(KanbanInterface):
         # column move — and openTask on a board-closed task with a stale
         # lifecycle record fed a reopen→move→openTask→reopen feedback loop
         # that flooded Kanboard until its SQLite locked up.
-        if raw is None:
-            raw = await self._rpc("getTask", task_id=int(task_id))
-        is_active = int((raw or {}).get("is_active", 1) or 0)
+        is_active = int(raw.get("is_active", 1) or 0)
         target_status = self._column_status_map.get(column_id)
         if target_status == TaskStatus.DONE:
             if is_active == 1:
                 await self._rpc("closeTask", task_id=int(task_id))
         elif is_active == 0:
             await self._rpc("openTask", task_id=int(task_id))
-        return True
+        return True, actual_project_id
 
     async def ensure_columns(
         self,
@@ -662,14 +751,16 @@ class KanboardKanban(KanbanInterface):
                     position=position,
                 )
 
-        # Rebuild the in-memory column cache for THIS project. connect()
-        # populated _column_map/_column_status_map once, before any columns
-        # were added or renamed here — so without this refresh a freshly
-        # reconciled configured project can't resolve the new "Blocked" /
-        # "Waiting for Human" columns, and every gate move to them silently
-        # returns False (column not found) until the process restarts.
-        if pid == self._project_id:
-            await self._refresh_columns()
+        # Rebuild the in-memory column cache for THIS project — for ANY
+        # project, not just self._project_id (a ticket can belong to any
+        # Kanboard project Marcus has discovered; see
+        # move_task_to_column's docstring). connect() only populated the
+        # cache once, before any columns were added or renamed here — so
+        # without this refresh a freshly reconciled project can't resolve
+        # its new "Blocked" / "Waiting for Human" columns, and every gate
+        # move to them silently returns False (column not found) until
+        # something else happens to refresh that project's cache.
+        await self._refresh_columns(pid)
 
         logger.info("Reconciled columns for Kanboard project %d", pid)
         return True
@@ -1218,16 +1309,23 @@ class KanboardKanban(KanbanInterface):
             raise RuntimeError(f"Kanboard API error in {method}: {msg}")
         return data.get("result")
 
-    async def _refresh_columns(self) -> None:
+    async def _refresh_columns(self, project_id: Optional[int] = None) -> None:
         """
-        Fetch the project's column list and populate the lookup maps.
+        Fetch a project's column list and populate the lookup maps.
 
-        Called once during ``connect()`` and can be called again if the
-        board layout changes at runtime.
+        Called once per project during ``connect()``/on first use in
+        :meth:`move_task_to_column`, and can be called again if that
+        project's board layout changes at runtime.
+
+        Parameters
+        ----------
+        project_id : Optional[int]
+            Kanboard project whose columns to (re)fetch; defaults to this
+            provider's configured ``self._project_id``.
         """
-        columns = await self._rpc("getColumns", project_id=self._project_id)
-        self._column_map = {}
-        self._column_status_map = {}
+        pid = self._project_id if project_id is None else project_id
+        columns = await self._rpc("getColumns", project_id=pid)
+        col_map: Dict[str, int] = {}
         for col in columns or []:
             name = col.get("title", "")
             raw_id = col.get("id")
@@ -1235,14 +1333,19 @@ class KanboardKanban(KanbanInterface):
                 logger.warning("Kanboard returned column with null id; skipping: %s", col)
                 continue
             cid = int(raw_id)
-            self._column_map[name.lower()] = cid
+            col_map[name.lower()] = cid
+            # Flat and shared across every project (see
+            # self._column_status_map's docstring) — updated incrementally,
+            # never reset here, so refreshing one project's columns can
+            # never erase another already-cached project's entries.
             self._column_status_map[cid] = _COLUMN_STATUS_MAP.get(
                 name.lower(), TaskStatus.TODO
             )
-        logger.debug(
-            "Kanboard columns cached: %s",
-            {k: v for k, v in self._column_map.items()},
-        )
+        if pid == self._project_id:
+            self._column_map = col_map
+        else:
+            self._project_columns[pid] = col_map
+        logger.debug("Kanboard columns cached for project %d: %s", pid, col_map)
 
     async def _resolve_user_id(self, assignee_id: str) -> Optional[int]:
         """

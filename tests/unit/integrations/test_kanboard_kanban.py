@@ -821,7 +821,7 @@ class TestMoveTaskToColumn:
         kanban._column_map = {}  # stale / empty
         kanban._column_status_map = {}
 
-        async def _refresh():
+        async def _refresh(project_id=None):
             kanban._column_map = {"waiting for human": 5}
             kanban._column_status_map = {5: TaskStatus.WAITING_FOR_HUMAN}
 
@@ -849,7 +849,7 @@ class TestMoveTaskToColumn:
         kanban._column_status_map = {}
         state = {"reconciled": False}
 
-        async def _refresh():
+        async def _refresh(project_id=None):
             if state["reconciled"]:
                 kanban._column_map = {"waiting for human": 5}
                 kanban._column_status_map = {5: TaskStatus.WAITING_FOR_HUMAN}
@@ -945,6 +945,154 @@ class TestMoveTaskToColumn:
         """move_task_to_column() raises RuntimeError when client is None."""
         with pytest.raises(RuntimeError, match="connect()"):
             await kanban.move_task_to_column("1", "Done")
+
+    @pytest.mark.asyncio
+    async def test_truthy_move_task_position_is_not_trusted(self, kanban):
+        """moveTaskPosition's return value does NOT prove the move happened.
+
+        Kanboard's underlying UPDATE ... WHERE project_id=? AND id=? still
+        returns true when project_id doesn't match the task and ZERO rows
+        were affected (PicoDb's Table::update() returns
+        execute() !== false, not the affected row count). If Marcus trusts
+        a truthy moveTaskPosition result without verifying, a project_id
+        mismatch silently no-ops while LOOKING like success — the precise
+        bug behind "comments post but cards never move columns". This must
+        be caught by verifying against getTask regardless of what
+        moveTaskPosition returned.
+        """
+        kanban._client = AsyncMock()
+        kanban._column_map = {"in progress": 2}
+        kanban._column_status_map = {2: TaskStatus.IN_PROGRESS}
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response(True),  # moveTaskPosition: misleadingly "true"
+                _rpc_response(  # getTask: task never actually moved
+                    _make_raw_task(task_id=5, column_id=99, project_id=1)
+                ),
+            ]
+        )
+        result = await kanban.move_task_to_column("5", "In Progress")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_retries_against_the_tasks_actual_project(self, kanban):
+        """A task belonging to a DIFFERENT Kanboard project than this
+        provider's configured self._project_id is still moved correctly:
+        the failed/no-op attempt against the wrong project reveals the
+        task's real project_id (via getTask), and the move is retried
+        there — resolving/reconciling THAT project's columns, not the
+        configured default's.
+        """
+        kanban._client = AsyncMock()
+        kanban._column_map = {"in progress": 2}  # project 1's (default) columns
+        kanban._column_status_map = {2: TaskStatus.IN_PROGRESS}
+        assert kanban._project_id == 1
+
+        async def _refresh(project_id=None):
+            if project_id == 42:
+                kanban._project_columns[42] = {"in progress": 7}
+                kanban._column_status_map[7] = TaskStatus.IN_PROGRESS
+
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response(True),  # moveTaskPosition against project 1 (wrong)
+                _rpc_response(  # getTask reveals: actually project 42, column 55
+                    _make_raw_task(
+                        task_id=5, column_id=55, project_id=42, is_active=1
+                    )
+                ),
+                _rpc_response(True),  # moveTaskPosition against project 42 (right)
+                _rpc_response(  # getTask verifies the retried move
+                    _make_raw_task(
+                        task_id=5, column_id=7, project_id=42, is_active=1
+                    )
+                ),
+            ]
+        )
+        with patch.object(kanban, "_refresh_columns", side_effect=_refresh):
+            result = await kanban.move_task_to_column("5", "In Progress")
+        assert result is True
+        # The RPC calls that actually mutated state used project 42, not 1.
+        move_calls = [
+            c.kwargs["json"]["params"]
+            for c in kanban._client.post.call_args_list
+            if c.kwargs["json"]["method"] == "moveTaskPosition"
+        ]
+        assert move_calls[-1]["project_id"] == 42
+
+    @pytest.mark.asyncio
+    async def test_reconciles_the_tasks_actual_project_not_the_default(
+        self, kanban
+    ):
+        """When the OTHER project's board doesn't have the target column at
+        all yet, ensure_columns is called for the task's REAL project — not
+        self._project_id (the bug in a prior fix: reconciling the wrong
+        project's board never helps a task that lives elsewhere).
+
+        The default project (1) already has a same-named "Waiting for
+        Human" column — realistic, since ensure_columns gives every
+        project the same standard names — so the first attempt's column
+        resolution succeeds and reaches moveTaskPosition/getTask, which is
+        what reveals the task's real project (42). Only THAT project's
+        board is missing the column and needs reconciling.
+        """
+        kanban._client = AsyncMock()
+        kanban._column_map = {"in progress": 2, "waiting for human": 6}
+        kanban._column_status_map = {2: TaskStatus.IN_PROGRESS, 6: TaskStatus.WAITING_FOR_HUMAN}
+
+        async def _refresh(project_id=None):
+            return None  # never finds it on project 42 via a plain refresh
+
+        async def _ensure(pid):
+            if pid == 42:
+                kanban._project_columns[42] = {"waiting for human": 8}
+                kanban._column_status_map[8] = TaskStatus.WAITING_FOR_HUMAN
+
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response(True),  # moveTaskPosition against project 1 (wrong)
+                _rpc_response(  # getTask reveals: actually project 42
+                    _make_raw_task(task_id=5, column_id=1, project_id=42)
+                ),
+                _rpc_response(True),  # moveTaskPosition against project 42
+                _rpc_response(  # getTask verifies
+                    _make_raw_task(
+                        task_id=5, column_id=8, project_id=42, is_active=1
+                    )
+                ),
+            ]
+        )
+        with patch.object(
+            kanban, "_refresh_columns", side_effect=_refresh
+        ), patch.object(
+            kanban, "ensure_columns", side_effect=_ensure
+        ) as ensure:
+            result = await kanban.move_task_to_column("5", "Waiting for Human")
+        assert result is True
+        ensure.assert_awaited_once_with(42)
+
+    @pytest.mark.asyncio
+    async def test_no_retry_when_task_genuinely_stays_in_wrong_column(
+        self, kanban
+    ):
+        """A real failure on the DEFAULT project (task's project_id matches
+        self._project_id, it just didn't move) must not retry — there is
+        nowhere else to retry against."""
+        kanban._client = AsyncMock()
+        kanban._column_map = {"in progress": 2}
+        kanban._column_status_map = {2: TaskStatus.IN_PROGRESS}
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response(False),
+                _rpc_response(
+                    _make_raw_task(task_id=5, column_id=1, project_id=1)
+                ),
+            ]
+        )
+        result = await kanban.move_task_to_column("5", "In Progress")
+        assert result is False
+        # Exactly two RPC calls — no retry attempted.
+        assert kanban._client.post.await_count == 2
 
 
 # ---------------------------------------------------------------------------
