@@ -55,6 +55,25 @@ from typing import Any, Dict, List, Optional
 # mistaken for Marcus's own comment and silently dropped.
 _TITLE_RE = re.compile(r"^\s*#{1,6}\s+Marcus\s+(?:Agent|AI)\b.*$", re.MULTILINE)
 
+# Not every Marcus comment comes from CommentFormatter. The provider layer
+# builds a few by hand with a "[Marcus …]" prefix instead of a heading:
+# KanboardKanban.report_blocker ("[Marcus BLOCKER — HIGH]"),
+# update_task_progress ("[Marcus] Progress: 50%") and assign_task's
+# fallback ("[Marcus] Assigned to: …").
+#
+# These have to be recognised as Marcus's own, because is_marcus_comment is
+# the ONLY thing separating Marcus's comments from a human's in
+# HumanGatedWorkflow._on_comment_added — anything it rejects is treated as
+# human input, which on a WAITING_FOR_HUMAN ticket transitions the ticket
+# back to IN_PROGRESS and moves the card back to the In Progress column.
+# report_blocker is the sharp case: it moves the card to Blocked and then
+# its own comment drags it straight back out, so the card visibly refuses
+# to stay where Marcus just put it.
+#
+# Anchored at the start (no MULTILINE) so a human quoting one of these
+# mid-sentence is still read as a human comment.
+_PREFIX_RE = re.compile(r"^\s*\[Marcus\b")
+
 #: Maps a distinctive phrase in a comment's ``### Marcus …`` title to its
 #: type. Order matters: more specific phrases (round verification) come
 #: before the generic ones they contain.
@@ -672,11 +691,18 @@ class CommentParser:
     def is_marcus_comment(text: str) -> bool:
         """Return ``True`` if *text* is a Marcus-generated comment.
 
-        Recognised by the visible ``### Marcus …`` section title every
-        Marcus comment opens with — no hidden markup is used (Kanboard
-        would render it as literal text on the card).
+        Recognised either by the visible ``### Marcus Agent/AI …`` section
+        title that every :class:`CommentFormatter` comment opens with, or
+        by the ``[Marcus …]`` prefix the provider layer uses for the few
+        comments it builds by hand. No hidden markup is used — Kanboard
+        renders it as literal text on the card.
+
+        Getting this wrong is not cosmetic: this is the only filter
+        separating Marcus's own comments from a human's, and a Marcus
+        comment mistaken for human input drags the card back out of the
+        column Marcus just moved it to.
         """
-        return bool(_TITLE_RE.search(text))
+        return bool(_TITLE_RE.search(text) or _PREFIX_RE.match(text))
 
     @staticmethod
     def parse(text: str) -> Optional[ParsedComment]:

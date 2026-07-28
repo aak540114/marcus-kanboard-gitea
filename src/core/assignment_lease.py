@@ -1549,8 +1549,13 @@ class AssignmentLeaseManager:
             The structured recovery information
         """
         # Build handoff message from recovery info
+        # The "[Marcus" prefix marks this as Marcus's own comment. Without
+        # it, CommentParser.is_marcus_comment reads it as human input, and
+        # HumanGatedWorkflow._on_comment_added drags a WAITING_FOR_HUMAN
+        # ticket back to the In Progress column on the strength of a
+        # comment Marcus itself posted.
         handoff_message = (
-            f"⚠️ **TASK RECOVERED FROM AGENT "
+            f"[Marcus] ⚠️ **TASK RECOVERED FROM AGENT "
             f"{recovery_info.recovered_from_agent}**\n\n"
             f"**Recovery Details:**\n"
             f"- Recovered at: "

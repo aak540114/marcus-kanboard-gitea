@@ -2,6 +2,7 @@
 Unit tests for src/core/comment_protocol.py
 """
 
+from types import SimpleNamespace
 
 from src.core.comment_protocol import (
     CommentFormatter,
@@ -215,6 +216,94 @@ class TestCommentParser:
     def test_is_marcus_comment_false_for_human(self):
         """is_marcus_comment returns False for plain human text."""
         assert CommentParser.is_marcus_comment("Please add more tests.") is False
+
+    def test_every_formatter_output_is_recognised_as_marcus_own(self):
+        """EVERY comment the formatter produces must be recognised by
+        is_marcus_comment.
+
+        This is the round trip the whole comment protocol rests on.
+        _on_comment_added in human_gated_workflow.py uses it as the only
+        filter separating Marcus's own comments from a human's, and on a
+        ticket in WAITING_FOR_HUMAN any comment that isn't Marcus's is
+        treated as human input: the ticket transitions back to
+        IN_PROGRESS and the card is moved back to the In Progress column.
+
+        So a formatter whose title this regex fails to match makes Marcus
+        respond to itself — it posts 'Ready for Review', moves the card to
+        Waiting for Human, reads its own comment back on the next poll and
+        drags the card straight back again. The card visibly refuses to
+        stay where Marcus put it.
+
+        Parametrised over every public formatter so a newly added comment
+        type with an off-pattern title fails here rather than in
+        production.
+        """
+        passed = SimpleNamespace(passed=True, findings=[])
+        failed = SimpleNamespace(passed=False, findings=["nope"])
+        bodies = [
+            CommentFormatter.ac_generated("T-1", "- [ ] x"),
+            CommentFormatter.ac_generated("T-1", "- [ ] x", was_human_created=True),
+            CommentFormatter.started("T-1", "ticket/kanboard/1", "alice"),
+            CommentFormatter.started(
+                "T-1", "ticket/kanboard/1", "alice", resumed_commits=["abc pre"]
+            ),
+            CommentFormatter.progress("T-1", "b", 50, "halfway"),
+            CommentFormatter.revision_requested("T-1", "change x", "will do"),
+            CommentFormatter.ready_for_review("T-1", "b", ["- [x] done"]),
+            CommentFormatter.dev_env_started("T-1", "b", "http://localhost:1", 1),
+            CommentFormatter.merged("T-1", "b", "main"),
+            CommentFormatter.error("T-1", "boom"),
+            CommentFormatter.error("T-1", "boom", needs_human=False),
+            CommentFormatter.verification_failed("T-1", ["issue"]),
+            # Last round passing, an earlier round passing, and a failure —
+            # each takes a different branch and builds a different title.
+            CommentFormatter.verification_round_result("T-1", 1, 1, passed),
+            CommentFormatter.verification_round_result("T-1", 1, 3, passed),
+            CommentFormatter.verification_round_result("T-1", 2, 3, failed),
+        ]
+        for body in bodies:
+            assert CommentParser.is_marcus_comment(body) is True, body[:120]
+
+    def test_recognises_bracket_prefixed_marcus_comments(self):
+        """Marcus comments that bypass CommentFormatter must be recognised too.
+
+        Several provider-level comments are built by hand with a
+        ``[Marcus …]`` prefix instead of a '### Marcus …' heading — see
+        ``KanboardKanban.report_blocker`` ("[Marcus BLOCKER — HIGH]"),
+        ``update_task_progress`` ("[Marcus] Progress: 50%") and
+        ``assign_task``'s fallback ("[Marcus] Assigned to: …").
+
+        BoardWatcher emits ticket.comment_added for these exactly as for
+        any other comment, and _on_comment_added treats anything
+        is_marcus_comment rejects as human input: on a ticket in
+        WAITING_FOR_HUMAN it transitions back to IN_PROGRESS and moves the
+        card back to the In Progress column. report_blocker is the sharp
+        case — it moves the card to Blocked and then its own comment drags
+        it straight back out again, so the card visibly refuses to stay in
+        the column Marcus just put it in.
+        """
+        assert (
+            CommentParser.is_marcus_comment("[Marcus] Progress: 50% | Status: ok")
+            is True
+        )
+        assert (
+            CommentParser.is_marcus_comment(
+                "[Marcus BLOCKER — HIGH]\n\nCannot reach the database"
+            )
+            is True
+        )
+        assert (
+            CommentParser.is_marcus_comment("[Marcus] Assigned to: alice") is True
+        )
+
+    def test_bracket_prefix_must_start_the_comment(self):
+        """A human quoting Marcus mid-comment is still a human comment."""
+        assert (
+            CommentParser.is_marcus_comment(
+                "You wrote [Marcus] Progress: 50% but that looks wrong to me."
+            )
+            is False
+        )
 
     def test_is_marcus_comment_false_for_human_heading_addressed_to_marcus(self):
         """A human's revision request that happens to open with a Markdown
