@@ -1234,7 +1234,6 @@ class HumanGatedWorkflow:
 
         title, description = ticket_id, ""
         parent_project_id: Optional[int] = None
-        parent_column: Optional[str] = None
         try:
             task = await self._kanban.get_task_by_id(ticket_id)
             if task:
@@ -1244,39 +1243,16 @@ class HumanGatedWorkflow:
                 pid_raw = raw.get("project_id")
                 if pid_raw:
                     parent_project_id = int(pid_raw)
-                parent_column = raw.get("column_name") or None
         except Exception as exc:  # noqa: BLE001
             logger.debug("Decompose: could not fetch %s: %s", ticket_id, exc)
 
-        # Children take the parent's place on the board: the parent vacates
-        # its column (it moves to Blocked below), so its sub-tickets should
-        # appear where it was. A parent decomposed out of In Progress whose
-        # children land back in Ready reads as the work having gone
-        # backwards.
-        #
-        # Never inherit a column that means "not workable", though. A human
-        # can decompose a ticket sitting in Blocked or Waiting for Human,
-        # and copying that column onto the children would create
-        # sub-tickets born blocked that no worker can ever pick up. Ready is
-        # the safe floor.
+        # Sub-tickets ALWAYS start in Ready, whatever column the parent sat
+        # in. A column reflects who is working a card, not where it belongs
+        # in the plan: a freshly created child has not been claimed by any
+        # agent, so putting it in In Progress just because its parent was
+        # there would advertise work nobody is doing. Ready is exactly the
+        # "assigned and available to claim" state, which is what these are.
         child_column = "ready"
-        if parent_column:
-            inherited = None
-            normalizer = getattr(self._kanban, "normalize_status", None)
-            if normalizer is not None:
-                try:
-                    inherited = normalizer(parent_column)
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug(
-                        "Could not normalise parent column %r: %s",
-                        parent_column,
-                        exc,
-                    )
-            if isinstance(inherited, TaskStatus) and inherited in (
-                TaskStatus.READY,
-                TaskStatus.IN_PROGRESS,
-            ):
-                child_column = parent_column
 
         subs = await self._llm_decompose(
             title, description, record.acceptance_criteria

@@ -24,7 +24,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from src.core.events import Events
-from src.core.models import TaskStatus
 from src.core.ticket_lifecycle import (
     TicketLifecycleManager,
     TicketState,
@@ -68,20 +67,6 @@ def mock_kanban():
     kb.move_task_to_column = AsyncMock(return_value=True)
     kb.add_comment = AsyncMock(return_value=1)
     kb.get_task_by_id = AsyncMock(return_value=None)
-    # Mirror KanbanInterface.normalize_status rather than returning a
-    # MagicMock: callers branch on the TaskStatus it returns (decompose
-    # decides whether a parent's column is safe to give its children), so a
-    # non-enum stand-in would silently take the wrong branch in tests only.
-    kb.normalize_status = MagicMock(
-        side_effect=lambda name: {
-            "todo": TaskStatus.TODO,
-            "ready": TaskStatus.READY,
-            "in progress": TaskStatus.IN_PROGRESS,
-            "blocked": TaskStatus.BLOCKED,
-            "waiting for human": TaskStatus.WAITING_FOR_HUMAN,
-            "done": TaskStatus.DONE,
-        }.get(str(name).strip().lower(), TaskStatus.TODO)
-    )
     return kb
 
 
@@ -2893,9 +2878,8 @@ class TestDecomposition:
         mock_kanban.assign_task = AsyncMock(return_value=True)
         parent = MagicMock(description="do a lot")
         parent.name = "Big"
-        parent.source_context = {
-            "kanboard_task": {"project_id": 3, "column_name": parent_column}
-        }
+        parent.source_context = {"kanboard_task": {"project_id": 3}}
+        parent.status = parent_column
         mock_kanban.get_task_by_id = AsyncMock(return_value=parent)
         return await workflow.decompose_ticket("100")
 
@@ -2925,43 +2909,27 @@ class TestDecomposition:
         assert set(assigned.values()) == {"alice"}
 
     @pytest.mark.asyncio
-    async def test_children_inherit_the_parents_column(
-        self, workflow, lifecycle, mock_kanban
+    @pytest.mark.parametrize(
+        "parent_column", ["In Progress", "Blocked", "Waiting for Human", "Ready"]
+    )
+    async def test_children_always_start_in_ready(
+        self, workflow, lifecycle, mock_kanban, parent_column
     ):
-        """Sub-tickets take the parent's place in the workflow.
+        """Sub-tickets ALWAYS start in Ready, whatever column the parent is in.
 
-        The parent vacates its column (it moves to Blocked), so its
-        children should appear where it was — a parent decomposed from In
-        Progress should not have its children land back in Ready, which
-        reads as the work having gone backwards.
+        A column says who is working a card, not where it sits in the plan.
+        A freshly created child has not been claimed by any agent, so
+        putting it in In Progress just because its parent was there would
+        advertise work nobody is doing; and copying a Blocked/Waiting
+        column would create children no worker can pick up at all. Ready is
+        precisely "assigned and available to claim", which is what these
+        are.
         """
         self._big_ticket(lifecycle)
 
         children = await self._decompose_with(
-            workflow, mock_kanban, "In Progress"
+            workflow, mock_kanban, parent_column
         )
-
-        moves = {
-            call.args[0]: call.args[1]
-            for call in mock_kanban.move_task_to_column.await_args_list
-            if call.args[0] in children
-        }
-        assert moves == {c: "In Progress" for c in children}
-
-    @pytest.mark.asyncio
-    async def test_children_do_not_inherit_a_terminal_parent_column(
-        self, workflow, lifecycle, mock_kanban
-    ):
-        """A column that means "not workable" is never inherited.
-
-        Marcus moves the parent to Blocked, and a human can decompose a
-        ticket sitting in Blocked or Waiting for Human. Copying that column
-        onto the children would create sub-tickets no worker can ever pick
-        up — they'd be born blocked. Fall back to Ready.
-        """
-        self._big_ticket(lifecycle)
-
-        children = await self._decompose_with(workflow, mock_kanban, "Blocked")
 
         moves = {
             call.args[0]: call.args[1]
