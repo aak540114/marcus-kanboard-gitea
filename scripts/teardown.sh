@@ -139,8 +139,13 @@ dir_size() {
 echo "Host directories (bind-mounted — directly deletable with rm -rf):"
 if [ -d "$REPO_ROOT/data" ]; then
     echo "  - $REPO_ROOT/data      ($(dir_size "$REPO_ROOT/data"))  — Marcus state: ticket lifecycle,"
+    echo "                                          which projects Marcus is enabled for,"
     echo "                                          gate/dev-env settings, project↔Gitea-repo mapping,"
     echo "                                          local git clones (data/repos/), cost-tracking DB"
+    if [ -f "$REPO_ROOT/data/project_access_settings.json" ]; then
+        echo "                                          (kept: re-running setup.sh restores the same"
+        echo "                                           per-project Marcus ON/OFF state you had)"
+    fi
 else
     echo "  - $REPO_ROOT/data      (not present — nothing was ever written here)"
 fi

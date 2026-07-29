@@ -36,6 +36,7 @@ import argparse
 import base64
 import json
 import sys
+from pathlib import Path
 import time
 import urllib.error
 import urllib.request
@@ -312,6 +313,62 @@ def reconcile_columns(
     return added
 
 
+def _enable_for_marcus(project_id: int, data_dir: str) -> None:
+    """Opt *project_id* into Marcus's scope (best-effort).
+
+    Marcus polls only the projects explicitly enabled for it. The project
+    provisioned here exists specifically for Marcus, so it is opted in;
+    every OTHER project stays off until a human flips its board-header
+    toggle, which is the point of the default-off gate.
+
+    Never fatal: the board itself provisioned fine, and setup must not
+    abort over a settings file. A warning goes to stderr so the operator
+    can enable it from the board header instead.
+
+    Parameters
+    ----------
+    project_id : int
+        Kanboard project to enable.
+    data_dir : str
+        Directory holding ``project_access_settings.json`` — the same
+        ``data/`` Marcus reads at runtime.
+    """
+    try:
+        repo_root = Path(__file__).resolve().parent.parent
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+        from src.core.project_access_settings import ProjectAccessSettingManager
+
+        mgr = ProjectAccessSettingManager(data_dir=Path(data_dir))
+        existing = mgr.get_project_enabled(project_id)
+        if existing is not None:
+            # A human has already made this decision. teardown.sh deletes
+            # nothing, so data/project_access_settings.json carries the
+            # enabled/disabled state across a teardown + setup cycle —
+            # re-running setup must restore that state, not overwrite it.
+            # Force-enabling here would silently resurrect a project the
+            # human had deliberately switched OFF.
+            print(
+                f"Marcus access for project {project_id} left as "
+                f"{'enabled' if existing else 'disabled'} (set previously; "
+                "setup does not override your choice)",
+                file=sys.stderr,
+            )
+            return
+        mgr.set_project_enabled(project_id, True)
+        print(
+            f"Enabled Marcus for project {project_id} "
+            f"(other projects stay off until you toggle them on)",
+            file=sys.stderr,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"warning: could not enable Marcus for project {project_id}: "
+            f"{exc}. Switch 'Marcus: OFF' to ON in the board header instead.",
+            file=sys.stderr,
+        )
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     """Entry point: provision a project + its columns, print the project id.
 
@@ -343,11 +400,26 @@ def main(argv: Optional[List[str]] = None) -> int:
             "when Kanboard is being exposed beyond localhost."
         ),
     )
+    parser.add_argument(
+        "--enable-for-marcus",
+        metavar="DATA_DIR",
+        help=(
+            "Opt the provisioned project into Marcus's scope by writing "
+            "project_access_settings.json under DATA_DIR. Marcus reads ONLY "
+            "the boards it has been enabled for, and nothing else in setup "
+            "enables anything — so without this a freshly-provisioned stack "
+            "watches no board at all and every ready, assigned ticket stays "
+            "invisible to agents until a human finds the board-header "
+            "toggle. Projects a human creates later still default to OFF."
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
         project_id = find_or_create_project(args.url, args.token, args.project_name)
         added = reconcile_columns(args.url, args.token, project_id)
+        if args.enable_for_marcus:
+            _enable_for_marcus(project_id, args.enable_for_marcus)
         if args.secure_admin:
             username, password = args.secure_admin
             if ensure_admin_user(args.url, args.token, username, password):

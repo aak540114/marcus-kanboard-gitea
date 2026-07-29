@@ -411,6 +411,13 @@ provision_args=(
     --url "http://localhost:8080/jsonrpc.php"
     --token "$(env_get KANBOARD_API_TOKEN)"
     --project-name "$(env_get KANBOARD_PROJECT_NAME)"
+    # Marcus reads ONLY the boards it has been enabled for, and every
+    # project defaults to OFF. This project is created specifically for
+    # Marcus, so opt it in — otherwise a freshly set-up stack watches no
+    # board at all and agents poll forever with nothing to do. Projects
+    # created later in the Kanboard UI still default to OFF until a human
+    # switches "Marcus" on in their board header.
+    --enable-for-marcus "$REPO_ROOT/data"
 )
 # Only replace admin/admin when Kanboard is actually being published beyond
 # localhost — for the default local-only deployment this stays as-is, same
