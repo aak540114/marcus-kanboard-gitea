@@ -3745,6 +3745,53 @@ class TestProjectAccessGate:
         assert result["status"] == "no_work"
 
     @pytest.mark.asyncio
+    async def test_marcus_work_rescans_the_board_before_handing_out(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """Each marcus_work poll re-reads the enabled boards first.
+
+        _next_worker_ticket selects from lifecycle records, which are only
+        populated by BoardWatcher's own timer (30s by default) and by
+        webhooks. An agent polling every ~10s would otherwise wait up to a
+        full watcher interval before a ticket a human just moved to Ready
+        became visible — and if webhooks aren't reaching Marcus, that delay
+        is the only thing standing between "assigned and Ready" and "handed
+        to an agent".
+        """
+        workflow._watcher = MagicMock()
+        workflow._watcher.poll_once = AsyncMock()
+
+        await workflow.orchestrate_work(agent_id="worker-scan")
+
+        workflow._watcher.poll_once.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_board_rescan_failure_does_not_break_handout(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """A board read that fails must not stop Marcus handing out work it
+        already knows about — the rescan is an optimisation, not a
+        precondition."""
+        self._wire_task_project(mock_kanban, 9)
+        mock_project_access.is_enabled = MagicMock(return_value=True)
+        workflow._watcher = MagicMock()
+        workflow._watcher.poll_once = AsyncMock(
+            side_effect=RuntimeError("kanboard unreachable")
+        )
+        lifecycle.get_or_create("70", "kanboard")
+        lifecycle.transition("70", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("70", "kanboard", "alice")
+
+        with patch(
+            "src.core.project_description.ProjectDescriptionManager.get_stack",
+            return_value={"language": "python"},
+        ):
+            result = await workflow.orchestrate_work(agent_id="worker-scan2")
+
+        assert result["status"] == "assigned"
+        assert result["ticket_id"] == "70"
+
+    @pytest.mark.asyncio
     async def test_withheld_message_names_the_project_not_just_its_id(
         self, workflow, lifecycle, mock_kanban, mock_project_access
     ):

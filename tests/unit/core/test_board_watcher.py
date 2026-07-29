@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock
 
+import asyncio
+
 import pytest
 
 from src.core.board_watcher import BoardWatcher, TicketSnapshot
@@ -313,3 +315,73 @@ class TestBoardWatcherStartStop:
         await watcher.start()
         assert watcher._task is task1  # same task object
         await watcher.stop()
+
+
+class TestPollOnceConcurrencyAndFreshness:
+    """poll_once() is called on demand (every marcus_work poll) as well as by
+    the background loop, so it has to be safe to overlap and cheap to repeat.
+    """
+
+    @pytest.mark.asyncio
+    async def test_concurrent_polls_do_not_double_emit(
+        self, watcher, events, mock_kanban
+    ):
+        """Two overlapping polls must not both report the same ticket as new.
+
+        The background loop and an on-demand poll from marcus_work can land
+        together. Without serialisation both diff against the same empty
+        snapshot and both emit ticket.new for the same card — which
+        downstream means two claims and two contradictory "Started"
+        comments on one ticket.
+        """
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_get_all_tasks():
+            started.set()
+            await release.wait()
+            return [_make_task("T-1")]
+
+        mock_kanban.get_all_tasks = AsyncMock(side_effect=slow_get_all_tasks)
+
+        received: List[Any] = []
+
+        async def handler(event: Any) -> None:
+            received.append(event)
+
+        events.subscribe("ticket.new", handler)
+
+        first = asyncio.create_task(watcher.poll_once())
+        await started.wait()
+        second = asyncio.create_task(watcher.poll_once())
+        await asyncio.sleep(0)  # let the second call reach the lock
+        release.set()
+        await asyncio.gather(first, second)
+
+        assert len(received) == 1
+
+    @pytest.mark.asyncio
+    async def test_max_age_skips_a_just_completed_poll(self, watcher, mock_kanban):
+        """A max_age window coalesces near-simultaneous on-demand polls.
+
+        Several agents each polling every ~10s would otherwise each trigger
+        a full board read per poll — two RPCs per enabled project, straight
+        into Kanboard's SQLite backend.
+        """
+        mock_kanban.get_all_tasks = AsyncMock(return_value=[])
+
+        await watcher.poll_once()
+        assert mock_kanban.get_all_tasks.await_count == 1
+
+        await watcher.poll_once(max_age=60.0)
+        assert mock_kanban.get_all_tasks.await_count == 1  # skipped
+
+    @pytest.mark.asyncio
+    async def test_max_age_zero_always_polls(self, watcher, mock_kanban):
+        """The default (no window) still reads the board every time."""
+        mock_kanban.get_all_tasks = AsyncMock(return_value=[])
+
+        await watcher.poll_once()
+        await watcher.poll_once()
+
+        assert mock_kanban.get_all_tasks.await_count == 2

@@ -91,6 +91,15 @@ _WORKING_WINDOW_SECONDS = 40.0
 #: silence means the agent has disconnected/stopped.
 _AGENT_POLL_WINDOW = 60.0
 
+#: How stale a board read may be and still be reused when a worker asks for
+#: its next ticket. Every marcus_work poll re-reads the enabled boards so a
+#: just-readied ticket is handed out immediately rather than after the next
+#: BoardWatcher tick — but with several agents polling every ~10s, an
+#: unconditional read per poll would be two RPCs per enabled project each
+#: time, straight into Kanboard's SQLite backend. A short window lets
+#: near-simultaneous polls share one read without adding noticeable delay.
+_BOARD_RESCAN_MAX_AGE = 3.0
+
 #: Hard caps applied to the agent-supplied ``usage`` payload — it is fully
 #: untrusted (any connected agent can send anything) and flows into stored
 #: state and the Kanboard UI, so it is sanitized on ingest to bound memory and
@@ -1424,6 +1433,31 @@ class HumanGatedWorkflow:
                 )
         return child_ids
 
+    async def _rescan_boards(self) -> None:
+        """Refresh lifecycle state from every enabled board (best-effort).
+
+        Runs before handing a worker its next ticket so a ticket that has
+        just become assigned+Ready is picked up on this poll rather than
+        after the next BoardWatcher tick. Delegates to the watcher so the
+        board→Marcus translation stays in one place (and inherits its
+        serialisation, so this can never race the background loop).
+
+        Never fatal: a failed board read leaves Marcus handing out the work
+        it already knows about, which is strictly better than refusing to
+        hand out anything.
+        """
+        watcher = getattr(self, "_watcher", None)
+        if watcher is None:
+            return
+        try:
+            await watcher.poll_once(max_age=_BOARD_RESCAN_MAX_AGE)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not re-read the board before handing out work "
+                "(continuing with known tickets): %s",
+                exc,
+            )
+
     async def _scope_summary(self) -> str:
         """Name the boards Marcus is actually watching.
 
@@ -1695,6 +1729,15 @@ class HumanGatedWorkflow:
             }
 
         # 3. No active ticket → assign the next available one.
+        # Re-read the enabled boards first. _next_worker_ticket selects from
+        # lifecycle records, which are otherwise only refreshed by
+        # BoardWatcher's own timer (30s by default) and by webhooks — so an
+        # agent polling every ~10s could wait a full watcher interval before
+        # a ticket a human just moved to Ready became visible, and where
+        # webhooks aren't reaching Marcus this is the only thing that closes
+        # that gap at all. Coalesced: several agents polling at once share
+        # one board read rather than each triggering their own.
+        await self._rescan_boards()
         next_id = await self._next_worker_ticket()
         if next_id is None:
             withheld = await self._withheld_ticket_reasons()

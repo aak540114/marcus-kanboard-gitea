@@ -43,6 +43,7 @@ BoardWatcher
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Set
@@ -125,6 +126,14 @@ class BoardWatcher:
         self._snapshots: Dict[str, TicketSnapshot] = {}
         self._running = False
         self._task: Optional[asyncio.Task] = None  # type: ignore[type-arg]
+        # poll_once() is called on demand (every marcus_work poll) as well
+        # as by the background loop, so cycles have to serialise: two
+        # overlapping cycles would diff against the same snapshot and both
+        # emit ticket.new/assigned for the same card, which downstream
+        # means two claims and two contradictory "Started" comments on one
+        # ticket. _last_poll_at supports the max_age freshness window.
+        self._poll_lock = asyncio.Lock()
+        self._last_poll_at: Optional[float] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -156,9 +165,30 @@ class BoardWatcher:
                 pass
         logger.info("BoardWatcher stopped for provider=%s", self._provider)
 
-    async def poll_once(self) -> None:
-        """Run a single poll cycle (useful for testing / on-demand checks)."""
-        await self._run_poll_cycle()
+    async def poll_once(self, *, max_age: float = 0.0) -> None:
+        """Run a single poll cycle, serialised against any other cycle.
+
+        Parameters
+        ----------
+        max_age : float
+            When > 0, skip the poll entirely if a cycle finished less than
+            this many seconds ago. Lets several agents polling
+            ``marcus_work`` every ~10s share one board read instead of each
+            triggering their own — two RPCs per enabled project per poll,
+            straight into Kanboard's SQLite backend. The default (0) always
+            reads the board.
+        """
+        async with self._poll_lock:
+            if (
+                max_age > 0
+                and self._last_poll_at is not None
+                and (time.monotonic() - self._last_poll_at) < max_age
+            ):
+                return
+            try:
+                await self._run_poll_cycle()
+            finally:
+                self._last_poll_at = time.monotonic()
 
     # ------------------------------------------------------------------
     # Core polling logic
@@ -168,7 +198,7 @@ class BoardWatcher:
         """Continuously poll the board until ``stop()`` is called."""
         while self._running:
             try:
-                await self._run_poll_cycle()
+                await self.poll_once()
             except asyncio.CancelledError:
                 break
             except Exception as exc:  # noqa: BLE001
