@@ -1234,6 +1234,7 @@ class HumanGatedWorkflow:
 
         title, description = ticket_id, ""
         parent_project_id: Optional[int] = None
+        parent_column: Optional[str] = None
         try:
             task = await self._kanban.get_task_by_id(ticket_id)
             if task:
@@ -1243,8 +1244,39 @@ class HumanGatedWorkflow:
                 pid_raw = raw.get("project_id")
                 if pid_raw:
                     parent_project_id = int(pid_raw)
+                parent_column = raw.get("column_name") or None
         except Exception as exc:  # noqa: BLE001
             logger.debug("Decompose: could not fetch %s: %s", ticket_id, exc)
+
+        # Children take the parent's place on the board: the parent vacates
+        # its column (it moves to Blocked below), so its sub-tickets should
+        # appear where it was. A parent decomposed out of In Progress whose
+        # children land back in Ready reads as the work having gone
+        # backwards.
+        #
+        # Never inherit a column that means "not workable", though. A human
+        # can decompose a ticket sitting in Blocked or Waiting for Human,
+        # and copying that column onto the children would create
+        # sub-tickets born blocked that no worker can ever pick up. Ready is
+        # the safe floor.
+        child_column = "ready"
+        if parent_column:
+            inherited = None
+            normalizer = getattr(self._kanban, "normalize_status", None)
+            if normalizer is not None:
+                try:
+                    inherited = normalizer(parent_column)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "Could not normalise parent column %r: %s",
+                        parent_column,
+                        exc,
+                    )
+            if isinstance(inherited, TaskStatus) and inherited in (
+                TaskStatus.READY,
+                TaskStatus.IN_PROGRESS,
+            ):
+                child_column = parent_column
 
         subs = await self._llm_decompose(
             title, description, record.acceptance_criteria
@@ -1299,24 +1331,55 @@ class HumanGatedWorkflow:
             child_moved = False
             try:
                 child_moved = await self._kanban.move_task_to_column(
-                    child_id, "ready"
+                    child_id, child_column
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
-                    "Could not move sub-ticket %s to ready: %s", child_id, exc
+                    "Could not move sub-ticket %s to %r: %s",
+                    child_id,
+                    child_column,
+                    exc,
                 )
             if not child_moved:
                 logger.warning(
-                    "Sub-ticket %s did NOT move to the 'Ready' column (stayed "
+                    "Sub-ticket %s did NOT move to the %r column (stayed "
                     "in Kanboard's default column). It is READY in Marcus's "
                     "lifecycle regardless.",
                     child_id,
+                    child_column,
                 )
             if owner:
                 try:
                     self._lifecycle.set_assignee(child_id, self._provider, owner)
                 except KeyError:
                     pass
+                # Also assign it ON THE BOARD. Inheriting the owner into
+                # Marcus's own record only is not enough: the Kanboard card
+                # shows no assignee, so a human sees unowned sub-tickets,
+                # and anything that re-derives state from the board (a
+                # restarted Marcus meeting an existing board) loses the
+                # owner entirely — at which point the children stop being
+                # handout candidates, since _next_worker_ticket requires a
+                # human owner.
+                assign = getattr(self._kanban, "assign_task", None)
+                if assign is not None:
+                    try:
+                        if not await assign(child_id, owner):
+                            logger.warning(
+                                "Could not assign sub-ticket %s to %r on the "
+                                "board; it is owned by %r in Marcus's "
+                                "lifecycle regardless.",
+                                child_id,
+                                owner,
+                                owner,
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "Could not assign sub-ticket %s to %r: %s",
+                            child_id,
+                            owner,
+                            exc,
+                        )
             try:
                 self._lifecycle.human_transition(
                     child_id,

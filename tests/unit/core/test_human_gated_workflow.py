@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from src.core.events import Events
+from src.core.models import TaskStatus
 from src.core.ticket_lifecycle import (
     TicketLifecycleManager,
     TicketState,
@@ -67,6 +68,20 @@ def mock_kanban():
     kb.move_task_to_column = AsyncMock(return_value=True)
     kb.add_comment = AsyncMock(return_value=1)
     kb.get_task_by_id = AsyncMock(return_value=None)
+    # Mirror KanbanInterface.normalize_status rather than returning a
+    # MagicMock: callers branch on the TaskStatus it returns (decompose
+    # decides whether a parent's column is safe to give its children), so a
+    # non-enum stand-in would silently take the wrong branch in tests only.
+    kb.normalize_status = MagicMock(
+        side_effect=lambda name: {
+            "todo": TaskStatus.TODO,
+            "ready": TaskStatus.READY,
+            "in progress": TaskStatus.IN_PROGRESS,
+            "blocked": TaskStatus.BLOCKED,
+            "waiting for human": TaskStatus.WAITING_FOR_HUMAN,
+            "done": TaskStatus.DONE,
+        }.get(str(name).strip().lower(), TaskStatus.TODO)
+    )
     return kb
 
 
@@ -2852,6 +2867,108 @@ class TestDecomposition:
             "- [ ] a\n- [ ] b\n- [ ] c\n- [ ] d", "hash",
         )
         return lifecycle.get(tid, "kanboard")
+
+    async def _decompose_with(self, workflow, mock_kanban, parent_column):
+        """Run a 2-child decompose against a parent in *parent_column*."""
+
+        async def fake_llm(prompt):
+            return (
+                '{"subtasks": [{"title": "Backend", "description": "api", '
+                '"acceptance_criteria": "- [ ] api"}, {"title": "Frontend", '
+                '"description": "ui", "acceptance_criteria": "- [ ] ui"}]}'
+            )
+
+        workflow._llm_generate = fake_llm
+        created = {"n": 200}
+
+        async def fake_create(data):
+            created["n"] += 1
+            t = MagicMock()
+            t.id = str(created["n"])
+            t.name = data["name"]
+            return t
+
+        mock_kanban.create_task = AsyncMock(side_effect=fake_create)
+        mock_kanban.create_task_link = AsyncMock(return_value=True)
+        mock_kanban.assign_task = AsyncMock(return_value=True)
+        parent = MagicMock(description="do a lot")
+        parent.name = "Big"
+        parent.source_context = {
+            "kanboard_task": {"project_id": 3, "column_name": parent_column}
+        }
+        mock_kanban.get_task_by_id = AsyncMock(return_value=parent)
+        return await workflow.decompose_ticket("100")
+
+    @pytest.mark.asyncio
+    async def test_children_are_assigned_on_the_board_not_just_internally(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Sub-tickets must be assigned to the parent's user ON THE BOARD.
+
+        Inheriting the owner into Marcus's own lifecycle record only is not
+        enough: the Kanboard card shows no assignee, so a human looking at
+        the board sees unowned sub-tickets, and any path that re-derives
+        state from the board (a fresh Marcus against an existing board)
+        loses the owner entirely — at which point the children stop being
+        handout candidates, since _next_worker_ticket requires a human
+        owner.
+        """
+        self._big_ticket(lifecycle)
+
+        children = await self._decompose_with(workflow, mock_kanban, "Ready")
+
+        assigned = {
+            call.args[0]: call.args[1]
+            for call in mock_kanban.assign_task.await_args_list
+        }
+        assert set(assigned) == set(children)
+        assert set(assigned.values()) == {"alice"}
+
+    @pytest.mark.asyncio
+    async def test_children_inherit_the_parents_column(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Sub-tickets take the parent's place in the workflow.
+
+        The parent vacates its column (it moves to Blocked), so its
+        children should appear where it was — a parent decomposed from In
+        Progress should not have its children land back in Ready, which
+        reads as the work having gone backwards.
+        """
+        self._big_ticket(lifecycle)
+
+        children = await self._decompose_with(
+            workflow, mock_kanban, "In Progress"
+        )
+
+        moves = {
+            call.args[0]: call.args[1]
+            for call in mock_kanban.move_task_to_column.await_args_list
+            if call.args[0] in children
+        }
+        assert moves == {c: "In Progress" for c in children}
+
+    @pytest.mark.asyncio
+    async def test_children_do_not_inherit_a_terminal_parent_column(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """A column that means "not workable" is never inherited.
+
+        Marcus moves the parent to Blocked, and a human can decompose a
+        ticket sitting in Blocked or Waiting for Human. Copying that column
+        onto the children would create sub-tickets no worker can ever pick
+        up — they'd be born blocked. Fall back to Ready.
+        """
+        self._big_ticket(lifecycle)
+
+        children = await self._decompose_with(workflow, mock_kanban, "Blocked")
+
+        moves = {
+            call.args[0]: call.args[1]
+            for call in mock_kanban.move_task_to_column.await_args_list
+            if call.args[0] in children
+        }
+        assert moves == {c: "ready" for c in children}
 
     @pytest.mark.asyncio
     async def test_decompose_creates_linked_children(

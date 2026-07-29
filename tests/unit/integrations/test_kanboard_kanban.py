@@ -323,7 +323,21 @@ class TestToTask:
         was actually configured."""
         kanban._column_status_map = {1: TaskStatus.TODO}
         task = kanban._to_task(_make_raw_task(project_id=5))
-        assert task.source_context == {"kanboard_task": {"project_id": 5}}
+        assert task.source_context["kanboard_task"]["project_id"] == 5
+
+    def test_source_context_carries_the_board_column_title(self, kanban):
+        """source_context must also carry the board's own column TITLE.
+
+        decompose_ticket puts sub-tickets in the same column their parent
+        sat in, which needs a real column name to hand to
+        move_task_to_column — the normalised TaskStatus is a one-to-many
+        mapping that cannot be reversed back into a title.
+        """
+        kanban._column_status_map = {1: TaskStatus.TODO}
+        task = kanban._to_task(
+            _make_raw_task(project_id=5, column_name="In Progress")
+        )
+        assert task.source_context["kanboard_task"]["column_name"] == "In Progress"
 
 
 # ---------------------------------------------------------------------------

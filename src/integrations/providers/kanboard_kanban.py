@@ -1635,7 +1635,16 @@ class KanboardKanban(KanbanInterface):
             # always "human", verify_count always 0, stack-check always
             # skipped) regardless of what was actually configured.
             source_context={
-                "kanboard_task": {"project_id": raw.get("project_id")}
+                "kanboard_task": {
+                    "project_id": raw.get("project_id"),
+                    # The board's own column TITLE, not the normalised
+                    # TaskStatus — callers that need to put another card in
+                    # the same column (decompose_ticket placing sub-tickets
+                    # where their parent sat) have to pass a real column
+                    # name to move_task_to_column, and TaskStatus is a
+                    # one-to-many mapping that cannot be reversed.
+                    "column_name": column_name,
+                }
             },
         )
 
