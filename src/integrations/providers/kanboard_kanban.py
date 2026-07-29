@@ -25,7 +25,7 @@ import mimetypes
 import re
 import secrets
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import httpx
 
@@ -186,6 +186,9 @@ class KanboardKanban(KanbanInterface):
         # so its comments show an "M" avatar instead of the "?" placeholder
         # that user_id=0 (anonymous) renders as.
         self._comment_user_id: Optional[int] = None
+        # Which Kanboard projects Marcus may read. None → just the
+        # configured one; see set_project_scope().
+        self._project_scope: Optional[Callable[[], List[int]]] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -259,14 +262,60 @@ class KanboardKanban(KanbanInterface):
     # Task retrieval
     # ------------------------------------------------------------------
 
+    def set_project_scope(
+        self, provider: Optional[Callable[[], List[int]]]
+    ) -> None:
+        """Set which Kanboard projects Marcus reads.
+
+        Marcus is scoped to the projects a human has explicitly enabled
+        (see :class:`~src.core.project_access_settings.ProjectAccessSettingManager`),
+        which is not the same thing as the single ``kanboard_project_id``
+        baked into config at setup time. Without this, enabling any other
+        project from its board header has no effect at all: Marcus keeps
+        polling only the configured one, never sees the enabled board's
+        ready+assigned tickets, and never hands them to an agent — while
+        the toggle sits reassuringly ON.
+
+        Parameters
+        ----------
+        provider : Optional[Callable[[], List[int]]]
+            Returns the project ids Marcus may read. ``None`` restores the
+            original single-configured-project behaviour.
+        """
+        self._project_scope = provider
+
+    def _scoped_project_ids(self) -> List[int]:
+        """Return the project ids to read, or the configured one."""
+        if self._project_scope is None:
+            return [self._project_id]
+        try:
+            return [int(pid) for pid in self._project_scope()]
+        except Exception as exc:  # noqa: BLE001
+            # A broken scope must not blind Marcus entirely — fall back to
+            # the configured project rather than reading no board at all.
+            logger.error(
+                "Project scope lookup failed (%s); falling back to the "
+                "configured project %d",
+                exc,
+                self._project_id,
+            )
+            return [self._project_id]
+
     async def get_all_tasks(self) -> List[Task]:
         """
-        Fetch all active and closed tasks for the configured project.
+        Fetch all active and closed tasks for every in-scope project.
+
+        Scope is whatever :meth:`set_project_scope` was wired to — the
+        projects enabled for Marcus — falling back to the single
+        configured project when no scope is set.
 
         Returns
         -------
         List[Task]
-            All tasks converted to Marcus ``Task`` objects.
+            All tasks converted to Marcus ``Task`` objects. Empty when no
+            project is in scope (nothing has been enabled), which is the
+            intended meaning of the default-off access gate: Marcus reads
+            no board until a human opts one in.
 
         Raises
         ------
@@ -276,15 +325,21 @@ class KanboardKanban(KanbanInterface):
         if self._client is None:
             raise RuntimeError("Call connect() before get_all_tasks()")
 
-        active = await self._rpc(
-            "getAllTasks", project_id=self._project_id, status_id=1
-        )
-        closed = await self._rpc(
-            "getAllTasks", project_id=self._project_id, status_id=0
-        )
+        project_ids = self._scoped_project_ids()
+        if not project_ids:
+            logger.debug(
+                "No Kanboard project is enabled for Marcus — reading no "
+                "board. Switch 'Marcus: OFF' to ON in a project's board "
+                "header to scope Marcus to it."
+            )
+            return []
+
         tasks: List[Task] = []
-        for raw in (active or []) + (closed or []):
-            tasks.append(self._to_task(raw))
+        for pid in project_ids:
+            active = await self._rpc("getAllTasks", project_id=pid, status_id=1)
+            closed = await self._rpc("getAllTasks", project_id=pid, status_id=0)
+            for raw in (active or []) + (closed or []):
+                tasks.append(self._to_task(raw))
         return tasks
 
     async def get_available_tasks(self) -> List[Task]:

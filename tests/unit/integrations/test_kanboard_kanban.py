@@ -436,6 +436,92 @@ class TestGetAllTasks:
         tasks = await kanban.get_all_tasks()
         assert tasks == []
 
+    @pytest.mark.asyncio
+    async def test_polls_every_project_in_scope(self, kanban):
+        """Marcus watches EVERY board it has been enabled for.
+
+        Without this, Marcus only ever polls the single project baked into
+        KANBOARD_PROJECT_ID at setup time. Enabling any OTHER project from
+        its board header then has no effect whatsoever — Marcus never looks
+        at it, so its ready+assigned tickets are never seen and never handed
+        to an agent, while the toggle sits reassuringly ON.
+        """
+        kanban._client = AsyncMock()
+        kanban.set_project_scope(lambda: [7, 8])
+        kanban._column_status_map = {1: TaskStatus.TODO}
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response([_make_raw_task(task_id=21, project_id=7)]),
+                _rpc_response([]),
+                _rpc_response([_make_raw_task(task_id=31, project_id=8)]),
+                _rpc_response([]),
+            ]
+        )
+
+        tasks = await kanban.get_all_tasks()
+
+        assert {t.id for t in tasks} == {"21", "31"}
+        polled = [
+            c.kwargs["json"]["params"]["project_id"]
+            for c in kanban._client.post.call_args_list
+            if c.kwargs["json"]["method"] == "getAllTasks"
+        ]
+        assert set(polled) == {7, 8}
+
+    @pytest.mark.asyncio
+    async def test_without_a_scope_falls_back_to_configured_project(self, kanban):
+        """Unscoped (no provider wired) keeps the original single-project
+        behaviour, so non-Kanboard-multi-project deployments are unaffected."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            side_effect=[_rpc_response([]), _rpc_response([])]
+        )
+
+        await kanban.get_all_tasks()
+
+        polled = [
+            c.kwargs["json"]["params"]["project_id"]
+            for c in kanban._client.post.call_args_list
+            if c.kwargs["json"]["method"] == "getAllTasks"
+        ]
+        assert set(polled) == {kanban._project_id}
+
+    @pytest.mark.asyncio
+    async def test_empty_scope_polls_nothing(self, kanban):
+        """No project enabled → Marcus reads no board at all, rather than
+        silently falling back to the configured one (the whole point of the
+        default-off access gate)."""
+        kanban._client = AsyncMock()
+        kanban.set_project_scope(lambda: [])
+        kanban._client.post = AsyncMock()
+
+        tasks = await kanban.get_all_tasks()
+
+        assert tasks == []
+        assert kanban._client.post.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_scope_failure_falls_back_to_configured_project(self, kanban):
+        """A broken scope provider must not blind Marcus completely."""
+        kanban._client = AsyncMock()
+
+        def boom():
+            raise RuntimeError("settings unreadable")
+
+        kanban.set_project_scope(boom)
+        kanban._client.post = AsyncMock(
+            side_effect=[_rpc_response([]), _rpc_response([])]
+        )
+
+        await kanban.get_all_tasks()
+
+        polled = [
+            c.kwargs["json"]["params"]["project_id"]
+            for c in kanban._client.post.call_args_list
+            if c.kwargs["json"]["method"] == "getAllTasks"
+        ]
+        assert set(polled) == {kanban._project_id}
+
 
 # ---------------------------------------------------------------------------
 # get_available_tasks tests

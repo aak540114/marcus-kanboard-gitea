@@ -1385,6 +1385,33 @@ class HumanGatedWorkflow:
                 )
         return child_ids
 
+    async def _scope_summary(self) -> str:
+        """Name the boards Marcus is actually watching.
+
+        "No tickets are ready" is indistinguishable from "Marcus is not
+        looking at your board at all" — which is the state a fresh install
+        is in, since every project starts disabled. Saying which boards are
+        in scope makes that difference visible without the human having to
+        go read logs.
+        """
+        lister = getattr(self._project_access, "enabled_project_ids", None)
+        if lister is None:
+            return ""
+        try:
+            pids = list(lister())
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Could not list enabled projects: %s", exc)
+            return ""
+        if not pids:
+            return (
+                "NOTE: Marcus is not enabled for ANY Kanboard project, so it "
+                "is not reading any board — no ticket can ever be handed out. "
+                "Open the board you want worked on and switch 'Marcus: OFF' "
+                "to ON in its header."
+            )
+        labels = [await self._project_display_name(pid) for pid in pids]
+        return f"Marcus is watching Kanboard project(s): {', '.join(labels)}."
+
     async def _withheld_ticket_reasons(self) -> List[str]:
         """Explain assigned tickets that a worker cannot be handed.
 
@@ -1650,8 +1677,9 @@ class HumanGatedWorkflow:
                 "status": "no_work",
                 "agent_id": agent_id,
                 "message": (
-                    "No tickets are ready right now. Call marcus_work again "
-                    "in ~10s."
+                    "No tickets are ready right now. "
+                    + await self._scope_summary()
+                    + " Call marcus_work again in ~10s."
                 ),
             }
         rec = self._lifecycle.get(next_id, self._provider)

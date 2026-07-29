@@ -31,7 +31,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +88,31 @@ class ProjectAccessSettingManager:
         """
         val = self._project_entry(project_id).get("enabled")
         return val if isinstance(val, bool) else None
+
+    def enabled_project_ids(self) -> List[int]:
+        """Return every project a human has explicitly enabled for Marcus.
+
+        This is the set of boards Marcus may read and work — it is NOT the
+        same as the single ``kanboard_project_id`` from config, which only
+        records the project setup.sh happened to provision. Marcus polls
+        these, so a project enabled from its board header is picked up
+        without touching any configuration.
+
+        Returns
+        -------
+        List[int]
+            Enabled project ids, ascending. Empty when nothing has been
+            enabled — the default-off state, in which Marcus reads no board.
+        """
+        out: List[int] = []
+        for key, entry in (self._data.get("projects") or {}).items():
+            if not isinstance(entry, dict) or entry.get("enabled") is not True:
+                continue
+            try:
+                out.append(int(key))
+            except (TypeError, ValueError):
+                logger.warning("Ignoring non-numeric project key %r", key)
+        return sorted(out)
 
     def set_project_enabled(self, project_id: int, enabled: bool) -> None:
         """Persist whether Marcus is allowed to work on *project_id*.

@@ -72,3 +72,34 @@ class TestProjectAccessSettingManager:
         path.write_text("{not valid json", encoding="utf-8")
         mgr = ProjectAccessSettingManager(data_dir=tmp_path)
         assert mgr.is_enabled(1) is False
+
+
+class TestEnabledProjectIds:
+    """enabled_project_ids() is what scopes which boards Marcus reads."""
+
+    def test_lists_only_explicitly_enabled_projects(self, tmp_path):
+        """Disabled and never-configured projects are excluded."""
+        mgr = ProjectAccessSettingManager(data_dir=tmp_path)
+        mgr.set_project_enabled(8, True)
+        mgr.set_project_enabled(7, False)
+        mgr.set_project_enabled(2, True)
+        assert mgr.enabled_project_ids() == [2, 8]
+
+    def test_empty_when_nothing_enabled(self, tmp_path):
+        """The default-off state reads no board at all."""
+        mgr = ProjectAccessSettingManager(data_dir=tmp_path)
+        assert mgr.enabled_project_ids() == []
+
+    def test_survives_a_reload_from_disk(self, tmp_path):
+        """JSON object keys are strings; they must still come back as ints
+        so the provider can pass them to Kanboard's API."""
+        ProjectAccessSettingManager(data_dir=tmp_path).set_project_enabled(8, True)
+        reloaded = ProjectAccessSettingManager(data_dir=tmp_path)
+        assert reloaded.enabled_project_ids() == [8]
+
+    def test_ignores_a_corrupt_key(self, tmp_path):
+        """A hand-edited file with a junk key must not break scoping."""
+        mgr = ProjectAccessSettingManager(data_dir=tmp_path)
+        mgr.set_project_enabled(8, True)
+        mgr._data["projects"]["oops"] = {"enabled": True}
+        assert mgr.enabled_project_ids() == [8]
