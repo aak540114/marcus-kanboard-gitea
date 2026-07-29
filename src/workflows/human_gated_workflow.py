@@ -201,6 +201,12 @@ class HumanGatedWorkflow:
         self._ac_gen = ac_generator or ACGenerator()
         self._gate = gate_settings or GateSettingManager()
         self._project_access = project_access or ProjectAccessSettingManager()
+        # ticket id → Kanboard project id, and project id → project name.
+        # Both are effectively immutable, and resolving them costs an RPC
+        # each — see _resolve_kanboard_project_id for why that matters on
+        # a 10-second agent poll.
+        self._ticket_project_ids: Dict[str, int] = {}
+        self._project_names: Dict[int, str] = {}
         self._verifier = ai_verifier or AIVerifier()
         # Optional ProjectDescriptionInferrer — when set, a ticket whose
         # project has no usable tech stack gets one inferred from the ticket
@@ -1393,33 +1399,58 @@ class HumanGatedWorkflow:
         List[str]
             Human-readable reasons, empty when nothing is being withheld.
         """
-        reasons: List[str] = []
+        paused: List[str] = []
+        blocked: List[str] = []
+        # Kanboard project id → tickets held up by that project's toggle.
+        # Grouped, because one toggle unblocks all of them: listing the
+        # same instruction once per ticket buries the single action the
+        # human actually has to take.
+        by_project: Dict[int, List[str]] = {}
+
         for rec in self._lifecycle.all_records():
             if rec.provider != self._provider:
                 continue
             if not self._is_human_owner(rec.assignee):
                 continue
             if rec.state == TicketState.WAITING_FOR_HUMAN:
-                reasons.append(
-                    f"#{rec.ticket_id} is paused waiting for human input — "
-                    "see the ticket's comments on the board."
-                )
+                paused.append(f"#{rec.ticket_id}")
                 continue
             if rec.state == TicketState.BLOCKED:
-                blocked_by = rec.blocked_by or "another ticket"
-                reasons.append(
-                    f"#{rec.ticket_id} is blocked by {blocked_by}."
+                blocked.append(
+                    f"#{rec.ticket_id} (blocked by "
+                    f"{rec.blocked_by or 'another ticket'})"
                 )
                 continue
             if rec.state not in (TicketState.READY, TicketState.IN_PROGRESS):
                 continue
             pid = await self._resolve_kanboard_project_id(rec.ticket_id)
             if pid is not None and not self._project_access.is_enabled(pid):
-                reasons.append(
-                    f"#{rec.ticket_id} is ready, but Kanboard project {pid} "
-                    "is not enabled for Marcus — switch 'Marcus: OFF' to ON "
-                    "in that project's board header to allow it."
-                )
+                by_project.setdefault(pid, []).append(f"#{rec.ticket_id}")
+
+        reasons: List[str] = []
+        for pid in sorted(by_project):
+            tickets = by_project[pid]
+            label = await self._project_display_name(pid)
+            reasons.append(
+                f"{len(tickets)} ready ticket(s) — {', '.join(tickets)} — "
+                f"are in Kanboard project {label}, which is not enabled for "
+                "Marcus. Open THAT project's board in Kanboard and switch "
+                "'Marcus: OFF' to ON in the board header. Enabling a "
+                "different project does not cover this one: the setting is "
+                "per project."
+            )
+        if paused:
+            reasons.append(
+                f"{len(paused)} ticket(s) — {', '.join(paused)} — are paused "
+                "waiting for human input; see each ticket's comments on the "
+                "board."
+            )
+        if blocked:
+            reasons.append(
+                f"{len(blocked)} ticket(s) are blocked by dependencies: "
+                + ", ".join(blocked)
+                + "."
+            )
         return reasons
 
     async def _next_worker_ticket(self) -> Optional[str]:
@@ -1606,11 +1637,12 @@ class HumanGatedWorkflow:
                     "status": "no_work",
                     "agent_id": agent_id,
                     "message": (
-                        "No tickets can be handed out right now, but "
-                        + str(len(withheld))
-                        + " assigned ticket(s) are being withheld:\n"
+                        "No tickets can be handed out right now. Assigned "
+                        "tickets are being withheld for these reasons:\n"
                         + "\n".join(f"- {r}" for r in withheld)
-                        + "\nTell the human the above, then call marcus_work "
+                        + "\nRelay the above to the human VERBATIM, including "
+                        "the project name and number — do not paraphrase it "
+                        "as a generic 'enable Marcus'. Then call marcus_work "
                         "again in ~10s."
                     ),
                 }
@@ -3358,17 +3390,60 @@ class HumanGatedWorkflow:
     async def _resolve_kanboard_project_id(
         self, ticket_id: str
     ) -> Optional[int]:
-        """Best-effort resolve a ticket's Kanboard project id, or ``None``."""
+        """Best-effort resolve a ticket's Kanboard project id, or ``None``.
+
+        Memoised. This is called for every assigned ticket by both
+        :meth:`_next_worker_ticket` and :meth:`_withheld_ticket_reasons`,
+        i.e. twice per ticket on every ``marcus_work`` poll — with a
+        handful of blocked tickets and an agent polling every ~10s that is
+        a steady stream of ``getTask`` calls into Kanboard's SQLite
+        backend, which is precisely the write contention that surfaces as
+        "database is locked". A ticket does not move between projects in
+        practice (Kanboard's moveTaskToProject is a deliberate, rare
+        action Marcus never performs), so resolve it once and keep it.
+        Failures are NOT cached, so a transient RPC error is retried.
+        """
+        cached = self._ticket_project_ids.get(ticket_id)
+        if cached is not None:
+            return cached
         try:
             task = await self._kanban.get_task_by_id(ticket_id)
             if task:
                 raw = (task.source_context or {}).get("kanboard_task", {})
                 pid_raw = raw.get("project_id")
                 if pid_raw:
-                    return int(pid_raw)
+                    pid = int(pid_raw)
+                    self._ticket_project_ids[ticket_id] = pid
+                    return pid
         except Exception as exc:  # noqa: BLE001
             logger.debug("Could not resolve project id for %s: %s", ticket_id, exc)
         return None
+
+    async def _project_display_name(self, project_id: int) -> str:
+        """Return ``"7 ('Website')"``-style label for a Kanboard project.
+
+        Kanboard shows humans project NAMES and never ids, so a bare id in
+        a message asking someone to change a project setting cannot be
+        acted on — worse, a human who has already enabled a DIFFERENT
+        project reads it as Marcus being confused rather than as a second
+        project needing the same toggle. Falls back to the bare id when
+        the provider can't name it (non-Kanboard provider, RPC failure).
+        """
+        cached = self._project_names.get(project_id)
+        if cached is None:
+            getter = getattr(self._kanban, "get_project_name", None)
+            if getter is not None:
+                try:
+                    cached = await getter(project_id) or ""
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "Could not resolve name for project %s: %s", project_id, exc
+                    )
+                    cached = ""
+            else:
+                cached = ""
+            self._project_names[project_id] = cached
+        return f"{project_id} ({cached!r})" if cached else str(project_id)
 
     def _project_internal_repo_url(
         self, project_id: Optional[int]

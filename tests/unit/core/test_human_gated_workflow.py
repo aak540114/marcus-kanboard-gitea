@@ -3660,6 +3660,81 @@ class TestProjectAccessGate:
         assert result["status"] == "no_work"
 
     @pytest.mark.asyncio
+    async def test_withheld_message_names_the_project_not_just_its_id(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """A bare numeric project id is unactionable.
+
+        Kanboard shows humans project NAMES, never ids, so "enable Kanboard
+        project 7" cannot be mapped to a board — a human who has already
+        enabled a different project reasonably reads it as Marcus being
+        wrong rather than as a second, different project needing the
+        toggle. Name the project.
+        """
+        self._wire_task_project(mock_kanban, 7)
+        mock_kanban.get_project_name = AsyncMock(return_value="Website Rebuild")
+        mock_project_access.is_enabled = MagicMock(return_value=False)
+        lifecycle.get_or_create("21", "kanboard")
+        lifecycle.transition("21", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("21", "kanboard", "alice")
+
+        result = await workflow.orchestrate_work(agent_id="worker-C")
+
+        msg = result["message"]
+        assert "Website Rebuild" in msg
+        assert "7" in msg
+
+    @pytest.mark.asyncio
+    async def test_withheld_tickets_are_grouped_per_project(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """Eight tickets blocked on ONE toggle must read as one instruction,
+        not eight repetitions of the same sentence."""
+        self._wire_task_project(mock_kanban, 7)
+        mock_kanban.get_project_name = AsyncMock(return_value="Website Rebuild")
+        mock_project_access.is_enabled = MagicMock(return_value=False)
+        for tid in [str(n) for n in range(21, 29)]:
+            lifecycle.get_or_create(tid, "kanboard")
+            lifecycle.transition(tid, "kanboard", TicketState.READY)
+            lifecycle.set_assignee(tid, "kanboard", "alice")
+
+        result = await workflow.orchestrate_work(agent_id="worker-D")
+
+        msg = result["message"]
+        # One line for the project, listing the tickets — not one per ticket.
+        assert msg.count("is not enabled for Marcus") == 1
+        for tid in ("21", "28"):
+            assert f"#{tid}" in msg
+
+    @pytest.mark.asyncio
+    async def test_project_id_lookup_is_cached_per_ticket(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """A ticket's project is resolved once, not on every poll.
+
+        _withheld_ticket_reasons and _next_worker_ticket each resolve every
+        assigned ticket's project. With a handful of blocked tickets and an
+        agent polling every ~10s that is a steady stream of getTask calls
+        against Kanboard's SQLite backend — the same write contention that
+        surfaces as "database is locked". A ticket does not change project
+        in practice, so resolve it once and remember it.
+        """
+        self._wire_task_project(mock_kanban, 7)
+        mock_kanban.get_project_name = AsyncMock(return_value="Website Rebuild")
+        mock_project_access.is_enabled = MagicMock(return_value=False)
+        lifecycle.get_or_create("21", "kanboard")
+        lifecycle.transition("21", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("21", "kanboard", "alice")
+
+        await workflow.orchestrate_work(agent_id="worker-E")
+        first = mock_kanban.get_task_by_id.await_count
+        await workflow.orchestrate_work(agent_id="worker-E")
+        second = mock_kanban.get_task_by_id.await_count
+
+        # The second poll must not re-resolve the same ticket's project.
+        assert second == first
+
+    @pytest.mark.asyncio
     async def test_refused_ticket_still_mirrors_the_board_state(
         self, workflow, lifecycle, mock_kanban, mock_project_access
     ):
