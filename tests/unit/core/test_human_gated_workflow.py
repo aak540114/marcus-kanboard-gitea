@@ -3660,6 +3660,99 @@ class TestProjectAccessGate:
         assert result["status"] == "no_work"
 
     @pytest.mark.asyncio
+    async def test_refused_ticket_still_mirrors_the_board_state(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """A ticket refused for a disabled project must still have its
+        lifecycle record synced to the board's column.
+
+        _next_worker_ticket only ever considers READY/IN_PROGRESS records.
+        Leaving the record at TODO while the board says Ready makes the
+        ticket invisible to every worker FOREVER — including after a human
+        toggles the project on, because nothing re-checks it: the board
+        column does not change again, so no further status event fires.
+        Mirroring the column keeps the ticket a valid candidate the moment
+        the block is lifted.
+        """
+        self._wire_task_project(mock_kanban, 9)
+        mock_project_access.is_enabled = MagicMock(return_value=False)
+        lifecycle.get_or_create("60", "kanboard")
+        lifecycle.set_assignee("60", "kanboard", "alice")
+
+        await workflow._on_status_changed(
+            _make_event(
+                {
+                    "ticket_id": "60",
+                    "provider": "kanboard",
+                    "old_status": "todo",
+                    "new_status": "ready",
+                }
+            )
+        )
+
+        rec = lifecycle.get("60", "kanboard")
+        assert rec.state == TicketState.READY  # mirrors the board
+        assert rec.ai_agent_id is None  # but was NOT claimed
+
+    @pytest.mark.asyncio
+    async def test_ticket_is_picked_up_once_the_project_is_enabled(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """The whole point of mirroring: after the human toggles Marcus on,
+        the next marcus_work poll hands the ticket out with no further
+        board activity needed."""
+        self._wire_task_project(mock_kanban, 9)
+        mock_project_access.is_enabled = MagicMock(return_value=False)
+        lifecycle.get_or_create("61", "kanboard")
+        lifecycle.set_assignee("61", "kanboard", "alice")
+
+        await workflow._on_status_changed(
+            _make_event(
+                {
+                    "ticket_id": "61",
+                    "provider": "kanboard",
+                    "old_status": "todo",
+                    "new_status": "ready",
+                }
+            )
+        )
+        first = await workflow.orchestrate_work(agent_id="worker-A")
+        assert first["status"] == "no_work"
+
+        # Human flips the toggle on. No board event follows.
+        mock_project_access.is_enabled = MagicMock(return_value=True)
+        with patch(
+            "src.core.project_description.ProjectDescriptionManager.get_stack",
+            return_value={"language": "python"},
+        ):
+            second = await workflow.orchestrate_work(agent_id="worker-A")
+
+        assert second["status"] == "assigned"
+        assert second["ticket_id"] == "61"
+
+    @pytest.mark.asyncio
+    async def test_no_work_message_explains_a_disabled_project(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """'No tickets are ready right now' is actively misleading when a
+        ticket IS ready and Marcus is simply not allowed to touch its
+        project. The agent's reply must name the ticket and the reason, or
+        the human has nothing to act on — the refusal is otherwise only an
+        INFO log line inside the container."""
+        self._wire_task_project(mock_kanban, 9)
+        mock_project_access.is_enabled = MagicMock(return_value=False)
+        lifecycle.get_or_create("62", "kanboard")
+        lifecycle.transition("62", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("62", "kanboard", "alice")
+
+        result = await workflow.orchestrate_work(agent_id="worker-B")
+
+        assert result["status"] == "no_work"
+        msg = result["message"]
+        assert "62" in msg
+        assert "not enabled" in msg.lower()
+
+    @pytest.mark.asyncio
     async def test_disabled_project_does_not_generate_ac_on_new_ticket(
         self, workflow, lifecycle, mock_kanban, mock_project_access
     ):

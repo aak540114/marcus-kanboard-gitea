@@ -519,6 +519,34 @@ class HumanGatedWorkflow:
                         ticket_id,
                     )
                 else:
+                    # Mirror the board column BEFORE attempting the start.
+                    # The start can be refused for reasons that are not the
+                    # ticket's fault — the project isn't enabled for Marcus,
+                    # the project description has no tech stack, a dependency
+                    # is unmet — and _next_worker_ticket only ever considers
+                    # READY/IN_PROGRESS records. A record left at TODO while
+                    # the board says Ready is therefore invisible to every
+                    # worker FOREVER, including after the block is lifted:
+                    # the column does not change again, so no further status
+                    # event fires to re-examine it. Mirroring first keeps the
+                    # ticket a valid candidate the moment it is unblocked.
+                    if record.state == TicketState.TODO:
+                        try:
+                            self._lifecycle.human_transition(
+                                ticket_id,
+                                self._provider,
+                                TicketState.READY,
+                                reason=(
+                                    "Human moved assigned ticket to a "
+                                    "workable column"
+                                ),
+                            )
+                        except (InvalidTransitionError, KeyError):
+                            pass
+                        record = (
+                            self._lifecycle.get(ticket_id, self._provider)
+                            or record
+                        )
                     # Status changed to a workable state with a human owner → start.
                     await self._start_ai_work(ticket_id, record)
             else:
@@ -1351,6 +1379,49 @@ class HumanGatedWorkflow:
                 )
         return child_ids
 
+    async def _withheld_ticket_reasons(self) -> List[str]:
+        """Explain assigned tickets that a worker cannot be handed.
+
+        ``marcus_work`` otherwise answers "No tickets are ready right now"
+        whenever a ticket is ready but Marcus is not allowed to start it —
+        which is actively misleading, and leaves the human nothing to act
+        on, because the refusal is only an INFO log line inside the
+        container. Each reason names the ticket and what to do about it.
+
+        Returns
+        -------
+        List[str]
+            Human-readable reasons, empty when nothing is being withheld.
+        """
+        reasons: List[str] = []
+        for rec in self._lifecycle.all_records():
+            if rec.provider != self._provider:
+                continue
+            if not self._is_human_owner(rec.assignee):
+                continue
+            if rec.state == TicketState.WAITING_FOR_HUMAN:
+                reasons.append(
+                    f"#{rec.ticket_id} is paused waiting for human input — "
+                    "see the ticket's comments on the board."
+                )
+                continue
+            if rec.state == TicketState.BLOCKED:
+                blocked_by = rec.blocked_by or "another ticket"
+                reasons.append(
+                    f"#{rec.ticket_id} is blocked by {blocked_by}."
+                )
+                continue
+            if rec.state not in (TicketState.READY, TicketState.IN_PROGRESS):
+                continue
+            pid = await self._resolve_kanboard_project_id(rec.ticket_id)
+            if pid is not None and not self._project_access.is_enabled(pid):
+                reasons.append(
+                    f"#{rec.ticket_id} is ready, but Kanboard project {pid} "
+                    "is not enabled for Marcus — switch 'Marcus: OFF' to ON "
+                    "in that project's board header to allow it."
+                )
+        return reasons
+
     async def _next_worker_ticket(self) -> Optional[str]:
         """Return the next human-readied ticket to hand a worker, or ``None``.
 
@@ -1529,6 +1600,20 @@ class HumanGatedWorkflow:
         # 3. No active ticket → assign the next available one.
         next_id = await self._next_worker_ticket()
         if next_id is None:
+            withheld = await self._withheld_ticket_reasons()
+            if withheld:
+                return {
+                    "status": "no_work",
+                    "agent_id": agent_id,
+                    "message": (
+                        "No tickets can be handed out right now, but "
+                        + str(len(withheld))
+                        + " assigned ticket(s) are being withheld:\n"
+                        + "\n".join(f"- {r}" for r in withheld)
+                        + "\nTell the human the above, then call marcus_work "
+                        "again in ~10s."
+                    ),
+                }
             return {
                 "status": "no_work",
                 "agent_id": agent_id,
