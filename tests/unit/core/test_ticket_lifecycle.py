@@ -519,3 +519,44 @@ class TestBranchNameUnification:
         """The common Kanboard case keeps the familiar shape."""
         rec = manager.get_or_create("42", "kanboard")
         assert rec.branch_name == "ticket/kanboard/42"
+
+
+class TestPurge:
+    """purge() drops a record for a ticket that no longer exists.
+
+    Without it, deleting a ticket in Kanboard leaves Marcus's record
+    behind — and since _next_worker_ticket selects from records, not from
+    the board, an agent gets handed a ticket that isn't there any more.
+    """
+
+    def test_purge_removes_the_record(self, manager):
+        """A purged ticket is no longer tracked."""
+        manager.get_or_create("21", "kanboard")
+        assert manager.purge("21", "kanboard") is True
+        assert manager.get("21", "kanboard") is None
+
+    def test_purge_is_idempotent(self, manager):
+        """Purging an unknown ticket reports False rather than raising —
+        the same deletion can be observed by both a webhook and a poll."""
+        assert manager.purge("nope", "kanboard") is False
+
+    def test_purge_frees_the_agent(self, manager):
+        """A purged ticket releases its claim, so the agent holding it is
+        not stuck owning a ticket that no longer exists."""
+        manager.get_or_create("21", "kanboard")
+        manager.transition("21", "kanboard", TicketState.READY)
+        manager.claim_ticket("21", "kanboard", "worker-1")
+        assert manager.get_agent_ticket("worker-1") == "21"
+
+        manager.purge("21", "kanboard")
+
+        assert manager.get_agent_ticket("worker-1") is None
+
+    def test_purge_persists(self, manager, state_file):
+        """The removal survives a reload — otherwise a restart resurrects
+        the deleted ticket."""
+        manager.get_or_create("21", "kanboard")
+        manager.purge("21", "kanboard")
+
+        reloaded = TicketLifecycleManager(state_file=state_file)
+        assert reloaded.get("21", "kanboard") is None

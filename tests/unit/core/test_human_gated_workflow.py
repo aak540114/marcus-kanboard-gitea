@@ -1154,6 +1154,90 @@ class TestFirstSightRecovery:
         assert rec.ai_agent_id is None
 
 
+class TestTicketDeleted:
+    """A ticket deleted in Kanboard must stop being tracked by Marcus.
+
+    Marcus hands out work from lifecycle records, not from the board, so a
+    record that outlives its ticket is still selected — the agent is then
+    told to work a ticket that no longer exists, and the slot it occupies
+    is never freed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_deleted_ticket_is_purged(self, workflow, lifecycle):
+        """The record is dropped so it can never be handed out again."""
+        lifecycle.get_or_create("21", "kanboard")
+        lifecycle.transition("21", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("21", "kanboard", "alice")
+
+        await workflow._on_ticket_deleted(
+            _make_event({"ticket_id": "21", "provider": "kanboard"})
+        )
+
+        assert lifecycle.get("21", "kanboard") is None
+
+    @pytest.mark.asyncio
+    async def test_deleting_a_claimed_ticket_frees_its_agent(
+        self, workflow, lifecycle
+    ):
+        """An agent holding the deleted ticket is freed to take new work,
+        rather than staying pinned to a ticket that no longer exists."""
+        lifecycle.get_or_create("21", "kanboard")
+        lifecycle.transition("21", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("21", "kanboard", "alice")
+        lifecycle.claim_ticket("21", "kanboard", "worker-1")
+
+        await workflow._on_ticket_deleted(
+            _make_event({"ticket_id": "21", "provider": "kanboard"})
+        )
+
+        assert lifecycle.get_agent_ticket("worker-1") is None
+
+    @pytest.mark.asyncio
+    async def test_deleted_ticket_stops_its_dev_environment(
+        self, workflow, lifecycle, mock_dev_env
+    ):
+        """Its preview container is torn down — nothing will ever stop it
+        later, since every other cleanup path keys off the ticket."""
+        lifecycle.get_or_create("21", "kanboard")
+
+        await workflow._on_ticket_deleted(
+            _make_event({"ticket_id": "21", "provider": "kanboard"})
+        )
+
+        mock_dev_env.stop.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_deleting_an_untracked_ticket_is_harmless(
+        self, workflow, lifecycle
+    ):
+        """The same deletion can arrive from both a webhook and a poll."""
+        await workflow._on_ticket_deleted(
+            _make_event({"ticket_id": "999", "provider": "kanboard"})
+        )
+
+    @pytest.mark.asyncio
+    async def test_deleted_ticket_is_not_handed_to_an_agent(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """End to end: the exact reported symptom — an agent being assigned
+        a ticket the human had already deleted."""
+        mock_project_access.is_enabled = MagicMock(return_value=True)
+        task = MagicMock()
+        task.source_context = {"kanboard_task": {"project_id": 1}}
+        mock_kanban.get_task_by_id = AsyncMock(return_value=task)
+        lifecycle.get_or_create("21", "kanboard")
+        lifecycle.transition("21", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("21", "kanboard", "alice")
+
+        await workflow._on_ticket_deleted(
+            _make_event({"ticket_id": "21", "provider": "kanboard"})
+        )
+        result = await workflow.orchestrate_work(agent_id="worker-1")
+
+        assert result["status"] == "no_work"
+
+
 # ---------------------------------------------------------------------------
 # Trigger: ticket unassigned → AI releases claim and stops
 # ---------------------------------------------------------------------------

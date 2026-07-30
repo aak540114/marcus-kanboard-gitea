@@ -319,6 +319,7 @@ class HumanGatedWorkflow:
         self._events.subscribe("ticket.status_changed", self._on_status_changed)
         self._events.subscribe("ticket.closed", self._on_ticket_closed)
         self._events.subscribe("ticket.reopened", self._on_ticket_reopened)
+        self._events.subscribe("ticket.deleted", self._on_ticket_deleted)
         self._events.subscribe("ticket.comment_added", self._on_comment_added)
         self._events.subscribe("ticket.ac_changed", self._on_ac_changed)
 
@@ -464,7 +465,42 @@ class HumanGatedWorkflow:
         # so parallel capacity is not left idle until an unrelated event.
         await self._pickup_next_ticket()
 
+    async def _on_ticket_deleted(self, event: Any) -> None:
+        """Stop tracking a ticket that was deleted from the board.
+
+        Marcus hands out work from lifecycle records, not from the board,
+        so a record that outlives its ticket keeps being selected: an agent
+        is told to work a ticket that no longer exists, and the slot it
+        holds is never freed. Its preview container has to go too — every
+        other teardown path keys off the ticket, so nothing else would ever
+        stop it.
+
+        The watcher only emits this once a direct lookup has confirmed the
+        ticket is really gone, so a ticket that merely fell out of scope
+        (its project was switched off) is never purged here.
+        """
+        ticket_id = event.data["ticket_id"]
+
+        try:
+            await self._dev_env.stop(ticket_id, self._provider)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not stop dev environment for deleted ticket %s: %s",
+                ticket_id,
+                exc,
+            )
+
+        if self._lifecycle.purge(ticket_id, self._provider):
+            logger.info(
+                "Ticket %s was deleted on the board — stopped tracking it",
+                ticket_id,
+            )
+            # A freed slot should be filled straight away rather than
+            # idling until some unrelated board event comes along.
+            await self._pickup_next_ticket()
+
     async def _on_status_changed(self, event: Any) -> None:
+
         """Handle a kanban status/column change.
 
         Triggers

@@ -385,3 +385,92 @@ class TestPollOnceConcurrencyAndFreshness:
         await watcher.poll_once()
 
         assert mock_kanban.get_all_tasks.await_count == 2
+
+
+class TestDeletedTicketDetection:
+    """A ticket that vanishes from the board must be reported as deleted —
+    but only once it is confirmed gone.
+
+    Marcus selects work from lifecycle records, not from the board, so a
+    record left behind after a human deletes a ticket is still handed to an
+    agent. The watcher previously just dropped its snapshot at debug level
+    and emitted nothing, so nothing downstream ever learned.
+
+    Disappearing from get_all_tasks() is NOT proof of deletion, though:
+    Marcus only reads the projects it is enabled for, so every ticket on a
+    project a human just switched OFF also vanishes from that call. Purging
+    those would destroy live state — including claims on tickets an agent is
+    actively working.
+    """
+
+    @pytest.mark.asyncio
+    async def test_emits_ticket_deleted_when_confirmed_gone(
+        self, watcher, events, mock_kanban
+    ):
+        """Gone from the board AND gone on direct lookup → deleted."""
+        mock_kanban.get_all_tasks = AsyncMock(return_value=[_make_task("T-1")])
+        await watcher.poll_once()
+
+        received: List[Any] = []
+
+        async def handler(event: Any) -> None:
+            received.append(event)
+
+        events.subscribe("ticket.deleted", handler)
+        mock_kanban.get_all_tasks = AsyncMock(return_value=[])
+        mock_kanban.get_task_by_id = AsyncMock(return_value=None)
+
+        await watcher.poll_once()
+
+        assert len(received) == 1
+        assert received[0].data["ticket_id"] == "T-1"
+        assert "T-1" not in watcher._snapshots
+
+    @pytest.mark.asyncio
+    async def test_out_of_scope_ticket_is_not_reported_deleted(
+        self, watcher, events, mock_kanban
+    ):
+        """Gone from the board but still resolvable → out of scope, not
+        deleted. Its snapshot is kept so re-enabling the project doesn't
+        replay it as a brand-new ticket."""
+        mock_kanban.get_all_tasks = AsyncMock(return_value=[_make_task("T-1")])
+        await watcher.poll_once()
+
+        received: List[Any] = []
+
+        async def handler(event: Any) -> None:
+            received.append(event)
+
+        events.subscribe("ticket.deleted", handler)
+        mock_kanban.get_all_tasks = AsyncMock(return_value=[])
+        mock_kanban.get_task_by_id = AsyncMock(return_value=_make_task("T-1"))
+
+        await watcher.poll_once()
+
+        assert received == []
+        assert "T-1" in watcher._snapshots
+
+    @pytest.mark.asyncio
+    async def test_lookup_failure_is_not_treated_as_deletion(
+        self, watcher, events, mock_kanban
+    ):
+        """A failed confirmation lookup must never purge anything — a
+        transient Kanboard error would otherwise wipe live tickets."""
+        mock_kanban.get_all_tasks = AsyncMock(return_value=[_make_task("T-1")])
+        await watcher.poll_once()
+
+        received: List[Any] = []
+
+        async def handler(event: Any) -> None:
+            received.append(event)
+
+        events.subscribe("ticket.deleted", handler)
+        mock_kanban.get_all_tasks = AsyncMock(return_value=[])
+        mock_kanban.get_task_by_id = AsyncMock(
+            side_effect=RuntimeError("kanboard unreachable")
+        )
+
+        await watcher.poll_once()
+
+        assert received == []
+        assert "T-1" in watcher._snapshots

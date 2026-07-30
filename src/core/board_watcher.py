@@ -232,11 +232,55 @@ class BoardWatcher:
             seen_ids.add(tid)
             await self._process_task(task)
 
-        # Detect tickets that disappeared from the board (likely deleted).
+        # Detect tickets that disappeared from the board.
+        #
+        # Disappearing from get_all_tasks() is NOT proof of deletion: Marcus
+        # only reads the projects it is enabled for, so every ticket on a
+        # project a human just switched OFF vanishes from that call too.
+        # Treating those as deleted would purge live state, including claims
+        # on tickets an agent is actively working. Confirm with a direct
+        # lookup before reporting anything gone.
         for tid in list(self._snapshots.keys()):
-            if tid not in seen_ids:
-                logger.debug("Ticket %s no longer visible on board", tid)
-                del self._snapshots[tid]
+            if tid in seen_ids:
+                continue
+            if not await self._confirm_deleted(tid):
+                logger.debug(
+                    "Ticket %s is no longer in view but still exists — "
+                    "out of scope, not deleted; keeping it tracked",
+                    tid,
+                )
+                continue
+            del self._snapshots[tid]
+            logger.info("Ticket %s was deleted from the board", tid)
+            try:
+                await self._events.publish(
+                    event_type="ticket.deleted",
+                    source="board_watcher",
+                    data={"provider": self._provider, "ticket_id": tid},
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Failed to publish ticket.deleted: %s", exc)
+
+    async def _confirm_deleted(self, ticket_id: str) -> bool:
+        """Return ``True`` only when *ticket_id* is really gone.
+
+        A lookup that fails (provider error, network blip) returns
+        ``False``: a transient error must never be mistaken for a deletion,
+        since acting on that wipes a live ticket's state.
+        """
+        getter = getattr(self._kanban, "get_task_by_id", None)
+        if getter is None:
+            return False
+        try:
+            return await getter(ticket_id) is None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not confirm whether ticket %s was deleted (%s) — "
+                "assuming it still exists",
+                ticket_id,
+                exc,
+            )
+            return False
 
     async def _process_task(self, task: Task) -> None:
         """Diff a single task against its stored snapshot and emit events."""

@@ -690,6 +690,41 @@ class TicketLifecycleManager:
             )
         return record
 
+    def purge(self, ticket_id: str, provider: str) -> bool:
+        """Stop tracking a ticket that no longer exists on the board.
+
+        Marcus selects work from these records, not from the board — so a
+        record left behind after a human deletes the ticket in Kanboard is
+        still handed to an agent, which then goes looking for a ticket that
+        isn't there. Removing the record also drops any claim on it,
+        freeing the agent that held it.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Provider ticket identifier.
+        provider : str
+            Kanban provider name.
+
+        Returns
+        -------
+        bool
+            ``True`` if a record was removed, ``False`` if the ticket was
+            not tracked. Not an error: the same deletion can be observed by
+            both a webhook and the next poll.
+        """
+        key = f"{provider}:{ticket_id}"
+        record = self._records.pop(key, None)
+        if record is None:
+            return False
+        self._save()
+        logger.info(
+            "Ticket %s purged from lifecycle (no longer on the board%s)",
+            key,
+            f"; was held by {record.ai_agent_id}" if record.ai_agent_id else "",
+        )
+        return True
+
     def release_stale_claims(self) -> List[str]:
         """Release every held AI claim; return the released record keys.
 
