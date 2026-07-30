@@ -3359,6 +3359,48 @@ async def main() -> None:
         raise
 
 
+#: How often the SSE stream wakes to check for work or for shutdown. Short
+#: so a Ctrl+C is noticed almost immediately (see _server_is_shutting_down);
+#: the client-visible heartbeat stays at _SSE_PING_INTERVAL.
+_SSE_TICK = 1.0
+#: Comment heartbeat that keeps proxies from dropping an idle SSE stream.
+_SSE_PING_INTERVAL = 25.0
+
+
+def _server_is_shutting_down(server: Any) -> bool:
+    """Return ``True`` once uvicorn has begun shutting down.
+
+    ``/api/events/stream`` holds one long-lived connection per open Kanboard
+    tab. Uvicorn's graceful shutdown stops accepting new connections and then
+    WAITS for the existing ones to close before running the app's lifespan
+    shutdown — and that lifespan shutdown is what stops BoardWatcher and
+    ProjectWatcher. A stream that loops forever therefore pins the whole
+    process open: Ctrl+C prints "Waiting for connections to close" and hangs
+    there while Marcus keeps polling Kanboard, because its shutdown hook is
+    queued behind a connection that will never end.
+
+    uvicorn sets ``should_exit`` in its own signal handler, immediately and
+    before it starts waiting — so it is the one signal available early
+    enough for the stream to let go on its own.
+
+    Parameters
+    ----------
+    server : Any
+        The Marcus server object; carries ``_uvicorn_server`` in HTTP mode.
+
+    Returns
+    -------
+    bool
+        ``True`` when the stream should end. Always ``False`` when no
+        uvicorn server is attached (stdio mode), so non-HTTP runs are
+        unaffected.
+    """
+    uv = getattr(server, "_uvicorn_server", None)
+    if uv is None:
+        return False
+    return bool(getattr(uv, "should_exit", False) or getattr(uv, "force_exit", False))
+
+
 #: Cap on webhook request bodies (/webhooks/kanboard, /webhooks/gitea).
 #: Both routes are exempt from bearer-token auth — they authenticate via
 #: their own token/HMAC signature instead — and that check only runs
@@ -5313,15 +5355,28 @@ function save() {{
                     # retry: tells EventSource to reconnect 3s after a drop.
                     yield b"retry: 3000\n\n"
                     yield b": connected\n\n"
+                    idle = 0.0
                     while True:
+                        # Let go the moment uvicorn starts shutting down —
+                        # it waits for this connection before running the
+                        # lifespan shutdown that stops Marcus's watchers.
+                        if _server_is_shutting_down(server):
+                            break
                         try:
-                            await asyncio.wait_for(queue.get(), timeout=25.0)
+                            await asyncio.wait_for(
+                                queue.get(), timeout=_SSE_TICK
+                            )
                             # Drain any burst so N rapid updates = one refresh.
                             while not queue.empty():
                                 queue.get_nowait()
                             yield b"event: refresh\ndata: 1\n\n"
+                            idle = 0.0
                         except asyncio.TimeoutError:
-                            yield b": ping\n\n"  # heartbeat keeps proxies open
+                            idle += _SSE_TICK
+                            if idle >= _SSE_PING_INTERVAL:
+                                # heartbeat keeps proxies open
+                                yield b": ping\n\n"
+                                idle = 0.0
                 finally:
                     for _n in names:
                         try:
@@ -5500,6 +5555,10 @@ function save() {{
         )
 
         server_instance = uvicorn.Server(uvicorn_config)
+        # Published so long-lived responses can notice shutdown — see
+        # _server_is_shutting_down(); without it the SSE stream keeps the
+        # process alive through Ctrl+C.
+        server._uvicorn_server = server_instance
 
         # Run the server (this will handle shutdown gracefully).
         #
