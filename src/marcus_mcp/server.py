@@ -4078,16 +4078,6 @@ async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
     )
     register_workflow(workflow)
 
-    # Scope the board reads to the projects a human has enabled. Without
-    # this the provider only ever polls the single kanboard_project_id
-    # baked into config at setup time, so enabling ANY other project from
-    # its board header has no effect: Marcus never reads that board, never
-    # sees its ready+assigned tickets, and never hands them to an agent —
-    # while the toggle sits reassuringly ON. Guarded by hasattr so
-    # non-Kanboard providers are untouched.
-    _scope_setter = getattr(server.kanban_client, "set_project_scope", None)
-    if _scope_setter is not None:
-        _scope_setter(_get_project_access_mgr(server).enabled_project_ids)
     await workflow.start()
 
     server._project_sync = project_sync  # type: ignore[attr-defined]

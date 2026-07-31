@@ -378,3 +378,52 @@ class TestEnvToken:
 
         result = await rcv.handle_request(body, token="envtoken")
         assert result is True
+
+
+class TestTaskRemove:
+    """task.remove → ticket.deleted.
+
+    Kanboard itself never fires this: TaskModel::remove() deletes the row
+    without dispatching anything, and there is no EVENT_REMOVE constant
+    (checked against v1.2.53). The MarcusDevEnv plugin supplies it by
+    overriding the model and POSTing this event name, so a deletion reaches
+    Marcus instantly instead of waiting to be noticed on the next board
+    read.
+    """
+
+    @pytest.mark.asyncio
+    async def test_publishes_ticket_deleted(self, receiver, mock_events):
+        """A task.remove payload becomes a ticket.deleted event."""
+        body = _body("task.remove", {"task": {"id": 21, "project_id": 8}})
+
+        assert await receiver.handle_request(body) is True
+
+        published = [c for c in mock_events.publish.call_args_list]
+        assert any(
+            (c.args and c.args[0] == "ticket.deleted")
+            or c.kwargs.get("event_type") == "ticket.deleted"
+            for c in published
+        )
+        data = published[-1].kwargs["data"]
+        assert data["ticket_id"] == "21"
+
+    @pytest.mark.asyncio
+    async def test_accepts_a_bare_task_id(self, receiver, mock_events):
+        """The row is already gone when the plugin fires, so the payload may
+        carry only the id."""
+        body = _body("task.remove", {"task_id": 21})
+
+        await receiver.handle_request(body)
+
+        data = mock_events.publish.call_args_list[-1].kwargs["data"]
+        assert data["ticket_id"] == "21"
+
+    @pytest.mark.asyncio
+    async def test_unknown_task_id_publishes_nothing(self, receiver, mock_events):
+        """A payload with no resolvable id is ignored rather than emitting a
+        deletion for the empty string."""
+        body = _body("task.remove", {})
+
+        await receiver.handle_request(body)
+
+        mock_events.publish.assert_not_called()

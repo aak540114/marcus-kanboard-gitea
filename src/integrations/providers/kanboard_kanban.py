@@ -284,10 +284,10 @@ class KanboardKanban(KanbanInterface):
         """
         self._project_scope = provider
 
-    def _scoped_project_ids(self) -> List[int]:
-        """Return the project ids to read, or the configured one."""
+    def _scoped_project_ids(self) -> Optional[List[int]]:
+        """Return the explicit read scope, or ``None`` to read everything."""
         if self._project_scope is None:
-            return [self._project_id]
+            return None
         try:
             return [int(pid) for pid in self._project_scope()]
         except Exception as exc:  # noqa: BLE001
@@ -300,6 +300,33 @@ class KanboardKanban(KanbanInterface):
                 self._project_id,
             )
             return [self._project_id]
+
+    async def _all_project_ids(self) -> List[int]:
+        """Every project id on this Kanboard, or just the configured one.
+
+        Falls back to ``[self._project_id]`` when the listing fails, so a
+        transient error narrows what Marcus sees rather than blinding it.
+        """
+        try:
+            projects = await self._rpc("getAllProjects")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not list Kanboard projects (%s); reading only the "
+                "configured project %d",
+                exc,
+                self._project_id,
+            )
+            return [self._project_id]
+        ids: List[int] = []
+        for proj in projects or []:
+            raw_id = (proj or {}).get("id")
+            if raw_id is None:
+                continue
+            try:
+                ids.append(int(raw_id))
+            except (TypeError, ValueError):
+                continue
+        return ids or [self._project_id]
 
     async def get_all_tasks(self) -> List[Task]:
         """
@@ -326,12 +353,15 @@ class KanboardKanban(KanbanInterface):
             raise RuntimeError("Call connect() before get_all_tasks()")
 
         project_ids = self._scoped_project_ids()
+        if project_ids is None:
+            # Unscoped: read EVERY project. Marcus needs visibility into
+            # boards it is not allowed to act on — so it can report "this
+            # project has ready tickets but isn't enabled", and so a ticket
+            # deleted on any board is noticed. Permission to TOUCH a ticket
+            # is enforced separately, per write.
+            project_ids = await self._all_project_ids()
         if not project_ids:
-            logger.debug(
-                "No Kanboard project is enabled for Marcus — reading no "
-                "board. Switch 'Marcus: OFF' to ON in a project's board "
-                "header to scope Marcus to it."
-            )
+            logger.debug("No Kanboard project to read.")
             return []
 
         tasks: List[Task] = []

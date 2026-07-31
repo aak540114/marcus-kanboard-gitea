@@ -404,7 +404,9 @@ class TestGetAllTasks:
         kanban._client = AsyncMock()
         active_resp = _rpc_response([_make_raw_task(task_id=1)])
         closed_resp = _rpc_response([])
-        kanban._client.post = AsyncMock(side_effect=[active_resp, closed_resp])
+        kanban._client.post = AsyncMock(
+            side_effect=[_rpc_response([{"id": 1}]), active_resp, closed_resp]
+        )
         kanban._column_status_map = {1: TaskStatus.TODO}
 
         tasks = await kanban.get_all_tasks()
@@ -420,7 +422,9 @@ class TestGetAllTasks:
         closed_resp = _rpc_response(
             [_make_raw_task(task_id=2, is_active=0, column_name="Done")]
         )
-        kanban._client.post = AsyncMock(side_effect=[active_resp, closed_resp])
+        kanban._client.post = AsyncMock(
+            side_effect=[_rpc_response([{"id": 1}]), active_resp, closed_resp]
+        )
         kanban._column_status_map = {1: TaskStatus.TODO}
 
         tasks = await kanban.get_all_tasks()
@@ -431,7 +435,11 @@ class TestGetAllTasks:
         """Empty project returns an empty list."""
         kanban._client = AsyncMock()
         kanban._client.post = AsyncMock(
-            side_effect=[_rpc_response([]), _rpc_response([])]
+            side_effect=[
+                _rpc_response([{"id": 1}]),
+                _rpc_response([]),
+                _rpc_response([]),
+            ]
         )
         tasks = await kanban.get_all_tasks()
         assert tasks == []
@@ -469,12 +477,21 @@ class TestGetAllTasks:
         assert set(polled) == {7, 8}
 
     @pytest.mark.asyncio
-    async def test_without_a_scope_falls_back_to_configured_project(self, kanban):
-        """Unscoped (no provider wired) keeps the original single-project
-        behaviour, so non-Kanboard-multi-project deployments are unaffected."""
+    async def test_without_a_scope_reads_every_project(self, kanban):
+        """Unscoped, Marcus reads EVERY board.
+
+        It needs visibility into projects it is not allowed to act on — to
+        report "this project has ready tickets but isn't enabled", and so a
+        ticket deleted on any board is noticed. Permission to TOUCH a
+        ticket is a separate, per-write check.
+        """
         kanban._client = AsyncMock()
         kanban._client.post = AsyncMock(
-            side_effect=[_rpc_response([]), _rpc_response([])]
+            side_effect=[
+                _rpc_response([{"id": 7}, {"id": 8}]),
+                _rpc_response([]), _rpc_response([]),
+                _rpc_response([]), _rpc_response([]),
+            ]
         )
 
         await kanban.get_all_tasks()
@@ -484,6 +501,30 @@ class TestGetAllTasks:
             for c in kanban._client.post.call_args_list
             if c.kwargs["json"]["method"] == "getAllTasks"
         ]
+        assert set(polled) == {7, 8}
+
+    @pytest.mark.asyncio
+    async def test_project_listing_failure_narrows_rather_than_blinds(
+        self, kanban
+    ):
+        """A failed getAllProjects falls back to the configured project
+        rather than leaving Marcus reading nothing at all."""
+        kanban._client = AsyncMock()
+        polled = []
+
+        async def fake_rpc(method, **params):
+            if method == "getAllProjects":
+                raise RuntimeError("listing unavailable")
+            if method == "getAllTasks":
+                polled.append(params["project_id"])
+                return []
+            return None
+
+        kanban._rpc = fake_rpc  # type: ignore[method-assign]
+
+        tasks = await kanban.get_all_tasks()
+
+        assert tasks == []
         assert set(polled) == {kanban._project_id}
 
     @pytest.mark.asyncio

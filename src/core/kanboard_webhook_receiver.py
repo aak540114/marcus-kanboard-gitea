@@ -16,6 +16,7 @@ Kanboard event          → Marcus event
 ``task.close``          → ``ticket.closed``
 ``task.open``           → ``ticket.reopened``
 ``task.create``         → ``ticket.new``
+``task.remove``         → ``ticket.deleted`` (MarcusDevEnv plugin only)
 ``comment.create``      → ``ticket.comment_added``
 ``comment.update``      → ``ticket.comment_added``
 
@@ -100,6 +101,12 @@ _EV_ASSIGN = "task.assignee_change"
 _EV_CLOSE = "task.close"
 _EV_OPEN = "task.open"
 _EV_CREATE = "task.create"
+#: Kanboard fires NO event on task removal — TaskModel::remove()
+#: deletes the row without dispatching, and there is no EVENT_REMOVE
+#: constant at all (v1.2.53). The MarcusDevEnv plugin supplies this
+#: name by overriding the model, so a deletion reaches Marcus at once
+#: instead of waiting to be noticed on the next board read.
+_EV_REMOVE = "task.remove"
 _EV_COMMENT_CREATE = "comment.create"
 _EV_COMMENT_UPDATE = "comment.update"
 
@@ -204,7 +211,20 @@ class KanboardWebhookReceiver:
         task = event_data.get("task", {})
         ticket_id = str(task.get("id", event_data.get("task_id", "")))
 
-        if event_name == _EV_MOVE:
+        if event_name == _EV_REMOVE:
+            if not ticket_id:
+                logger.warning("task.remove with no resolvable task id; ignoring")
+                return
+            await self._events.publish(
+                "ticket.deleted",
+                source="kanboard_webhook",
+                data={
+                    "ticket_id": ticket_id,
+                    "provider": self._provider,
+                },
+            )
+
+        elif event_name == _EV_MOVE:
             await self._handle_move_column(ticket_id, event_data, task)
 
         elif event_name == _EV_UPDATE:

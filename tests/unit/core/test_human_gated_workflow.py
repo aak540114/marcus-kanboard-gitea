@@ -921,12 +921,18 @@ class TestClaimReleaseGaps:
         assert rec.ai_agent_id is not None
 
     @pytest.mark.asyncio
-    async def test_start_releases_ghost_claims(self, workflow, lifecycle):
+    async def test_start_releases_ghost_claims(
+        self, workflow, lifecycle, mock_kanban
+    ):
         """workflow.start() releases claims persisted by a dead process."""
         lifecycle.get_or_create("53", "kanboard")
         lifecycle.transition("53", "kanboard", TicketState.READY)
         lifecycle.transition("53", "kanboard", TicketState.IN_PROGRESS)
         lifecycle.claim_ticket("53", "kanboard", "marcus-deadbeef")
+        # The ticket still exists on the board — otherwise start()'s
+        # reconcile correctly purges it as deleted (see
+        # TestStartupReconcile) and there is no claim left to release.
+        mock_kanban.get_task_by_id = AsyncMock(return_value=MagicMock())
 
         workflow._watcher.start = AsyncMock()
         await workflow.start()
@@ -1152,6 +1158,62 @@ class TestFirstSightRecovery:
         rec = lifecycle.get("33", "kanboard")
         assert rec is not None
         assert rec.ai_agent_id is None
+
+
+class TestStartupReconcile:
+    """On startup Marcus re-reads every board and drops what is gone.
+
+    BoardWatcher's disappeared-ticket check compares against snapshots it
+    built during THIS process — and those start empty, so a ticket deleted
+    while Marcus was down is never noticed by it. Its lifecycle record
+    would otherwise outlive the ticket forever, and keep being handed to
+    agents.
+    """
+
+    @pytest.mark.asyncio
+    async def test_purges_tickets_deleted_while_marcus_was_down(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """A tracked ticket that no longer exists is dropped at startup."""
+        lifecycle.get_or_create("21", "kanboard")
+        lifecycle.transition("21", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("21", "kanboard", "alice")
+        mock_kanban.get_task_by_id = AsyncMock(return_value=None)
+
+        await workflow._reconcile_deleted_tickets()
+
+        assert lifecycle.get("21", "kanboard") is None
+
+    @pytest.mark.asyncio
+    async def test_keeps_tickets_that_still_exist(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """A ticket still on the board — including one on a project that is
+        merely DISABLED — is kept. Disabling a project must never delete
+        its tickets from Marcus's view."""
+        lifecycle.get_or_create("22", "kanboard")
+        lifecycle.set_assignee("22", "kanboard", "alice")
+        task = MagicMock()
+        task.source_context = {"kanboard_task": {"project_id": 9}}
+        mock_kanban.get_task_by_id = AsyncMock(return_value=task)
+
+        await workflow._reconcile_deleted_tickets()
+
+        assert lifecycle.get("22", "kanboard") is not None
+
+    @pytest.mark.asyncio
+    async def test_a_lookup_failure_never_purges(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Kanboard being unreachable at boot must not wipe every record."""
+        lifecycle.get_or_create("23", "kanboard")
+        mock_kanban.get_task_by_id = AsyncMock(
+            side_effect=RuntimeError("kanboard unreachable")
+        )
+
+        await workflow._reconcile_deleted_tickets()
+
+        assert lifecycle.get("23", "kanboard") is not None
 
 
 class TestTicketDeleted:
@@ -4042,6 +4104,65 @@ class TestProjectAccessGate:
         msg = result["message"]
         assert "62" in msg
         assert "not enabled" in msg.lower()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "handler,payload",
+        [
+            ("_on_comment_added", {"comment_body": "please change it"}),
+            ("_on_ticket_closed", {}),
+            ("_on_ticket_reopened", {}),
+            ("_on_ac_changed", {"new_ac_text": "- [ ] x"}),
+        ],
+    )
+    async def test_disabled_project_tickets_are_seen_but_never_touched(
+        self, workflow, lifecycle, mock_kanban, mock_project_access,
+        handler, payload,
+    ):
+        """Marcus reads every board, so events arrive for projects it is
+        NOT allowed to act on — and these handlers all write to the board
+        (comments, column moves, merges to main). Reading a disabled
+        project must never turn into touching it.
+        """
+        self._wire_task_project(mock_kanban, 9)
+        mock_project_access.is_enabled = MagicMock(return_value=False)
+        lifecycle.get_or_create("80", "kanboard")
+        lifecycle.transition("80", "kanboard", TicketState.READY)
+        lifecycle.transition("80", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.set_assignee("80", "kanboard", "alice")
+        mock_kanban.add_comment.reset_mock()
+        mock_kanban.move_task_to_column.reset_mock()
+
+        event = _make_event(
+            {"ticket_id": "80", "provider": "kanboard", **payload}
+        )
+        await getattr(workflow, handler)(event)
+
+        mock_kanban.add_comment.assert_not_called()
+        mock_kanban.move_task_to_column.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_enabled_project_comment_still_handled(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """Sanity check: the gate must not deafen an ENABLED project."""
+        self._wire_task_project(mock_kanban, 9)
+        mock_project_access.is_enabled = MagicMock(return_value=True)
+        lifecycle.get_or_create("81", "kanboard")
+        lifecycle.transition("81", "kanboard", TicketState.READY)
+        lifecycle.transition("81", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("81", "kanboard", TicketState.WAITING_FOR_HUMAN)
+        lifecycle.set_assignee("81", "kanboard", "alice")
+        mock_kanban.add_comment.reset_mock()
+
+        await workflow._on_comment_added(
+            _make_event({
+                "ticket_id": "81", "provider": "kanboard",
+                "comment_body": "please change it", "comment_author": "alice",
+            })
+        )
+
+        mock_kanban.add_comment.assert_called()
 
     @pytest.mark.asyncio
     async def test_disabled_project_does_not_generate_ac_on_new_ticket(

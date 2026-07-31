@@ -282,6 +282,15 @@ class HumanGatedWorkflow:
         # "in progress" on the board forever (first-sight recovery
         # deliberately skips claimed records). Release them all before the
         # watcher's first poll so recovery can re-claim and resume work.
+        # Re-sync with the board before anything else looks at the
+        # lifecycle: tickets deleted while Marcus was down are invisible to
+        # BoardWatcher (its snapshots start empty), so this is the only
+        # thing that notices them.
+        try:
+            await self._reconcile_deleted_tickets()
+        except Exception as exc:  # noqa: BLE001 - never block startup
+            logger.warning("Startup board reconcile failed: %s", exc)
+
         stale = self._lifecycle.release_stale_claims()
         if stale:
             logger.info(
@@ -464,6 +473,83 @@ class HumanGatedWorkflow:
         # Unassigning freed a slot; fill it with any waiting assigned work
         # so parallel capacity is not left idle until an unrelated event.
         await self._pickup_next_ticket()
+
+    async def _reconcile_deleted_tickets(self) -> None:
+        """Drop lifecycle records whose tickets no longer exist.
+
+        BoardWatcher's disappeared-ticket check compares the board against
+        snapshots built during THIS process, and those start empty — so a
+        ticket deleted while Marcus was down is invisible to it. That
+        record would otherwise outlive its ticket forever and keep being
+        handed to agents.
+
+        Each candidate is confirmed with a direct lookup: a ticket that
+        still exists is kept, including one whose project is merely
+        DISABLED (Marcus can see those, it just may not act on them). A
+        lookup that FAILS is read as "still exists", so Kanboard being
+        unreachable at boot can never wipe Marcus's state.
+        """
+        records = [
+            r for r in self._lifecycle.all_records() if r.provider == self._provider
+        ]
+        if not records:
+            return
+        purged = 0
+        for rec in records:
+            try:
+                task = await self._kanban.get_task_by_id(rec.ticket_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "Could not check whether ticket %s still exists (%s) — "
+                    "assuming it does",
+                    rec.ticket_id,
+                    exc,
+                )
+                continue
+            if task is not None:
+                continue
+            try:
+                await self._dev_env.stop(rec.ticket_id, self._provider)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "Could not stop dev env for deleted ticket %s: %s",
+                    rec.ticket_id,
+                    exc,
+                )
+            if self._lifecycle.purge(rec.ticket_id, self._provider):
+                purged += 1
+        if purged:
+            logger.info(
+                "Startup reconcile: dropped %d ticket(s) that no longer "
+                "exist on the board",
+                purged,
+            )
+
+    async def _may_touch(self, ticket_id: str) -> bool:
+        """Whether Marcus is allowed to ACT on this ticket.
+
+        Marcus reads every Kanboard project so it has visibility into
+        boards it is not allowed to work — to report "this project has
+        ready tickets but isn't enabled", and so a deletion on any board is
+        noticed. That means events arrive for disabled projects too, and
+        the handlers behind them write to the board: comments, column
+        moves, merges to main. Seeing a project must never turn into
+        touching it.
+
+        A ticket whose project cannot be resolved (non-Kanboard provider,
+        RPC failure) is allowed through — the gate only applies where it
+        can actually be evaluated.
+        """
+        pid = await self._resolve_kanboard_project_id(ticket_id)
+        if pid is None or self._project_access.is_enabled(pid):
+            return True
+        logger.debug(
+            "Ignoring event for ticket %s: Kanboard project %d is not "
+            "enabled for Marcus (visible, but not actionable)",
+            ticket_id,
+            pid,
+        )
+        return False
 
     async def _on_ticket_deleted(self, event: Any) -> None:
         """Stop tracking a ticket that was deleted from the board.
@@ -672,6 +758,8 @@ class HumanGatedWorkflow:
         """Handle a ticket marked done — merge branch to main."""
         data = event.data
         ticket_id = data["ticket_id"]
+        if not await self._may_touch(ticket_id):
+            return
         record = self._lifecycle.get(ticket_id, self._provider)
         if record is None:
             return
@@ -838,6 +926,8 @@ class HumanGatedWorkflow:
         """Handle a ticket being reopened — rebase branch on main and resume."""
         data = event.data
         ticket_id = data["ticket_id"]
+        if not await self._may_touch(ticket_id):
+            return
         record = self._lifecycle.get(ticket_id, self._provider)
         if record is None:
             return
@@ -909,6 +999,8 @@ class HumanGatedWorkflow:
         """Handle a new human comment on a ticket."""
         data = event.data
         ticket_id = data["ticket_id"]
+        if not await self._may_touch(ticket_id):
+            return
         body = data.get("comment_body", "")
         author = data.get("comment_author", "")
 
@@ -1004,6 +1096,8 @@ class HumanGatedWorkflow:
         """Handle human edits to the acceptance criteria."""
         data = event.data
         ticket_id = data["ticket_id"]
+        if not await self._may_touch(ticket_id):
+            return
         new_ac = data.get("new_ac_text", "")
         new_hash = data.get("new_hash", "")
 

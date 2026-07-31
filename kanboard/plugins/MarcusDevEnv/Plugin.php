@@ -80,6 +80,24 @@ class Plugin extends Base
             'template:project:header:after',
             'MarcusDevEnv:board/header'
         );
+
+        // Tell Marcus when a task is DELETED.
+        //
+        // Kanboard has no deletion event to listen for: TaskModel::remove()
+        // drops the row without dispatching anything, and there is no
+        // EVENT_REMOVE constant at all (checked against v1.2.53). So
+        // $this->on(...) cannot observe a deletion, and Kanboard's own
+        // outbound webhook never carries one. Replacing the model is the
+        // only place a deletion is observable.
+        //
+        // Safe to reassign here: Pimple builds services lazily, and plugins
+        // load after the service providers but before any request touches
+        // taskModel, so nothing has been constructed from the original
+        // definition yet.
+        $container = $this->container;
+        $container['taskModel'] = function ($c) {
+            return new \Kanboard\Plugin\MarcusDevEnv\Model\NotifyingTaskModel($c);
+        };
     }
 
     /**
