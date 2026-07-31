@@ -1159,6 +1159,49 @@ class TestFirstSightRecovery:
         assert rec is not None
         assert rec.ai_agent_id is None
 
+    @pytest.mark.asyncio
+    async def test_mirrors_state_when_start_is_refused_for_a_reason_unrelated_to_the_ticket(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """If ``_start_ai_work`` refuses (e.g. every agent slot busy), the
+        lifecycle record must still mirror the board's Ready/In-Progress
+        state — not stay stuck at TODO.
+
+        ``ticket.new`` fires only ONCE per ticket for the life of a
+        BoardWatcher snapshot — a fresh process only ever sees a given
+        ticket as "new" the very first time. A record left at TODO here is
+        therefore invisible forever: ``_next_worker_ticket`` only considers
+        READY/IN_PROGRESS records, and no later event re-examines a column
+        that never moves again. This mirrors the same fix already applied
+        in ``_on_status_changed`` for the equivalent "started refused" gap.
+        """
+        # Occupy the workflow's only slot (default max_parallel_agents=1).
+        lifecycle.get_or_create("99", "kanboard")
+        lifecycle.transition("99", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("99", "kanboard", "carol")
+        await workflow._start_ai_work("99", lifecycle.get("99", "kanboard"))
+        assert lifecycle.get("99", "kanboard").ai_agent_id is not None
+
+        event = _make_event(
+            {
+                "ticket_id": "40",
+                "provider": "kanboard",
+                "task": {
+                    "id": "40",
+                    "title": "Stuck on restart",
+                    "description": "",
+                    "status": "ready",
+                    "assignee": "alice",
+                },
+            }
+        )
+        await workflow._on_ticket_new(event)
+
+        rec = lifecycle.get("40", "kanboard")
+        assert rec is not None
+        assert rec.ai_agent_id is None  # correctly refused — no free slot
+        assert rec.state == TicketState.READY  # but NOT stuck at TODO
+
 
 class TestStartupReconcile:
     """On startup Marcus re-reads every board and drops what is gone.

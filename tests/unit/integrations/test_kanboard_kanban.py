@@ -408,6 +408,7 @@ class TestGetAllTasks:
             side_effect=[_rpc_response([{"id": 1}]), active_resp, closed_resp]
         )
         kanban._column_status_map = {1: TaskStatus.TODO}
+        kanban._columns_loaded = {1}
 
         tasks = await kanban.get_all_tasks()
         assert isinstance(tasks, list)
@@ -426,6 +427,7 @@ class TestGetAllTasks:
             side_effect=[_rpc_response([{"id": 1}]), active_resp, closed_resp]
         )
         kanban._column_status_map = {1: TaskStatus.TODO}
+        kanban._columns_loaded = {1}
 
         tasks = await kanban.get_all_tasks()
         assert len(tasks) == 2
@@ -441,6 +443,7 @@ class TestGetAllTasks:
                 _rpc_response([]),
             ]
         )
+        kanban._columns_loaded = {1}
         tasks = await kanban.get_all_tasks()
         assert tasks == []
 
@@ -457,6 +460,7 @@ class TestGetAllTasks:
         kanban._client = AsyncMock()
         kanban.set_project_scope(lambda: [7, 8])
         kanban._column_status_map = {1: TaskStatus.TODO}
+        kanban._columns_loaded = {7, 8}
         kanban._client.post = AsyncMock(
             side_effect=[
                 _rpc_response([_make_raw_task(task_id=21, project_id=7)]),
@@ -486,6 +490,7 @@ class TestGetAllTasks:
         ticket is a separate, per-write check.
         """
         kanban._client = AsyncMock()
+        kanban._columns_loaded = {7, 8}
         kanban._client.post = AsyncMock(
             side_effect=[
                 _rpc_response([{"id": 7}, {"id": 8}]),
@@ -502,6 +507,56 @@ class TestGetAllTasks:
             if c.kwargs["json"]["method"] == "getAllTasks"
         ]
         assert set(polled) == {7, 8}
+
+    @pytest.mark.asyncio
+    async def test_warms_columns_for_projects_beyond_the_bootstrap_one(
+        self, kanban
+    ):
+        """Every project's columns must be cached before its tasks are
+        converted, not just the single project baked into
+        ``kanboard_project_id``.
+
+        Real Kanboard's ``getAllTasks``/``getTask`` responses never include
+        ``column_name`` (only ``getDetails()`` joins that in), so
+        ``_to_task()`` always falls back to ``_column_status_map`` —  which
+        ``_refresh_columns()`` only ever populated for ``kanban._project_id``
+        at connect time. A ticket sitting in a "Ready" column on any OTHER
+        project silently defaulted to TODO, so Marcus's first-sight recovery
+        gate (which requires ``board_status`` to be READY or IN_PROGRESS)
+        never fired and the ticket was never handed to a polling agent.
+        """
+        kanban._client = AsyncMock()
+
+        columns_by_project = {
+            1: [{"id": 10, "title": "Backlog"}],
+            2: [{"id": 99, "title": "Ready"}],
+        }
+
+        async def fake_rpc(method, **params):
+            if method == "getProjectById":
+                return {"id": 1, "name": "Project One"}
+            if method == "getAllProjects":
+                return [{"id": 1}, {"id": 2}]
+            if method == "getColumns":
+                return columns_by_project[params["project_id"]]
+            if method == "getAllTasks":
+                if params["project_id"] == 2 and params["status_id"] == 1:
+                    return [
+                        _make_raw_task(
+                            task_id=5, column_id=99, column_name="", project_id=2
+                        )
+                    ]
+                return []
+            return None
+
+        kanban._rpc = AsyncMock(side_effect=fake_rpc)
+
+        assert await kanban.connect() is True
+
+        tasks = await kanban.get_all_tasks()
+
+        project_2_task = next(t for t in tasks if t.id == "5")
+        assert project_2_task.status == TaskStatus.READY
 
     @pytest.mark.asyncio
     async def test_project_listing_failure_narrows_rather_than_blinds(
@@ -550,6 +605,7 @@ class TestGetAllTasks:
             raise RuntimeError("settings unreadable")
 
         kanban.set_project_scope(boom)
+        kanban._columns_loaded = {kanban._project_id}
         kanban._client.post = AsyncMock(
             side_effect=[_rpc_response([]), _rpc_response([])]
         )
@@ -562,6 +618,79 @@ class TestGetAllTasks:
             if c.kwargs["json"]["method"] == "getAllTasks"
         ]
         assert set(polled) == {kanban._project_id}
+
+
+# ---------------------------------------------------------------------------
+# get_task_by_id tests
+# ---------------------------------------------------------------------------
+
+
+class TestGetTaskById:
+    """Test get_task_by_id() against mocked RPC responses."""
+
+    @pytest.mark.asyncio
+    async def test_raises_if_not_connected(self, kanban):
+        """get_task_by_id() raises RuntimeError when client is None."""
+        with pytest.raises(RuntimeError, match="connect()"):
+            await kanban.get_task_by_id("5")
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_task_missing(self, kanban):
+        """A nonexistent task id returns None rather than raising."""
+        kanban._client = AsyncMock()
+        kanban._rpc = AsyncMock(return_value=None)
+
+        assert await kanban.get_task_by_id("999") is None
+
+    @pytest.mark.asyncio
+    async def test_warms_columns_for_a_task_from_another_project(self, kanban):
+        """A single-task lookup must warm that task's project's columns
+        too, not just self._project_id's — the same gap that made
+        get_all_tasks() silently default every non-bootstrap-project task
+        to TODO (see test_warms_columns_for_projects_beyond_the_bootstrap_one)
+        applies here whenever a caller looks up one ticket by id directly.
+        """
+        kanban._client = AsyncMock()
+
+        async def fake_rpc(method, **params):
+            if method == "getTask":
+                return _make_raw_task(
+                    task_id=5, column_id=99, column_name="", project_id=2
+                )
+            if method == "getColumns":
+                assert params["project_id"] == 2
+                return [{"id": 99, "title": "Ready"}]
+            return None
+
+        kanban._rpc = AsyncMock(side_effect=fake_rpc)
+
+        task = await kanban.get_task_by_id("5")
+
+        assert task is not None
+        assert task.status == TaskStatus.READY
+
+    @pytest.mark.asyncio
+    async def test_does_not_refetch_already_loaded_columns(self, kanban):
+        """A project whose columns are already cached isn't refetched."""
+        kanban._client = AsyncMock()
+        kanban._columns_loaded = {2}
+        kanban._column_status_map = {99: TaskStatus.WAITING_FOR_HUMAN}
+
+        async def fake_rpc(method, **params):
+            if method == "getTask":
+                return _make_raw_task(
+                    task_id=5, column_id=99, column_name="", project_id=2
+                )
+            if method == "getColumns":
+                raise AssertionError("columns already loaded; should not refetch")
+            return None
+
+        kanban._rpc = AsyncMock(side_effect=fake_rpc)
+
+        task = await kanban.get_task_by_id("5")
+
+        assert task is not None
+        assert task.status == TaskStatus.WAITING_FOR_HUMAN
 
 
 # ---------------------------------------------------------------------------

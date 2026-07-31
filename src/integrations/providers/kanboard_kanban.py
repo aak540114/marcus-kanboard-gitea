@@ -25,7 +25,7 @@ import mimetypes
 import re
 import secrets
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Union
 
 import httpx
 
@@ -176,6 +176,9 @@ class KanboardKanban(KanbanInterface):
         # ids are globally unique across the whole install, so one map is
         # correct for every project once that project's columns are fetched.
         self._column_status_map: Dict[int, TaskStatus] = {}
+        # Project ids whose columns have already been fetched into
+        # self._column_status_map — see _ensure_columns_loaded().
+        self._columns_loaded: Set[int] = set()
         # project name — populated in connect()
         self._project_name: str = ""
 
@@ -228,6 +231,7 @@ class KanboardKanban(KanbanInterface):
 
             self._project_name = project.get("name", "")
             await self._refresh_columns()
+            self._columns_loaded.add(self._project_id)
             logger.info(
                 "Connected to Kanboard project '%s' (id=%d) at %s",
                 self._project_name,
@@ -366,6 +370,7 @@ class KanboardKanban(KanbanInterface):
 
         tasks: List[Task] = []
         for pid in project_ids:
+            await self._ensure_columns_loaded(pid)
             active = await self._rpc("getAllTasks", project_id=pid, status_id=1)
             closed = await self._rpc("getAllTasks", project_id=pid, status_id=0)
             for raw in (active or []) + (closed or []):
@@ -405,7 +410,12 @@ class KanboardKanban(KanbanInterface):
         if self._client is None:
             raise RuntimeError("Call connect() before get_task_by_id()")
         raw = await self._rpc("getTask", task_id=int(task_id))
-        return self._to_task(raw) if raw else None
+        if not raw:
+            return None
+        raw_pid = raw.get("project_id")
+        if raw_pid is not None:
+            await self._ensure_columns_loaded(int(raw_pid))
+        return self._to_task(raw)
 
     # ------------------------------------------------------------------
     # Task mutation
@@ -1570,6 +1580,27 @@ class KanboardKanban(KanbanInterface):
         else:
             self._project_columns[pid] = col_map
         logger.debug("Kanboard columns cached for project %d: %s", pid, col_map)
+
+    async def _ensure_columns_loaded(self, project_id: int) -> None:
+        """
+        Warm ``_column_status_map`` for ``project_id`` on first use.
+
+        ``_to_task()`` falls back to ``_column_status_map`` whenever the raw
+        task has no ``column_name`` — which real Kanboard's ``getAllTasks``/
+        ``getTask`` responses never do. Without this, every project other
+        than the one ``connect()`` bootstraps silently converts every task
+        to ``TaskStatus.TODO``, no matter what column it is actually in.
+
+        Parameters
+        ----------
+        project_id : int
+            Kanboard project whose columns must be cached before any of its
+            tasks are converted.
+        """
+        if project_id in self._columns_loaded:
+            return
+        await self._refresh_columns(project_id)
+        self._columns_loaded.add(project_id)
 
     async def _resolve_user_id(self, assignee_id: str) -> Optional[int]:
         """

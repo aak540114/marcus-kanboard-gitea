@@ -411,6 +411,31 @@ class HumanGatedWorkflow:
                 pass
             record = self._lifecycle.get(ticket_id, self._provider) or record
             if record.ai_agent_id is None:
+                # Mirror the board column BEFORE attempting the start —
+                # same reasoning as the column-move resume in
+                # _on_status_changed. _start_ai_work can refuse for reasons
+                # that are not this ticket's fault (disabled project, an
+                # unmet dependency, every agent slot busy) and a record
+                # left at TODO while the board already shows Ready/In
+                # Progress is invisible to _next_worker_ticket forever:
+                # ticket.new only ever fires once per ticket, so no later
+                # event re-examines a column that never moves again.
+                if record.state == TicketState.TODO:
+                    try:
+                        self._lifecycle.human_transition(
+                            ticket_id,
+                            self._provider,
+                            TicketState.READY,
+                            reason=(
+                                "Ticket first seen already assigned and in "
+                                "a workable column (restart recovery)"
+                            ),
+                        )
+                    except (InvalidTransitionError, KeyError):
+                        pass
+                    record = (
+                        self._lifecycle.get(ticket_id, self._provider) or record
+                    )
                 logger.info(
                     "Ticket %s first seen already assigned (%s) and %s — "
                     "starting AI work (restart recovery)",
