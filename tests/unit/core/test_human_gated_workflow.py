@@ -3030,6 +3030,86 @@ class TestDecomposition:
         return await workflow.decompose_ticket("100")
 
     @pytest.mark.asyncio
+    async def test_refuses_to_decompose_a_disabled_project_ticket(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """decompose_ticket must not call the LLM or write to the board at
+        all for a ticket whose project is disabled.
+
+        Without its own gate, decompose_ticket's multi-second LLM call
+        (seconds, not microseconds) creates a window where a human can
+        disable the project mid-call — after which decompose still creates
+        child tickets, assigns them, and parks the parent as BLOCKED, all
+        on a project Marcus is not supposed to touch. Relying on the
+        caller (orchestrate_work) to have checked the gate before calling
+        in is not enough, since the call itself is what takes the time.
+        """
+        self._big_ticket(lifecycle)
+        mock_project_access.is_enabled = MagicMock(return_value=False)
+        llm_called = {"yes": False}
+
+        async def fake_llm(prompt):
+            llm_called["yes"] = True
+            return '{"subtasks": []}'
+
+        workflow._llm_generate = fake_llm
+        parent = MagicMock(description="do a lot")
+        parent.name = "Big"
+        parent.source_context = {"kanboard_task": {"project_id": 3}}
+        mock_kanban.get_task_by_id = AsyncMock(return_value=parent)
+        mock_kanban.create_task = AsyncMock()
+
+        children = await workflow.decompose_ticket("100")
+
+        assert children == []
+        assert llm_called["yes"] is False
+        mock_kanban.create_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_refuses_to_write_children_disabled_during_the_llm_call(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """Even when the LLM DOES return subtasks, nothing gets written if
+        the project was disabled while that call was in flight.
+
+        The pre-call gate only stops a call that was already pointless; it
+        cannot see a disable that happens during the call itself. Without a
+        second check right after the LLM returns, decompose_ticket would
+        still create child tickets, assign them, link them, and park the
+        parent as BLOCKED — all writes to a project Marcus is not supposed
+        to touch. That the resulting children would be re-filtered before
+        ever reaching an agent (orchestrate_work recurses through
+        _next_worker_ticket) does not make the writes themselves OK.
+        """
+        self._big_ticket(lifecycle)
+        calls = {"n": 0}
+
+        def is_enabled(pid):
+            calls["n"] += 1
+            return calls["n"] == 1  # enabled for the pre-call check only
+
+        mock_project_access.is_enabled = MagicMock(side_effect=is_enabled)
+
+        async def fake_llm(prompt):
+            return (
+                '{"subtasks": [{"title": "Backend", "description": "api", '
+                '"acceptance_criteria": "- [ ] api"}, {"title": "Frontend", '
+                '"description": "ui", "acceptance_criteria": "- [ ] ui"}]}'
+            )
+
+        workflow._llm_generate = fake_llm
+        parent = MagicMock(description="do a lot")
+        parent.name = "Big"
+        parent.source_context = {"kanboard_task": {"project_id": 3}}
+        mock_kanban.get_task_by_id = AsyncMock(return_value=parent)
+        mock_kanban.create_task = AsyncMock()
+
+        children = await workflow.decompose_ticket("100")
+
+        assert children == []
+        mock_kanban.create_task.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_children_are_assigned_on_the_board_not_just_internally(
         self, workflow, lifecycle, mock_kanban
     ):
@@ -4218,3 +4298,113 @@ class TestProjectAccessGate:
         await workflow._on_ticket_new(event)
 
         workflow._generate_and_post_ac.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_orchestrate_never_hands_out_a_disabled_project_ticket(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """Belt-and-suspenders: orchestrate_work itself must refuse to hand
+        out a disabled-project ticket, no matter how ``next_id`` was
+        produced — not just rely on ``_next_worker_ticket``'s own filter.
+
+        The concrete gap this closes: ``_next_worker_ticket`` checks
+        is_enabled per candidate and returns a ticket only once that check
+        passes, but orchestrate_work does not act on it immediately.
+        ``decompose_ticket`` runs first (an LLM call — seconds, not
+        microseconds) and, if the ticket turns out already IN_PROGRESS
+        under an internal 'marcus-' slot claim, the hand-out used to skip
+        straight to ``claim_ticket`` — bypassing ``_start_ai_work``'s own
+        re-check entirely. A human has a real window to disable the
+        project in between.
+        """
+        self._wire_task_project(mock_kanban, 9)
+        mock_project_access.is_enabled = MagicMock(return_value=False)
+        lifecycle.get_or_create("60", "kanboard")
+        lifecycle.transition("60", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("60", "kanboard", "alice")
+        # Simulate _next_worker_ticket having selected this ticket before
+        # the project was disabled — the invariant must hold regardless.
+        workflow._next_worker_ticket = AsyncMock(return_value="60")
+
+        result = await workflow.orchestrate_work(agent_id="worker-Z")
+
+        assert result["status"] != "working"
+        assert result.get("ticket_id") != "60"
+        rec = lifecycle.get("60", "kanboard")
+        assert rec.ai_agent_id is None
+
+    @pytest.mark.asyncio
+    async def test_reclaim_branch_refuses_a_disabled_project_ticket(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """The reclaim branch specifically (ticket already IN_PROGRESS
+        under an internal 'marcus-' slot claim from the human-gated
+        auto-start path) must not hand the claim to a worker once the
+        project has been disabled."""
+        self._wire_task_project(mock_kanban, 9)
+        mock_project_access.is_enabled = MagicMock(return_value=False)
+        lifecycle.get_or_create("61", "kanboard")
+        lifecycle.transition("61", "kanboard", TicketState.READY)
+        lifecycle.transition("61", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.set_assignee("61", "kanboard", "alice")
+        lifecycle.claim_ticket("61", "kanboard", "marcus-slot-0")
+        workflow._next_worker_ticket = AsyncMock(return_value="61")
+
+        result = await workflow.orchestrate_work(agent_id="worker-Z")
+
+        assert result.get("ticket_id") != "61"
+        rec = lifecycle.get("61", "kanboard")
+        assert rec.ai_agent_id != "worker-Z"
+
+    @pytest.mark.asyncio
+    async def test_reclaim_branch_refuses_when_disabled_during_decompose(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """The residual gap: decompose_ticket's LLM call can take seconds,
+        and the project can be disabled DURING it — after the ONE gate
+        check orchestrate_work does before attempting decompose, but
+        before the reclaim branch's claim_ticket call. If the LLM declines
+        to split the ticket (returns no subtasks), execution falls through
+        to the reclaim branch using the ORIGINAL, now-stale gate result.
+        There must be a second, fresh check after decompose returns.
+        """
+        self._wire_task_project(mock_kanban, 9)
+        lifecycle.get_or_create("62", "kanboard")
+        lifecycle.transition("62", "kanboard", TicketState.READY)
+        lifecycle.transition("62", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.set_assignee("62", "kanboard", "alice")
+        lifecycle.claim_ticket("62", "kanboard", "marcus-slot-0")
+        # 4+ AC items so _should_attempt_decompose fires.
+        lifecycle.update_acceptance_criteria(
+            "62", "kanboard", "- [ ] a\n- [ ] b\n- [ ] c\n- [ ] d", "hash"
+        )
+        workflow._next_worker_ticket = AsyncMock(return_value="62")
+
+        # Enabled through orchestrate_work's pre-decompose gate check AND
+        # decompose_ticket's own internal gate (so the LLM is actually
+        # called, matching the real scenario) — then disabled by the time
+        # decompose returns having declined to split the ticket, so
+        # execution falls through to the reclaim branch for ticket 62
+        # itself using what would otherwise be a stale "enabled" result.
+        calls = {"n": 0}
+
+        def is_enabled(pid):
+            calls["n"] += 1
+            return calls["n"] <= 2
+
+        mock_project_access.is_enabled = MagicMock(side_effect=is_enabled)
+
+        llm_called = {"yes": False}
+
+        async def fake_llm(prompt):
+            llm_called["yes"] = True
+            return '{"subtasks": []}'
+
+        workflow._llm_generate = fake_llm
+
+        result = await workflow.orchestrate_work(agent_id="worker-Z")
+
+        assert llm_called["yes"] is True  # the real, slow path was taken
+        assert result.get("ticket_id") != "62"
+        rec = lifecycle.get("62", "kanboard")
+        assert rec.ai_agent_id != "worker-Z"

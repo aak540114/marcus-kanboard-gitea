@@ -1385,6 +1385,21 @@ class HumanGatedWorkflow:
         except Exception as exc:  # noqa: BLE001
             logger.debug("Decompose: could not fetch %s: %s", ticket_id, exc)
 
+        # Gate BEFORE the LLM call, not after. That call takes seconds, not
+        # microseconds, and is the actual reason a caller's own gate check
+        # can go stale before this method's writes happen — checking here,
+        # right before either occurs, is what keeps the two in sync.
+        if parent_project_id is not None and not self._project_access.is_enabled(
+            parent_project_id
+        ):
+            logger.debug(
+                "Refusing to decompose ticket %s: Kanboard project %d is "
+                "not enabled for Marcus",
+                ticket_id,
+                parent_project_id,
+            )
+            return []
+
         # Sub-tickets ALWAYS start in Ready, whatever column the parent sat
         # in. A column reflects who is working a card, not where it belongs
         # in the plan: a freshly created child has not been claimed by any
@@ -1397,6 +1412,26 @@ class HumanGatedWorkflow:
             title, description, record.acceptance_criteria
         )
         if not subs:
+            return []
+
+        # Re-verify once more, right before any write happens. The pre-call
+        # gate above only catches a call that was already pointless — it
+        # cannot see a disable that happens WHILE the LLM call is in
+        # flight. Without this, a project disabled during that call would
+        # still get child tickets created, assigned, linked, and its
+        # parent parked as BLOCKED, regardless of whether those children
+        # ever reach an agent (orchestrate_work re-filters them before
+        # handing anything out, but the writes themselves would already be
+        # done).
+        if parent_project_id is not None and not self._project_access.is_enabled(
+            parent_project_id
+        ):
+            logger.debug(
+                "Refusing to write sub-tickets for %s: Kanboard project %d "
+                "was disabled during decomposition",
+                ticket_id,
+                parent_project_id,
+            )
             return []
 
         link = getattr(self._kanban, "create_task_link", None)
@@ -1894,6 +1929,26 @@ class HumanGatedWorkflow:
                     + " Call marcus_work again in ~10s."
                 ),
             }
+
+        # Re-verify right before acting on it. _next_worker_ticket's own
+        # is_enabled check can be stale by the time we get here:
+        # decompose_ticket below awaits an LLM call — seconds, not
+        # microseconds — during which a human has a real window to disable
+        # the project. The reclaim branch further down (a ticket already
+        # IN_PROGRESS under an internal 'marcus-' slot claim) skips
+        # _start_ai_work — and its own re-check — entirely, so without this
+        # a disabled-project ticket already claimed by an internal slot
+        # could still be handed to a worker.
+        if not await self._may_touch(next_id):
+            return {
+                "status": "no_work",
+                "agent_id": agent_id,
+                "message": (
+                    "No tickets are ready right now. Call marcus_work "
+                    "again in ~10s."
+                ),
+            }
+
         rec = self._lifecycle.get(next_id, self._provider)
         # Auto-decompose a large ticket into sub-tickets before handing it
         # out, so agents work independent pieces in parallel. The parent is
@@ -1902,6 +1957,22 @@ class HumanGatedWorkflow:
             children = await self.decompose_ticket(next_id)
             if children:
                 return await self.orchestrate_work(agent_id=agent_id)
+
+            # decompose_ticket declined to split it (LLM said "atomic") —
+            # but that call is an LLM round-trip, seconds not microseconds,
+            # so the _may_touch check made before attempting it can be
+            # stale by now. Re-verify before falling through to claim/start
+            # the ORIGINAL ticket below, or a disable that happened during
+            # that call would go unnoticed.
+            if not await self._may_touch(next_id):
+                return {
+                    "status": "no_work",
+                    "agent_id": agent_id,
+                    "message": (
+                        "No tickets are ready right now. Call marcus_work "
+                        "again in ~10s."
+                    ),
+                }
 
         if rec is not None:
             # Adopt the human-readied ticket under the WORKER's claim. The
