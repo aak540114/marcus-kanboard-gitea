@@ -4186,6 +4186,25 @@ class TestHandleBranchPush:
         lifecycle.transition("8", "kanboard", TicketState.DONE)
         assert await workflow.handle_branch_push("ticket/kanboard/8", ["x"]) is False
 
+    @pytest.mark.asyncio
+    async def test_syncs_marcus_local_clone_before_the_webhook_refresh(
+        self, workflow, lifecycle, mock_branch
+    ):
+        """A push must pull the new commits into Marcus's OWN local clone,
+        not just post a comment — GiteaWebhookReceiver calls this handler
+        (on_commits) BEFORE DevEnvironmentManager.refresh_by_branch(), and
+        that refresh's container-side `git fetch origin` reaches Marcus's
+        local clone (a bind-mount), not Gitea directly. Skipping this sync
+        left an already-open preview's hot reload resetting to the same
+        stale commit it already had — the change a human just requested
+        via a "waiting for human" comment never appeared on reload."""
+        rec = lifecycle.get_or_create("9", "kanboard")
+        rec.branch_name = "ticket/kanboard/9"
+
+        await workflow.handle_branch_push("ticket/kanboard/9", ["fix the button copy"])
+
+        mock_branch.sync_branch.assert_awaited_once_with("ticket/kanboard/9")
+
 
 class TestAgentPresenceAndUsage:
     """Connected (polling) vs active (working) agent presence, and the

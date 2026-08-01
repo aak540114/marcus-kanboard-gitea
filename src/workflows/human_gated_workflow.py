@@ -2481,6 +2481,16 @@ class HumanGatedWorkflow:
         the "actively worked" highlight lit) and lets a human review the
         pushed code on the branch whenever they want.
 
+        Also syncs Marcus's local clone of this branch (see
+        :meth:`_sync_branch_for_ticket`) BEFORE the webhook's own dev-env
+        refresh runs (:class:`~src.core.gitea_webhook_receiver.
+        GiteaWebhookReceiver` calls this ``on_commits`` hook first, then
+        ``DevEnvironmentManager.refresh_by_branch``) — an already-open
+        preview's ``git fetch`` inside its container reaches Marcus's local
+        clone, not Gitea directly, so without this the hot-reload the push
+        was supposed to trigger would silently reset to the same stale
+        commit it already had.
+
         Parameters
         ----------
         branch_name : str
@@ -2516,6 +2526,8 @@ class HumanGatedWorkflow:
         ticket_id = record.ticket_id
         # A push is agent activity — keep the "actively worked" ring lit.
         self._mark_progress_activity(ticket_id)
+
+        await self._sync_branch_for_ticket(ticket_id, branch_name)
 
         count = len(commit_messages)
         shown = [m.splitlines()[0][:100] for m in commit_messages[-5:] if m.strip()]
@@ -3201,6 +3213,67 @@ class HumanGatedWorkflow:
             self._branch_managers[repo_path] = cached
         return cached
 
+    async def _sync_branch_for_ticket(
+        self, ticket_id: str, branch_name: str
+    ) -> Optional[str]:
+        """Pull *ticket_id*'s branch from the remote into Marcus's local clone.
+
+        Marcus's own local clone is what a preview container's ``git fetch
+        origin`` reaches (``origin`` there is a bind-mount of THIS clone,
+        not Gitea directly — see :meth:`~src.core.dev_environment.
+        DevEnvironmentManager.refresh`'s docstring). It only advances when
+        something explicitly fetches from the real Gitea remote — an agent
+        pushing new commits does not touch it. Without this call first,
+        both :meth:`start_dev_environment` (opening a fresh preview) and a
+        push-triggered :meth:`~src.core.dev_environment.
+        DevEnvironmentManager.refresh` (an already-open preview's hot
+        reload) would reset the container to whatever stale commit this
+        clone happened to be on, silently showing no change at all.
+
+        Best-effort: a failed sync is logged, never raised — the caller
+        proceeds regardless (a stale preview is better than none).
+
+        Parameters
+        ----------
+        ticket_id : str
+            Ticket identifier, used to resolve which repo this branch lives
+            in via the ticket's Kanboard project.
+        branch_name : str
+            Branch to sync from the remote.
+
+        Returns
+        -------
+        Optional[str]
+            The resolved local repo path (or ``None``), so a caller that
+            also needs it (e.g. :meth:`start_dev_environment`) doesn't have
+            to re-run the project→repo lookup, which can re-trigger repo
+            provisioning.
+        """
+        kanboard_project_id: Optional[int] = None
+        try:
+            task = await self._kanban.get_task_by_id(ticket_id)
+            if task:
+                src_ctx = task.source_context or {}
+                raw = src_ctx.get("kanboard_task", {})
+                project_id_raw = raw.get("project_id")
+                if project_id_raw:
+                    kanboard_project_id = int(project_id_raw)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not fetch task %s from kanban: %s", ticket_id, exc)
+
+        mapping = await self._resolve_project_repo_mapping(kanboard_project_id)
+        repo_path = mapping.get("local_repo_path") if mapping else None
+
+        try:
+            branch_mgr = self._branch_for_repo_path(repo_path)
+            await branch_mgr.sync_branch(branch_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not sync branch %s for %s: %s", branch_name, ticket_id, exc
+            )
+
+        return repo_path
+
     async def start_dev_environment(self, ticket_id: str) -> Optional[str]:
         """Spin up the hot-reload dev environment for a ticket branch.
 
@@ -3218,38 +3291,17 @@ class HumanGatedWorkflow:
         if record is None:
             return None
 
-        kanboard_project_id: Optional[int] = None
-        try:
-            task = await self._kanban.get_task_by_id(ticket_id)
-            if task:
-                src_ctx = task.source_context or {}
-                raw = src_ctx.get("kanboard_task", {})
-                project_id_raw = raw.get("project_id")
-                if project_id_raw:
-                    kanboard_project_id = int(project_id_raw)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not fetch task %s from kanban: %s", ticket_id, exc)
-
-        mapping = await self._resolve_project_repo_mapping(kanboard_project_id)
-        repo_path = mapping.get("local_repo_path") if mapping else None
-
         # Pull the agent's latest pushed commits into Marcus's local clone
         # FIRST, so the preview reflects the ticket's REMOTE branch (the
-        # committed-and-pushed work), not whatever stale state the local clone
-        # held. The container is then cloned from this freshly-synced clone.
-        # Reuse the already-resolved repo_path so we don't re-run the
-        # project→repo lookup (which can re-trigger repo provisioning).
+        # committed-and-pushed work), not whatever stale state the local
+        # clone held. The container is then cloned from this freshly-synced
+        # clone. repo_path comes back from the same call so the project→repo
+        # lookup (which can re-trigger repo provisioning) doesn't run twice.
+        repo_path: Optional[str] = None
         if record.branch_name:
-            try:
-                branch_mgr = self._branch_for_repo_path(repo_path)
-                await branch_mgr.sync_branch(record.branch_name)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Could not sync branch %s before preview for %s: %s",
-                    record.branch_name,
-                    ticket_id,
-                    exc,
-                )
+            repo_path = await self._sync_branch_for_ticket(
+                ticket_id, record.branch_name
+            )
 
         try:
             info = await self._dev_env.start(
