@@ -18,6 +18,7 @@ All external dependencies (kanban, branch manager, dev env, AC generator)
 are mocked; no file I/O or network calls occur.
 """
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -3025,6 +3026,164 @@ class TestOrchestrateWork:
         assert workflow._classify_report_intent("DONE - x") == "done"
         assert workflow._classify_report_intent("BLOCKED - y") == "blocked"
         assert workflow._classify_report_intent("wrote a test") == "progress"
+
+
+class TestReclaimStuckTicket:
+    """An agent that loses track of its own ticket must not leave it
+    abandoned forever — a genuinely stuck ticket is reassigned to
+    whichever agent asks next, with full context, instead of Marcus
+    starting fresh work while the old ticket silently rots."""
+
+    def _stuck_ticket(self, lifecycle, tid, *, held_by="agent-old", stale=True):
+        """An IN_PROGRESS, human-assigned ticket claimed by *held_by*,
+        backdated past (or within, if stale=False) the staleness window."""
+        lifecycle.get_or_create(tid, "kanboard")
+        lifecycle.transition(tid, "kanboard", TicketState.READY)
+        lifecycle.set_assignee(tid, "kanboard", "alice")
+        lifecycle.claim_ticket(tid, "kanboard", held_by)
+        lifecycle.transition(tid, "kanboard", TicketState.IN_PROGRESS)
+        rec = lifecycle.get(tid, "kanboard")
+        age = timedelta(seconds=700) if stale else timedelta(seconds=10)
+        rec.updated_at = datetime.now(timezone.utc) - age
+        return rec
+
+    @pytest.mark.asyncio
+    async def test_stuck_ticket_is_reassigned_with_full_context(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """A ticket stuck past the timeout is handed to the new agent,
+        claim reassigned, same shape as resuming one's own ticket."""
+        self._stuck_ticket(lifecycle, "40")
+
+        res = await workflow.orchestrate_work(agent_id="agent-new")
+
+        assert res["status"] == "working"
+        assert res["ticket_id"] == "40"
+        assert "context" in res
+        assert lifecycle.get_agent_ticket("agent-new") == "40"
+        assert lifecycle.get("40", "kanboard").ai_agent_id == "agent-new"
+
+    @pytest.mark.asyncio
+    async def test_recently_claimed_ticket_is_not_reclaimed(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """A ticket claimed well within the timeout is left alone —
+        the new agent gets told there's no work, not someone else's
+        in-flight ticket."""
+        self._stuck_ticket(lifecycle, "41", stale=False)
+
+        res = await workflow.orchestrate_work(agent_id="agent-new")
+
+        assert res["status"] == "no_work"
+        assert lifecycle.get("41", "kanboard").ai_agent_id == "agent-old"
+
+    @pytest.mark.asyncio
+    async def test_reclaim_takes_priority_over_a_fresh_ready_ticket(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """Recovering abandoned work wins over starting something new,
+        even when a perfectly good fresh ticket is also available."""
+        self._stuck_ticket(lifecycle, "42")
+        lifecycle.get_or_create("43", "kanboard")
+        lifecycle.transition("43", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("43", "kanboard", "bob")
+
+        res = await workflow.orchestrate_work(agent_id="agent-new")
+
+        assert res["ticket_id"] == "42"
+
+    @pytest.mark.asyncio
+    async def test_recent_progress_heartbeat_keeps_a_ticket_from_reclaim(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Even with an old updated_at, a LIVE progress heartbeat (the
+        agent has reported recently) must win — staleness is judged by
+        the more recent of the two signals, not just the state-machine
+        timestamp."""
+        self._stuck_ticket(lifecycle, "44")
+        workflow._mark_progress_activity("44")
+
+        res = await workflow.orchestrate_work(agent_id="agent-new")
+
+        assert res["status"] == "no_work"
+        assert lifecycle.get("44", "kanboard").ai_agent_id == "agent-old"
+
+    @pytest.mark.asyncio
+    async def test_internal_slot_claim_is_never_reclaimed_as_stuck(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """A 'marcus-' internal auto-start slot is bookkeeping, not a live
+        agent — _reclaim_stuck_ticket must never treat it as a stuck
+        session (it's already adoptable via the normal hand-out path;
+        see _held_by_worker / orchestrate_work's own IN_PROGRESS-adoption
+        branch, a separate, pre-existing mechanism from this one)."""
+        self._stuck_ticket(lifecycle, "45", held_by="marcus-slot-0")
+
+        result = await workflow._reclaim_stuck_ticket("agent-new")
+
+        assert result is None
+        assert lifecycle.get("45", "kanboard").ai_agent_id == "marcus-slot-0"
+
+    @pytest.mark.asyncio
+    async def test_reclaimed_ticket_posts_a_visible_comment(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """A human watching the board must be able to see a reclaim
+        happened, not just have the claim silently swapped."""
+        self._stuck_ticket(lifecycle, "46")
+
+        await workflow.orchestrate_work(agent_id="agent-new")
+
+        posted = [c.args[-1] for c in mock_kanban.add_comment.call_args_list]
+        assert any("reassign" in body.lower() for body in posted)
+
+    @pytest.mark.asyncio
+    async def test_most_stale_ticket_is_reclaimed_first(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """With two stuck tickets, the one that has been silent longest
+        is recovered first."""
+        self._stuck_ticket(lifecycle, "47", held_by="agent-a")
+        lifecycle.get("47", "kanboard").updated_at = (
+            datetime.now(timezone.utc) - timedelta(seconds=700)
+        )
+        self._stuck_ticket(lifecycle, "48", held_by="agent-b")
+        lifecycle.get("48", "kanboard").updated_at = (
+            datetime.now(timezone.utc) - timedelta(seconds=1200)
+        )
+
+        res = await workflow.orchestrate_work(agent_id="agent-new")
+
+        assert res["ticket_id"] == "48"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_claim_is_resumed_not_raced(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """If a concurrent orchestrate_work call for this SAME agent_id
+        already claimed a ticket in the window between the initial
+        checks and the fresh-ticket lookup, resume THAT ticket instead
+        of racing to claim a different one. claim_ticket itself now
+        refuses to give one agent a second claim (one agent, one ticket
+        at a time) — this proves orchestrate_work handles that refusal
+        gracefully by resuming, not by erroring or double-claiming."""
+        lifecycle.get_or_create("60", "kanboard")
+        lifecycle.transition("60", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("60", "kanboard", "alice")
+
+        async def fake_reclaim(agent_id):
+            # Simulate another concurrent call claiming ticket 60 for this
+            # same agent_id while _reclaim_stuck_ticket was in flight.
+            lifecycle.claim_ticket("60", "kanboard", agent_id)
+            lifecycle.transition("60", "kanboard", TicketState.IN_PROGRESS)
+            return None
+
+        workflow._reclaim_stuck_ticket = fake_reclaim
+
+        res = await workflow.orchestrate_work(agent_id="agent-race")
+
+        assert res["status"] == "working"
+        assert res["ticket_id"] == "60"
 
 
 class TestReopenGuard:

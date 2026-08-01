@@ -53,6 +53,7 @@ import math
 import os
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, cast
 
 from src.ai.verification.ai_verifier import AIVerifier, VerificationResult
@@ -90,6 +91,17 @@ _WORKING_WINDOW_SECONDS = 40.0
 #: between contacts can easily exceed 30s, so keep this generous; a longer
 #: silence means the agent has disconnected/stopped.
 _AGENT_POLL_WINDOW = 60.0
+
+#: How long an IN_PROGRESS ticket may go without any sign of life from its
+#: claiming agent before Marcus treats it as abandoned and reclaims it for
+#: whichever agent asks next (see _reclaim_stuck_ticket). Deliberately much
+#: larger than _WORKING_WINDOW_SECONDS/_AGENT_POLL_WINDOW above (those tune
+#: a live UI indicator refreshed every ~10-15s; this tunes when Marcus
+#: actively takes an ACTION on a ticket) — long enough that an agent mid a
+#: slow build/test cycle is never punished, short enough that a session
+#: that lost track of its own agent_id (a fresh session, a compacted
+#: context) doesn't leave real work abandoned indefinitely.
+_STUCK_AGENT_TIMEOUT_SECONDS = 600.0
 
 #: How stale a board read may be and still be reused when a worker asks for
 #: its next ticket. Every marcus_work poll re-reads the enabled boards so a
@@ -1843,6 +1855,88 @@ class HumanGatedWorkflow:
             return candidate.ticket_id
         return None
 
+    async def _reclaim_stuck_ticket(self, agent_id: str) -> Optional[str]:
+        """Recover an IN_PROGRESS ticket whose claiming agent has gone
+        silent for too long, reassigning its claim to *agent_id*.
+
+        An agent that loses track of its own agent_id — a fresh session, a
+        compacted context, anything that makes it call ``marcus_work``
+        without the id it was given — leaves its old ticket claimed and
+        IN_PROGRESS forever: nothing else releases that claim except the
+        agent's own done/blocked/waiting-for-human signal, and a claimed
+        ticket is invisible to :meth:`_next_worker_ticket`. Called from
+        :meth:`orchestrate_work` BEFORE it looks for a fresh ticket, so
+        recovering abandoned work always takes priority over starting new
+        work — the ticket is handed back out with its full context, same
+        as a matched agent_id resuming its own ticket, so the new session
+        continues exactly where the old one left off.
+
+        Staleness is judged by the more recent of two signals: the
+        progress-activity heartbeat (:meth:`_mark_progress_activity`) and
+        the record's own ``updated_at`` (covers a ticket claimed but never
+        once reported on). The single MOST stale eligible ticket is
+        reclaimed, if any exceeds ``_STUCK_AGENT_TIMEOUT_SECONDS``.
+
+        Parameters
+        ----------
+        agent_id : str
+            The agent id to reassign the stuck ticket's claim to.
+
+        Returns
+        -------
+        Optional[str]
+            The reclaimed ticket id, or ``None`` if nothing is stuck.
+        """
+        now_wall = datetime.now(timezone.utc)
+        now_mono = time.monotonic()
+        stale: List[Tuple[float, str]] = []
+        for record in self._lifecycle.all_records():
+            if record.provider != self._provider:
+                continue
+            if record.state != TicketState.IN_PROGRESS:
+                continue
+            held_by = str(record.ai_agent_id or "")
+            # Unclaimed, an internal auto-start slot (not a real worker), or
+            # already this very agent's own ticket (handled by the normal
+            # "re-send context" path, not a reclaim) — none are stuck.
+            if not held_by or held_by.startswith("marcus-") or held_by == agent_id:
+                continue
+            key = f"{self._provider}:{record.ticket_id}"
+            heartbeat_ts = self._progress_activity.get(key)
+            heartbeat_age = (
+                (now_mono - heartbeat_ts) if heartbeat_ts is not None else math.inf
+            )
+            claim_age = (now_wall - record.updated_at).total_seconds()
+            age = min(heartbeat_age, claim_age)
+            if age > _STUCK_AGENT_TIMEOUT_SECONDS:
+                stale.append((age, record.ticket_id))
+
+        stale.sort(reverse=True)  # most stale first
+        for _, ticket_id in stale:
+            if not await self._may_touch(ticket_id):
+                continue
+            try:
+                self._lifecycle.release_ticket(ticket_id, self._provider)
+                self._lifecycle.claim_ticket(ticket_id, self._provider, agent_id)
+            except KeyError:
+                continue
+            self._mark_progress_activity(ticket_id)
+            minutes = int(_STUCK_AGENT_TIMEOUT_SECONDS // 60)
+            await self._post_comment(
+                ticket_id,
+                f"🔄 **Reassigned** — the previous session went quiet for "
+                f"over {minutes} minutes. A new agent session is resuming "
+                "this ticket from where it was left.",
+            )
+            logger.info(
+                "Ticket %s reclaimed from a stale agent session; "
+                "reassigned to %s",
+                ticket_id,
+                agent_id,
+            )
+            return ticket_id
+        return None
+
     async def orchestrate_work(
         self,
         agent_id: Optional[str] = None,
@@ -1965,7 +2059,43 @@ class HumanGatedWorkflow:
                 "message": self._worker_instructions(),
             }
 
-        # 3. No active ticket → assign the next available one.
+        # 3. No active ticket → first check whether some OTHER ticket has
+        # gone stuck (claimed by a now-unreachable agent session — see
+        # _reclaim_stuck_ticket) and needs recovering. This takes priority
+        # over starting fresh work: unfinished work must never sit
+        # abandoned in favor of a brand new ticket just because the agent
+        # that was doing it lost track of its own agent_id.
+        stuck_id = await self._reclaim_stuck_ticket(agent_id)
+        if stuck_id is not None:
+            ctx = await self.get_work_context(stuck_id)
+            return {
+                "status": "working",
+                "agent_id": agent_id,
+                "ticket_id": stuck_id,
+                "context": ctx,
+                "message": (
+                    "Reassigned: a previous session on this ticket went "
+                    "quiet. " + self._worker_instructions()
+                ),
+            }
+
+        # Defensive re-check: the awaits above (_reclaim_stuck_ticket) give
+        # a concurrent orchestrate_work call for this SAME agent_id a
+        # window to have claimed a ticket in the meantime — claim_ticket
+        # itself now refuses to give one agent a second, different claim,
+        # but resuming that ticket here (rather than racing to claim
+        # another) is what keeps this call correct rather than merely safe.
+        active = self._lifecycle.get_agent_ticket(agent_id)
+        if active:
+            ctx = await self.get_work_context(active)
+            return {
+                "status": "working",
+                "agent_id": agent_id,
+                "ticket_id": active,
+                "context": ctx,
+                "message": self._worker_instructions(),
+            }
+
         # Re-read the enabled boards first. _next_worker_ticket selects from
         # lifecycle records, which are otherwise only refreshed by
         # BoardWatcher's own timer (30s by default) and by webhooks — so an

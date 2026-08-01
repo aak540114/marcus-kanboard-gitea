@@ -603,10 +603,14 @@ class TicketLifecycleManager:
     ) -> bool:
         """Atomically claim a ticket for an AI agent.
 
-        This is the anti-duplication gate: at most one AI agent holds a
-        claim at any time.  A second call while another agent holds the
-        claim returns ``False`` without modifying the record.  The claim
-        is automatically released by :meth:`release_ticket`.
+        This is the anti-duplication gate, enforced in both directions:
+        at most one AI agent holds a claim on a given ticket at any time
+        (a second call while another agent holds it returns ``False``),
+        AND one agent may never simultaneously hold claims on two
+        DIFFERENT tickets (a call for agent *X* refuses if *X* already
+        holds a different ticket, even though the target ticket itself
+        is unclaimed). The claim is automatically released by
+        :meth:`release_ticket`.
 
         Parameters
         ----------
@@ -620,8 +624,9 @@ class TicketLifecycleManager:
         Returns
         -------
         bool
-            ``True`` if the claim was acquired; ``False`` if already
-            claimed by another agent.
+            ``True`` if the claim was acquired; ``False`` if the ticket is
+            already claimed by another agent, or if *agent_id* already
+            holds a claim on a different ticket.
 
         Raises
         ------
@@ -641,6 +646,17 @@ class TicketLifecycleManager:
                 agent_id,
             )
             return False
+
+        for other_key, other in self._records.items():
+            if other_key != key and other.ai_agent_id == agent_id:
+                logger.warning(
+                    "Refusing claim of %s for agent %s: it already holds "
+                    "%s (one agent, one ticket at a time)",
+                    key,
+                    agent_id,
+                    other_key,
+                )
+                return False
 
         record.ai_agent_id = agent_id
         record.updated_at = datetime.now(timezone.utc)

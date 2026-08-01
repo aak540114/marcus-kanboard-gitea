@@ -350,6 +350,37 @@ class TestClaimRelease:
         result = manager.claim_ticket("C-3", "jira", "agent-alpha")
         assert result is False
 
+    def test_one_agent_cannot_hold_two_different_tickets(self, manager):
+        """An agent already holding one ticket cannot claim a SECOND,
+        different, unclaimed ticket — one agent, one claim at a time."""
+        manager.get_or_create("C-3a", "jira")
+        manager.get_or_create("C-3b", "jira")
+        manager.claim_ticket("C-3a", "jira", "agent-alpha")
+
+        result = manager.claim_ticket("C-3b", "jira", "agent-alpha")
+
+        assert result is False
+        rec_b = manager.get("C-3b", "jira")
+        assert rec_b is not None
+        assert rec_b.ai_agent_id is None  # untouched
+        rec_a = manager.get("C-3a", "jira")
+        assert rec_a is not None
+        assert rec_a.ai_agent_id == "agent-alpha"  # original claim intact
+
+    def test_agent_can_claim_a_new_ticket_after_releasing_the_old_one(
+        self, manager
+    ):
+        """Releasing the first claim frees the agent to claim another."""
+        manager.get_or_create("C-3c", "jira")
+        manager.get_or_create("C-3d", "jira")
+        manager.claim_ticket("C-3c", "jira", "agent-alpha")
+        manager.release_ticket("C-3c", "jira")
+
+        result = manager.claim_ticket("C-3d", "jira", "agent-alpha")
+
+        assert result is True
+        assert manager.get("C-3d", "jira").ai_agent_id == "agent-alpha"
+
     def test_release_clears_agent_id(self, manager):
         """release_ticket clears ai_agent_id."""
         manager.get_or_create("C-4", "jira")
