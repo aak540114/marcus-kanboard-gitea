@@ -36,10 +36,11 @@ Kanboard appends (``?token=<value>``).  Leave both unset to skip validation
 (development only).
 """
 
+import asyncio
 import json
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 from src.core.events import Events
 
@@ -136,6 +137,11 @@ class KanboardWebhookReceiver:
         self._events = events
         self._provider = provider
         self._secret_token = secret_token or os.getenv("KANBOARD_WEBHOOK_TOKEN")
+        # Strong references for background=True dispatch tasks — asyncio
+        # only holds a WEAK reference to a task once its create_task() call
+        # returns, so an unreferenced task can be garbage-collected mid-run.
+        # Discarded via the done callback once each task finishes.
+        self._background_tasks: Set["asyncio.Task[None]"] = set()
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -147,6 +153,7 @@ class KanboardWebhookReceiver:
         *,
         token: Optional[str] = None,
         header_token: Optional[str] = None,
+        background: bool = False,
     ) -> bool:
         """
         Parse a raw Kanboard webhook request body and emit Marcus events.
@@ -159,12 +166,39 @@ class KanboardWebhookReceiver:
             Value of the ``?token=`` query parameter (Kanboard appends this).
         header_token : Optional[str]
             Value of the ``X-Kanboard-Token`` HTTP header, if present.
+        background : bool
+            If ``True``, validate and parse the payload synchronously but
+            hand the actual event dispatch off to a background task instead
+            of awaiting it — see the "Why background matters" note below.
+            Defaults to ``False`` (fully synchronous, original behaviour).
 
         Returns
         -------
         bool
-            ``True`` if the payload was accepted and processed;
-            ``False`` if rejected (bad token or malformed body).
+            ``True`` if the payload was accepted (and, for ``background=
+            False``, processed); ``False`` if rejected (bad token or
+            malformed body). With ``background=True``, ``True`` only means
+            the event was scheduled — dispatch errors are logged, not
+            raised, since there is no caller left to see them by the time
+            they can happen.
+
+        Why background matters
+        -----------------------
+        Kanboard sends its outbound webhook as a synchronous HTTP call made
+        from *inside* the PHP request that changed the ticket (Kanboard's
+        ``WebhookNotification`` — a plain blocking ``postJson()``, no
+        queue). If this method doesn't return until the ENTIRE event has
+        been handled, Kanboard's own request stays open for that whole
+        time — and some of that handling (e.g. a "waiting for human" →
+        "done" move drives a merge to main, then Marcus calls straight
+        back into Kanboard's JSON-RPC API to move the column and post a
+        comment) makes brand new write requests to the very same
+        SQLite-backed Kanboard instance while the original request is
+        still in flight. Kanboard only allows one writer to its database
+        file at a time, so that overlap is exactly what surfaces to a
+        human as ``SQLException: database is locked``. Acking immediately
+        after validating and parsing — before doing any of the work that
+        writes back to Kanboard — closes that window.
         """
         if not self._validate_token(token, header_token):
             logger.warning("Kanboard webhook rejected: invalid token")
@@ -181,6 +215,14 @@ class KanboardWebhookReceiver:
 
         logger.debug("Kanboard webhook received: %s", event_name)
 
+        if background:
+            task: "asyncio.Task[None]" = asyncio.create_task(
+                self._dispatch_safely(event_name, event_data)
+            )
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+            return True
+
         try:
             await self._dispatch(event_name, event_data)
         except Exception:
@@ -188,6 +230,14 @@ class KanboardWebhookReceiver:
             return False
 
         return True
+
+    async def _dispatch_safely(self, event_name: str, event_data: Dict[str, Any]) -> None:
+        """Run ``_dispatch`` for a background task, logging instead of
+        raising — an exception here has no caller left to propagate to."""
+        try:
+            await self._dispatch(event_name, event_data)
+        except Exception:
+            logger.exception("Error processing Kanboard webhook event %s", event_name)
 
     # ------------------------------------------------------------------
     # Token validation

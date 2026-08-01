@@ -4243,14 +4243,25 @@ if __name__ == "__main__":
         )
 
         async def kanboard_webhook(request: Request) -> JSONResponse:
-            """Receive Kanboard push-webhook and re-emit as Marcus events."""
+            """Receive Kanboard push-webhook and re-emit as Marcus events.
+
+            Dispatches in the BACKGROUND (see KanboardWebhookReceiver.
+            handle_request's "Why background matters" docstring): Kanboard
+            sends this webhook synchronously from inside the request that
+            changed the ticket, and Marcus's own handling of some events
+            (e.g. a "waiting for human" -> "done" move) writes straight
+            back to Kanboard's JSON-RPC API. Awaiting full processing here
+            would keep Kanboard's own request open while those write-backs
+            land on the same SQLite-backed instance — exactly the
+            "database is locked" collision this avoids.
+            """
             token = request.query_params.get("token")
             header_token = request.headers.get("X-Kanboard-Token")
             body = await _read_bounded_body(request)
             if body is None:
                 return JSONResponse({"status": "rejected", "reason": "payload too large"}, status_code=413)
             accepted = await _webhook_receiver.handle_request(
-                body, token=token, header_token=header_token
+                body, token=token, header_token=header_token, background=True
             )
             if accepted:
                 return JSONResponse({"status": "ok"}, status_code=200)

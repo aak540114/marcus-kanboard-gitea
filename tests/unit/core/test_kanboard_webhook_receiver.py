@@ -5,6 +5,7 @@ Verifies that raw Kanboard webhook payloads are correctly translated into
 Marcus internal events and that token validation works correctly.
 """
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -427,3 +428,81 @@ class TestTaskRemove:
         await receiver.handle_request(body)
 
         mock_events.publish.assert_not_called()
+
+
+class TestBackgroundDispatch:
+    """``background=True`` acks Kanboard before processing the event.
+
+    Kanboard's outbound webhook call is a synchronous, blocking HTTP
+    request made from *within* the PHP request that changed the ticket
+    (see Kanboard's ``WebhookNotification::sendMessage`` — a plain
+    ``httpClient->postJson()`` call, no queue). If Marcus doesn't respond
+    until it has finished handling the event — including any RPC calls
+    Marcus itself makes back to Kanboard (e.g. moving a "waiting for
+    human" ticket to "done" merges to main, then moves the column and
+    posts a comment via the JSON-RPC API) — Kanboard's own request stays
+    open the whole time. Those write-back calls are brand new HTTP
+    requests hitting the very same SQLite-backed Kanboard instance while
+    the original request is still in flight, which is exactly the
+    "database is locked" collision Kanboard users can hit when moving a
+    ticket to Done. ``background=True`` breaks that: Marcus acks as soon
+    as the payload is validated and parsed, and does the actual dispatch
+    (and any resulting writes back to Kanboard) after responding.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_before_dispatch_runs(self, receiver, mock_events):
+        """The call returns without waiting for the event to be handled."""
+        body = _body("task.close", {"task": {"id": "5"}})
+
+        result = await receiver.handle_request(body, background=True)
+
+        assert result is True
+        mock_events.publish.assert_not_called()  # not yet — still pending
+
+        await asyncio.sleep(0)  # let the scheduled task run
+
+        mock_events.publish.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_invalid_token_still_rejected_synchronously(
+        self, secured_receiver, mock_events
+    ):
+        """A bad token is rejected immediately — nothing gets scheduled."""
+        body = _body("task.close", {"task": {"id": "5"}})
+
+        result = await secured_receiver.handle_request(
+            body, token="wrong", background=True
+        )
+
+        assert result is False
+        await asyncio.sleep(0)
+        mock_events.publish.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_malformed_json_still_rejected_synchronously(
+        self, receiver, mock_events
+    ):
+        """Malformed JSON is rejected immediately — nothing gets scheduled."""
+        result = await receiver.handle_request(b"not json", background=True)
+
+        assert result is False
+        await asyncio.sleep(0)
+        mock_events.publish.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_error_is_logged_not_raised(self, receiver, mock_events):
+        """A handler exception during background dispatch must not escape —
+        there is no caller left awaiting it by the time it happens."""
+        mock_events.publish = AsyncMock(side_effect=RuntimeError("boom"))
+        body = _body("task.close", {"task": {"id": "5"}})
+
+        result = await receiver.handle_request(body, background=True)
+        assert result is True
+
+        await asyncio.sleep(0)  # the background task runs and raises —
+
+        # ...and the test reaching this line at all is the assertion: a
+        # raised exception inside the background task would otherwise
+        # surface as "Task exception was never retrieved" at GC time, not
+        # here, but it must not propagate through handle_request itself.
