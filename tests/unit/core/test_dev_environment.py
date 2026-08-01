@@ -15,6 +15,7 @@ from src.core.dev_environment import (
     DevEnvironmentManager,
     PortAllocator,
     STACK_CONFIGS,
+    _resolve_nodejs_dev_command,
     detect_project_type,
 )
 
@@ -276,6 +277,98 @@ class TestDetectProjectType:
 
 
 # ---------------------------------------------------------------------------
+# _resolve_nodejs_dev_command
+# ---------------------------------------------------------------------------
+
+
+class TestResolveNodejsDevCommand:
+    """Picking the right npm script for a Node.js project's dev server.
+
+    Marcus's blind default assumes every Node.js project defines a "dev"
+    script — Vite, Next.js, and Create React App all do by convention, but
+    a project that names it differently (or doesn't have "dev" at all)
+    made the preview container exit immediately with `npm error Missing
+    script: "dev"`, and the human saw "Preview could not start" for a
+    project whose OWN start script would have worked fine."""
+
+    def test_prefers_dev_script_when_present(self, tmp_path: Path) -> None:
+        """The conventional "dev" script wins even when others exist too —
+        matches Marcus's existing default, so a project that DOES follow
+        the convention behaves exactly as before."""
+        (tmp_path / "package.json").write_text(
+            '{"scripts": {"dev": "vite", "start": "node server.js"}}'
+        )
+        assert _resolve_nodejs_dev_command(str(tmp_path)) == (
+            "npm run dev -- --port 3000"
+        )
+
+    def test_falls_back_to_start_script(self, tmp_path: Path) -> None:
+        """No "dev" script, but "start" exists — use that instead of
+        failing outright on the generic guess."""
+        (tmp_path / "package.json").write_text(
+            '{"scripts": {"start": "node server.js", "test": "jest"}}'
+        )
+        assert _resolve_nodejs_dev_command(str(tmp_path)) == (
+            "npm run start -- --port 3000"
+        )
+
+    def test_falls_back_to_serve_script(self, tmp_path: Path) -> None:
+        """Neither "dev" nor "start" — "serve" is next in priority."""
+        (tmp_path / "package.json").write_text(
+            '{"scripts": {"serve": "http-server ."}}'
+        )
+        assert _resolve_nodejs_dev_command(str(tmp_path)) == (
+            "npm run serve -- --port 3000"
+        )
+
+    def test_falls_back_to_develop_script(self, tmp_path: Path) -> None:
+        """Last in priority: "develop"."""
+        (tmp_path / "package.json").write_text(
+            '{"scripts": {"develop": "webpack serve"}}'
+        )
+        assert _resolve_nodejs_dev_command(str(tmp_path)) == (
+            "npm run develop -- --port 3000"
+        )
+
+    def test_defaults_to_dev_when_no_known_script_matches(
+        self, tmp_path: Path
+    ) -> None:
+        """None of the candidate scripts exist — keep trying "dev" (the
+        pre-existing default) rather than guessing something riskier."""
+        (tmp_path / "package.json").write_text(
+            '{"scripts": {"build": "tsc", "test": "jest"}}'
+        )
+        assert _resolve_nodejs_dev_command(str(tmp_path)) == (
+            "npm run dev -- --port 3000"
+        )
+
+    def test_defaults_to_dev_when_package_json_missing(
+        self, tmp_path: Path
+    ) -> None:
+        """No package.json at all — unchanged default behavior."""
+        assert _resolve_nodejs_dev_command(str(tmp_path)) == (
+            "npm run dev -- --port 3000"
+        )
+
+    def test_defaults_to_dev_on_invalid_json(self, tmp_path: Path) -> None:
+        """Malformed package.json must not crash the dev-env start —
+        fail open to the same default as if the file were absent."""
+        (tmp_path / "package.json").write_text("{not valid json")
+        assert _resolve_nodejs_dev_command(str(tmp_path)) == (
+            "npm run dev -- --port 3000"
+        )
+
+    def test_defaults_to_dev_when_scripts_key_missing(
+        self, tmp_path: Path
+    ) -> None:
+        """Valid JSON but no "scripts" object at all."""
+        (tmp_path / "package.json").write_text('{"name": "app"}')
+        assert _resolve_nodejs_dev_command(str(tmp_path)) == (
+            "npm run dev -- --port 3000"
+        )
+
+
+# ---------------------------------------------------------------------------
 # DevEnvironmentManager._build_entrypoint
 # ---------------------------------------------------------------------------
 
@@ -509,6 +602,53 @@ class TestStartDockerRepoPath:
             )
         cmd = mock_run.call_args[0][0]
         assert "/app/data/repos/z:/src:ro" in cmd
+
+
+class TestStartDockerRefinesNodejsCommand:
+    """start()'s auto-detected/inferred Node.js command is confirmed
+    against the repo's own package.json before it's run in the container —
+    see _resolve_nodejs_dev_command."""
+
+    @pytest.fixture
+    def manager(self, tmp_path):
+        config = DevEnvironmentConfig(
+            repo_path=str(tmp_path),
+            use_docker=True,
+            auto_detect=True,
+            port_range=(19800, 19850),
+        )
+        return DevEnvironmentManager(
+            config=config,
+            settings_manager=DevEnvSettingsManager(data_dir=tmp_path),
+        )
+
+    @pytest.mark.asyncio
+    async def test_auto_detect_uses_projects_own_start_script(
+        self, manager, tmp_path
+    ):
+        """package.json defines "start" but not "dev" — the container must
+        run "npm run start", not fail on the generic "npm run dev" guess."""
+        (tmp_path / "package.json").write_text(
+            '{"scripts": {"start": "node server.js"}}'
+        )
+        with patch(
+            "subprocess.run", return_value=MagicMock(returncode=0, stderr="")
+        ) as mock_run:
+            await manager.start("T-20", "kanboard", "ticket/kanboard/t-20")
+        cmd = mock_run.call_args[0][0]
+        assert any("npm run start -- --port 3000" in str(c) for c in cmd)
+        assert not any("npm run dev" in str(c) for c in cmd)
+
+    @pytest.mark.asyncio
+    async def test_auto_detect_keeps_dev_when_present(self, manager, tmp_path):
+        """package.json defines "dev" — unchanged from today's behavior."""
+        (tmp_path / "package.json").write_text('{"scripts": {"dev": "vite"}}')
+        with patch(
+            "subprocess.run", return_value=MagicMock(returncode=0, stderr="")
+        ) as mock_run:
+            await manager.start("T-21", "kanboard", "ticket/kanboard/t-21")
+        cmd = mock_run.call_args[0][0]
+        assert any("npm run dev -- --port 3000" in str(c) for c in cmd)
 
 
 # ---------------------------------------------------------------------------
@@ -1218,6 +1358,22 @@ class TestEntrypointResilience:
             "b", install_cmd="", start_cmd="npm run dev", use_hm_reload=True,
         )
         assert "python3 -m http.server" not in cmd
+
+    def test_static_fallback_package_is_installed(self) -> None:
+        """busybox httpd needs busybox-extras — alpine:3.20's base busybox
+        package does not include the httpd applet, so a container falling
+        back to it fails with "httpd: applet not found" and never answers
+        the port at all (observed live: a project whose real dev command
+        failed left the preview completely unreachable, instead of
+        degrading to the static file server the fallback exists for).
+        busybox-extras must be installed unconditionally, regardless of
+        which stack is in use, since ANY stack's dev command can be the
+        one that fails."""
+        cmd = self._mgr()._build_entrypoint(
+            "b", install_cmd="", start_cmd="npm run dev", use_hm_reload=True,
+        )
+        apk_line = next(line for line in cmd.split("&&") if "apk add" in line)
+        assert "busybox-extras" in apk_line
 
     def test_install_failure_is_non_fatal(self) -> None:
         """A failed dependency install must not abort the entrypoint."""

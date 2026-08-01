@@ -40,6 +40,7 @@ DevEnvironmentManager
 """
 
 import asyncio
+import json
 import logging
 import os
 import random
@@ -93,23 +94,31 @@ _BASE_IMAGE = "alpine:3.20"
 
 #: Alpine ``apk`` packages installed before project setup.  ``git`` is
 #: required for the branch checkout; ``inotify-tools`` powers the file-watch
-#: restart loop for non-hot-reload stacks.  Installation is best-effort
-#: (``|| true``) so a transient network hiccup never stops the container from
-#: serving.  Language runtimes are NOT here — they come from the stack.
-_BASE_APK = "git inotify-tools"
+#: restart loop for non-hot-reload stacks; ``busybox-extras`` is what makes
+#: :data:`_STATIC_FALLBACK` below actually work (see its docstring — the
+#: base image's own BusyBox build does NOT include ``httpd``). Installation
+#: is best-effort (``|| true``) so a transient network hiccup never stops
+#: the container from serving.  Language runtimes are NOT here — they come
+#: from the stack.
+_BASE_APK = "git inotify-tools busybox-extras"
 
 #: Port the application is expected to listen on **inside** the container.
 #: The host-side port (allocated by :class:`PortAllocator`) is published to
 #: this one via ``docker run -p <host>:<_APP_PORT>``.
 _APP_PORT = 3000
 
-#: Guaranteed-available fallback server.  Alpine's BusyBox ships an ``httpd``
-#: applet, so this command needs **zero** package installation and can never
-#: fail for lack of a runtime.  It serves the checked-out branch's files (the
-#: container's ``/app`` working directory) as a static website — perfect for
-#: the common case of letting a human open a browser and *see* what an agent
-#: built, and as the last-resort fallback when a project's real dev command
-#: can't start.
+#: Last-resort fallback server, run whenever a project's real dev command
+#: exits (wrong/missing script, crash, etc.) — see :meth:`_build_entrypoint`.
+#: ``alpine:3.20``'s BASE ``busybox`` package does NOT include the ``httpd``
+#: applet (confirmed live: a container falling back to this command failed
+#: with ``httpd: applet not found``, leaving the preview completely
+#: unreachable instead of degrading to a static file server as designed) —
+#: it ships only in the separate ``busybox-extras`` package, which
+#: :data:`_BASE_APK` installs unconditionally for exactly this reason. It
+#: serves the checked-out branch's files (the container's ``/app`` working
+#: directory) as a static website — perfect for the common case of letting
+#: a human open a browser and *see* what an agent built, and as the
+#: last-resort fallback when a project's real dev command can't start.
 _STATIC_FALLBACK = f"busybox httpd -f -p {_APP_PORT} -h /app"
 
 # ---------------------------------------------------------------------------
@@ -230,6 +239,60 @@ def detect_project_type(repo_path: str) -> str:
         return "php"
 
     return "static"
+
+
+#: npm script names tried, in priority order, when a Node.js project's
+#: package.json doesn't define a "dev" script. "dev" first since it's the
+#: convention Marcus's own default command already assumes (Vite, Next.js,
+#: CRA, etc. all default to it); the rest cover projects that name their
+#: dev-server script differently instead of not having one at all.
+_NODEJS_SCRIPT_PRIORITY = ("dev", "start", "serve", "develop")
+
+
+def _resolve_nodejs_dev_command(repo_path: str) -> str:
+    """Pick the npm script to run as a Node.js project's dev server.
+
+    ``detect_project_type`` returning ``"nodejs"`` only means a
+    ``package.json`` exists — it says nothing about which script in it
+    actually starts a dev server. Assuming "dev" unconditionally (Marcus's
+    long-standing default) fails outright for any project that names it
+    something else: ``npm error Missing script: "dev"`` exits immediately,
+    and the human sees "Preview could not start" for a project that would
+    have worked fine under its own ``start``/``serve``/``develop`` script.
+
+    Reads ``package.json``'s ``"scripts"`` object and returns the first
+    match from :data:`_NODEJS_SCRIPT_PRIORITY`, formatted the same way as
+    the static fallback table's own "nodejs" entry. Falls back to that
+    same default (still trying "dev") when the file is missing, unreadable,
+    not valid JSON, or defines none of the candidate scripts — so a project
+    a human hasn't configured behaves exactly as before this existed.
+
+    Parameters
+    ----------
+    repo_path : str
+        Root of the git repository to inspect.
+
+    Returns
+    -------
+    str
+        The ``npm run <script> -- --port {port}`` command to use as this
+        stack's ``start`` command.
+    """
+    default: str = _FALLBACK_STACKS["nodejs"]["start"]
+    package_json = Path(repo_path) / "package.json"
+    try:
+        data = json.loads(package_json.read_text())
+    except (OSError, ValueError):
+        return default
+
+    scripts = data.get("scripts")
+    if not isinstance(scripts, dict):
+        return default
+
+    for name in _NODEJS_SCRIPT_PRIORITY:
+        if name in scripts:
+            return f"npm run {name} -- --port {_APP_PORT}"
+    return default
 
 
 def _resolve_host_repo_path(repo_path: str) -> str:
@@ -1298,6 +1361,20 @@ class DevEnvironmentManager:
             install_cmd = ""
             start_cmd = self.config.dev_command.format(port=3000)
             use_hm_reload = False
+
+        # Confirm the generic Node.js guess against the repo's own
+        # package.json before running it. Both paths above can produce the
+        # exact same unconfirmed "npm run dev -- --port 3000" default —
+        # project_stack.dev_cmd when a Tech Stack section names Node.js but
+        # gives no explicit "Dev server command" line, or the auto-detect
+        # table for any repo with a package.json — and it fails outright
+        # (`npm error Missing script: "dev"`) for any project that names
+        # its dev-server script something else instead of not having one.
+        # A human's own EXPLICIT "Dev server command" line is never this
+        # exact generic string by coincidence in practice, so refining only
+        # when it matches leaves a real override untouched.
+        if start_cmd == _FALLBACK_STACKS["nodejs"]["start"]:
+            start_cmd = _resolve_nodejs_dev_command(repo_path)
 
         # Remember the resolved dev-server command so the "Preview could not
         # start" page can show exactly what Marcus inferred from the Tech
