@@ -898,8 +898,8 @@ class TestClaimReleaseGaps:
         _on_status_changed used to call release_ticket at all — the claim
         stayed held with no later event ever able to free it (the same
         one-ticket-per-agent deadlock risk as the todo-reset gap above).
-        Covered generically now: a claim survives ONLY in Ready/In
-        Progress, released on a move to anything else.
+        Covered generically now: a claim survives ONLY in In Progress,
+        released on a move to anything else.
         """
         lifecycle.get_or_create("53", "kanboard")
         lifecycle.transition("53", "kanboard", TicketState.READY)
@@ -916,6 +916,38 @@ class TestClaimReleaseGaps:
         rec = lifecycle.get("53", "kanboard")
         assert rec is not None
         assert rec.state == TicketState.BLOCKED
+        assert rec.ai_agent_id is None
+
+    @pytest.mark.asyncio
+    async def test_ready_move_releases_a_claim_too(self, workflow, lifecycle):
+        """Human drags an ACTIVE (claimed, IN_PROGRESS) card BACKWARD to
+        'ready' → the claim is released and state mirrors down to READY.
+
+        The generic "already claimed and in progress — ignore" branch
+        does NOT cover this: it only fires when new_status matches the
+        record's CURRENT state (a genuine poll-echo), and dragging to
+        'ready' while internally still IN_PROGRESS is a real, distinct
+        board change, not an echo. Without a dedicated branch for this,
+        Marcus's internal state (and the golden-ring claim) would
+        silently stay IN_PROGRESS forever while the board visibly showed
+        Ready. This is "un-starting" the ticket: the claim releases, and
+        _start_ai_work re-claims it from scratch the next time a worker
+        is handed it."""
+        lifecycle.get_or_create("54", "kanboard")
+        lifecycle.transition("54", "kanboard", TicketState.READY)
+        lifecycle.transition("54", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.set_assignee("54", "kanboard", "alice")
+        lifecycle.claim_ticket("54", "kanboard", workflow._agent_id)
+
+        event = _make_event(
+            {"ticket_id": "54", "new_status": "ready",
+             "old_status": "in_progress", "provider": "kanboard"}
+        )
+        await workflow._on_status_changed(event)
+
+        rec = lifecycle.get("54", "kanboard")
+        assert rec is not None
+        assert rec.state == TicketState.READY
         assert rec.ai_agent_id is None
 
     @pytest.mark.asyncio

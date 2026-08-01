@@ -641,17 +641,27 @@ class HumanGatedWorkflow:
         Claim invariant
         ----------------
         An AI agent may hold a claim on a ticket ONLY while it sits in the
-        Ready or In Progress column — those are the only two columns
-        "an agent is (or is about to be) actively working this" is true
-        for. Every move to any other column (Todo, Blocked, Waiting for
-        Human, Done, or a custom one) releases the claim here, before any
-        other branch below runs — regardless of whether the move was made
-        by a human or by Marcus itself (this handler fires the same way
-        either way: from BoardWatcher's poll diff or the Kanboard webhook).
-        This is a backstop as much as a rule: most individual branches
-        below already release the claim for their own reason (todo reset,
-        done/merge, review-signal into waiting_for_human) — BLOCKED was
-        the one gap, left claimed with no later event to release it.
+        Ready or In Progress column — Ready covers the brief in-flight
+        window before :meth:`_start_ai_work` finishes moving a fresh claim
+        on to In Progress; in practice a claim is essentially always
+        observed as In Progress. Every move to any other column (Todo,
+        Blocked, Waiting for Human, Done, or a custom one) releases the
+        claim here, before any other branch below runs — regardless of
+        whether the move was made by a human or by Marcus itself (this
+        handler fires the same way either way: from BoardWatcher's poll
+        diff or the Kanboard webhook). This also drives the board's
+        golden-ring highlight (see kanboard/plugins/MarcusDevEnv/Template/
+        board/header.php), which is additionally filtered to state ==
+        in_progress there, so it only lights while a ticket is genuinely
+        being worked, not during this transient window. This is a
+        backstop as much as a rule: most individual branches below already
+        release the claim for their own reason (todo reset, done/merge,
+        review-signal into waiting_for_human) — BLOCKED was the one gap,
+        left claimed with no later event to release it. A human dragging
+        an ACTIVE (claimed, In Progress) card backward to Ready is a
+        distinct case handled explicitly further below, since this
+        backstop alone would leave it exempt (Ready is an allowed claim
+        column) — see the comment at that branch.
         """
         data = event.data
         ticket_id = data["ticket_id"]
@@ -704,7 +714,8 @@ class HumanGatedWorkflow:
                         pass
                     self._reclaim_for_resume(ticket_id)
                 elif (
-                    record.state == TicketState.IN_PROGRESS
+                    new_status == TaskStatus.IN_PROGRESS.value
+                    and record.state == TicketState.IN_PROGRESS
                     and record.ai_agent_id is not None
                 ):
                     # Work already in flight (e.g. the poll-path echo of a
@@ -716,6 +727,34 @@ class HumanGatedWorkflow:
                         "ignoring redundant status event",
                         ticket_id,
                     )
+                elif (
+                    new_status == TaskStatus.READY.value
+                    and record.state == TicketState.IN_PROGRESS
+                    and record.ai_agent_id is not None
+                ):
+                    # Human dragged an ACTIVE (claimed) card BACKWARD to
+                    # Ready — a real, deliberate board change, not a
+                    # poll-echo of the current state (unlike the branch
+                    # above, new_status here does NOT match record.state).
+                    # Treat it as "un-starting" the ticket: release the
+                    # claim and mirror the lifecycle state back to Ready,
+                    # so the golden ring clears immediately and the next
+                    # worker pickup claims it fresh, instead of silently
+                    # leaving Marcus's internal state stuck at In Progress
+                    # while the board visibly shows Ready.
+                    try:
+                        self._lifecycle.release_ticket(ticket_id, self._provider)
+                    except KeyError:
+                        pass
+                    try:
+                        self._lifecycle.human_transition(
+                            ticket_id,
+                            self._provider,
+                            TicketState.READY,
+                            reason="Human moved an in-progress ticket back to ready",
+                        )
+                    except (InvalidTransitionError, KeyError):
+                        pass
                 else:
                     # Mirror the board column BEFORE attempting the start.
                     # The start can be refused for reasons that are not the

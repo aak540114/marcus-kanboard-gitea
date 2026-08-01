@@ -214,16 +214,17 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
 
 /* ── Claimed ticket highlight ─────────────────────────────────────────── */
 /* A golden ring marks every card an AI agent currently holds a CLAIM on —
-   driven by Marcus's lifecycle record (ai_agent_id set), not an activity
-   heartbeat, so it stays lit for the whole time a ticket is claimed, not
-   just while the agent is actively reporting progress. Marcus only ever
-   holds a claim while a ticket sits in Ready or In Progress (see the claim
-   invariant in HumanGatedWorkflow._on_status_changed) and releases it the
-   moment the card leaves either column — whether moved by a human or by
-   Marcus itself — so the ring disappears on the next poll below. Rendered
-   as a box-shadow ring rather than a real `border` so it doesn't shift the
-   card's layout or fight Kanboard's own category-colored left border, and
-   respects the card's rounded corners. */
+   driven by Marcus's lifecycle record (ai_agent_id set AND state ==
+   in_progress — see the filter below), not an activity heartbeat, so it
+   stays lit for the whole time a ticket is claimed, not just while the
+   agent is actively reporting progress. Marcus only ever holds a claim
+   while a ticket sits in In Progress (see the claim invariant in
+   HumanGatedWorkflow._on_status_changed) and releases it the moment the
+   card leaves that column — to Ready, Done, Blocked, anywhere — whether
+   moved by a human or by Marcus itself — so the ring disappears on the
+   next poll below. Rendered as a box-shadow ring rather than a real
+   `border` so it doesn't shift the card's layout or fight Kanboard's own
+   category-colored left border, and respects the card's rounded corners. */
 .task-board.marcus-ai-active {
     border-color: #f5b301 !important;
     /* The ring itself comes from the animation below. A CSS animation
@@ -475,11 +476,14 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
     // (every lifecycle record with ai_agent_id set), NOT the narrower
     // activity-heartbeat signal (data.working_ticket_ids, still used above
     // for the badge's own "N working" count). Marcus only ever holds a
-    // claim while the ticket sits in Ready or In Progress and releases it
+    // claim while the ticket sits in In Progress and releases it
     // immediately on any other column move, so this stays lit for the
     // ticket's whole claimed lifetime and clears within one poll of the
     // claim actually being released — whether that happens because the
-    // agent finished, or because the card was dragged elsewhere.
+    // agent finished, or because the card was dragged elsewhere. Filtered
+    // to state === "in_progress" defensively here too, in case a claim
+    // is ever observed outside that column for a moment (a Marcus-side
+    // invariant, not something this display should just trust blindly).
     var claimedTicketIds = Object.create(null);
 
     // (Re)paint the golden ring onto exactly the claimed cards and strip it
@@ -534,11 +538,14 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
                         + active + '</strong> working<br>'
                         + (rows.length ? rows.join('<br>') : 'No claimed tickets.');
                 }
-                // Rebuild the claimed set from data.agents (every ticket
-                // with an active claim) and repaint the golden rings.
+                // Rebuild the claimed set from data.agents, restricted to
+                // tickets actually in In Progress right now, and repaint
+                // the golden rings.
                 claimedTicketIds = Object.create(null);
                 agents.forEach(function (a) {
-                    claimedTicketIds[String(a.ticket_id)] = true;
+                    if (a.state === 'in_progress') {
+                        claimedTicketIds[String(a.ticket_id)] = true;
+                    }
                 });
                 applyAgentBorders();
             })
