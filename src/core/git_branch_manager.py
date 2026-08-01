@@ -372,7 +372,7 @@ class BranchManager:
         branch_name: str,
         *,
         commit_message: Optional[str] = None,
-        delete_after: bool = True,
+        delete_after: bool = False,
     ) -> bool:
         """Merge *branch_name* into the main branch.
 
@@ -390,7 +390,11 @@ class BranchManager:
         commit_message : Optional[str]
             Merge commit message.  Defaults to a templated message.
         delete_after : bool
-            Delete the branch after a successful merge.  Default ``True``.
+            Delete the branch after a successful merge.  Default ``False``
+            — Marcus's own callers never opt into this, so a ticket's
+            branch history survives past Done (useful for later inspection
+            or a manual reopen) instead of vanishing the moment the card
+            is merged.
 
         Returns
         -------

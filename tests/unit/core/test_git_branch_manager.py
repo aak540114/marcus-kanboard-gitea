@@ -80,6 +80,26 @@ class TestMergeToMainAbortsOnFailure:
         assert ok is True
         assert ("merge", "--abort") not in _calls(mgr._git)
 
+    @pytest.mark.asyncio
+    async def test_successful_merge_keeps_the_branch_by_default(self):
+        """A completed ticket's branch must survive the merge unless a
+        caller explicitly opts into deletion. Marcus's own callers
+        (_merge_ticket_to_main and the AI-gate auto-merge path) never pass
+        delete_after, so the branch history for a Done ticket stays
+        available (e.g. for later inspection or a manual reopen) instead
+        of vanishing the moment the card crosses into Done."""
+        mgr = _mgr()
+        mgr._git = AsyncMock(return_value=(0, "", ""))
+
+        ok = await mgr.merge_to_main("ticket/kanboard/7")
+
+        assert ok is True
+        calls = _calls(mgr._git)
+        assert ("branch", "-d", "ticket/kanboard/7") not in calls
+        assert not any(
+            c[0] == "push" and "--delete" in c for c in calls
+        )
+
 
 class TestMergeFetchesAgentBranch:
     """merge_to_main must merge the AGENT's pushed commits, not the stale
