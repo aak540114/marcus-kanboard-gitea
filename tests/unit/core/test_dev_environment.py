@@ -1286,7 +1286,7 @@ class TestEntrypointResilience:
     def test_marks_app_dir_git_safe(self) -> None:
         """/src and /app are both marked safe git directories before checkout."""
         cmd = self._mgr()._build_entrypoint(
-            "b", install_cmd="", start_cmd="busybox httpd -f -p 3000 -h /app",
+            "b", install_cmd="", start_cmd="httpd -f -p 3000 -h /app",
             use_hm_reload=False,
         )
         assert "safe.directory /src" in cmd
@@ -1296,7 +1296,7 @@ class TestEntrypointResilience:
         """The entrypoint clones the read-only /src into a container-local
         /app, so the preview never mutates the shared source repo."""
         cmd = self._mgr()._build_entrypoint(
-            "b", install_cmd="", start_cmd="busybox httpd -f -p 3000 -h /app",
+            "b", install_cmd="", start_cmd="httpd -f -p 3000 -h /app",
             use_hm_reload=False,
         )
         assert "git clone /src /app" in cmd
@@ -1308,7 +1308,7 @@ class TestEntrypointResilience:
         re-pointed at the Gitea URL, which is unreachable from the preview
         container's default-bridge network. refresh() fetches from /src."""
         cmd = self._mgr()._build_entrypoint(
-            "b", install_cmd="", start_cmd="busybox httpd -f -p 3000 -h /app",
+            "b", install_cmd="", start_cmd="httpd -f -p 3000 -h /app",
             use_hm_reload=False,
         )
         assert "remote set-url origin" not in cmd
@@ -1321,35 +1321,47 @@ class TestEntrypointResilience:
             "b", install_cmd="npm install",
             start_cmd="npm run dev -- --port 3000", use_hm_reload=True,
         )
-        assert "npm run dev -- --port 3000; busybox httpd" in cmd
+        assert "npm run dev -- --port 3000; httpd" in cmd
 
     def test_checkout_falls_back_to_origin_tracking_branch(self) -> None:
         """A branch that exists only on origin is checked out as a new
         tracking branch when a plain checkout can't find it locally."""
         cmd = self._mgr()._build_entrypoint(
-            "feature/x", install_cmd="", start_cmd="busybox httpd -f -p 3000 -h /app",
+            "feature/x", install_cmd="", start_cmd="httpd -f -p 3000 -h /app",
             use_hm_reload=False,
         )
         assert "git checkout feature/x" in cmd
         assert "git checkout -b feature/x origin/feature/x" in cmd
 
     def test_static_fallback_present_for_hm_stack(self) -> None:
-        """HMR stacks fall back to the zero-install busybox httpd server."""
+        """HMR stacks fall back to the busybox-extras httpd server."""
         cmd = self._mgr()._build_entrypoint(
             "b", install_cmd="npm install",
             start_cmd="npm run dev -- --port 3000", use_hm_reload=True,
         )
-        assert "busybox httpd" in cmd
+        assert "httpd -f -p 3000 -h /app" in cmd
         assert "npm run dev" in cmd
 
     def test_static_fallback_present_for_non_hm_stack(self) -> None:
-        """Non-HMR stacks also fall back to busybox httpd on failure."""
+        """Non-HMR stacks also fall back to the httpd server on failure."""
         cmd = self._mgr()._build_entrypoint(
             "b", install_cmd="",
             start_cmd="flask run --host 0.0.0.0 --port 3000", use_hm_reload=False,
         )
-        assert "busybox httpd" in cmd
+        assert "httpd -f -p 3000 -h /app" in cmd
         assert "flask run" in cmd
+
+    def test_fallback_invoked_without_busybox_prefix(self) -> None:
+        """busybox-extras installs httpd as its OWN standalone binary, not
+        as an applet of the base /bin/busybox multi-call binary — invoking
+        it as "busybox httpd" fails with "httpd: applet not found" even
+        with busybox-extras installed (observed live, twice: first with no
+        busybox-extras at all, then again after installing it — only
+        dropping the "busybox" prefix actually started the server)."""
+        cmd = self._mgr()._build_entrypoint(
+            "b", install_cmd="", start_cmd="npm run dev", use_hm_reload=True,
+        )
+        assert "busybox httpd" not in cmd
 
     def test_fallback_needs_no_language_runtime(self) -> None:
         """The fallback server is BusyBox (always in alpine), not python —
@@ -1360,8 +1372,8 @@ class TestEntrypointResilience:
         assert "python3 -m http.server" not in cmd
 
     def test_static_fallback_package_is_installed(self) -> None:
-        """busybox httpd needs busybox-extras — alpine:3.20's base busybox
-        package does not include the httpd applet, so a container falling
+        """httpd needs busybox-extras — alpine:3.20's base busybox package
+        does not include the httpd applet at all, so a container falling
         back to it fails with "httpd: applet not found" and never answers
         the port at all (observed live: a project whose real dev command
         failed left the preview completely unreachable, instead of

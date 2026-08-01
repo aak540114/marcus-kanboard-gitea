@@ -110,16 +110,21 @@ _APP_PORT = 3000
 #: Last-resort fallback server, run whenever a project's real dev command
 #: exits (wrong/missing script, crash, etc.) — see :meth:`_build_entrypoint`.
 #: ``alpine:3.20``'s BASE ``busybox`` package does NOT include the ``httpd``
-#: applet (confirmed live: a container falling back to this command failed
-#: with ``httpd: applet not found``, leaving the preview completely
-#: unreachable instead of degrading to a static file server as designed) —
-#: it ships only in the separate ``busybox-extras`` package, which
-#: :data:`_BASE_APK` installs unconditionally for exactly this reason. It
-#: serves the checked-out branch's files (the container's ``/app`` working
-#: directory) as a static website — perfect for the common case of letting
-#: a human open a browser and *see* what an agent built, and as the
-#: last-resort fallback when a project's real dev command can't start.
-_STATIC_FALLBACK = f"busybox httpd -f -p {_APP_PORT} -h /app"
+#: applet at all (confirmed live: a container falling back to
+#: ``busybox httpd`` failed with ``httpd: applet not found``, leaving the
+#: preview completely unreachable instead of degrading to a static file
+#: server as designed). ``busybox-extras`` (installed unconditionally by
+#: :data:`_BASE_APK` for exactly this reason) provides it — but as its OWN
+#: standalone ``/usr/bin/httpd`` binary, not as an applet added to the
+#: original ``/bin/busybox`` multi-call binary (confirmed live a second
+#: time: with busybox-extras installed, ``busybox httpd`` *still* failed
+#: with the same "applet not found" — only invoking ``httpd`` directly,
+#: without the ``busybox`` prefix, actually runs it). It serves the
+#: checked-out branch's files (the container's ``/app`` working directory)
+#: as a static website — perfect for the common case of letting a human
+#: open a browser and *see* what an agent built, and as the last-resort
+#: fallback when a project's real dev command can't start.
+_STATIC_FALLBACK = f"httpd -f -p {_APP_PORT} -h /app"
 
 # ---------------------------------------------------------------------------
 # Fallback stack table — used when no ProjectStack is supplied and
@@ -175,7 +180,7 @@ _FALLBACK_STACKS: Dict[str, Dict[str, Any]] = {
                        "hm":      False,
                        "apk":     ["php"]},
     "static":         {"install": "",
-                       "start":   "busybox httpd -f -p 3000 -h /app",
+                       "start":   "httpd -f -p 3000 -h /app",
                        "hm":      False,
                        "apk":     []},
 }
