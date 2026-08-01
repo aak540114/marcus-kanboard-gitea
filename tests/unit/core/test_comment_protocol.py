@@ -187,6 +187,19 @@ class TestCommentFormatter:
         assert "ticket/jira/t-10" in body
         assert "main" in body
 
+    def test_merge_conflict_names_branch_and_main_and_says_ready(self):
+        """merge_conflict names the branch/main and says the ticket is
+        going back to an AI agent via Ready, not to a human."""
+        body = CommentFormatter.merge_conflict(
+            ticket_id="T-13",
+            branch_name="ticket/jira/t-13",
+            main_branch="main",
+        )
+        assert "ticket/jira/t-13" in body
+        assert "main" in body
+        assert "Ready" in body
+        assert "rebase" in body.lower()
+
     def test_error_shows_error_summary(self):
         """error comment includes the error summary."""
         body = CommentFormatter.error(
@@ -394,3 +407,10 @@ class TestCommentParser:
         parsed = CommentParser.parse(body)
         assert parsed is not None
         assert parsed.comment_type == CommentType.ERROR
+
+    def test_parse_merge_conflict_comment(self):
+        """parse() identifies merge_conflict comments distinctly from ERROR."""
+        body = CommentFormatter.merge_conflict("T-14", "ticket/jira/t-14")
+        parsed = CommentParser.parse(body)
+        assert parsed is not None
+        assert parsed.comment_type == CommentType.MERGE_CONFLICT

@@ -212,13 +212,18 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
     white-space: nowrap;
 }
 
-/* ── Actively-worked ticket highlight ─────────────────────────────────── */
-/* A golden ring marks the cards an AI agent is working RIGHT NOW — driven by
-   Marcus's activity heartbeat (the agent reported progress in the last ~40s),
-   NOT by ticket state, so a card stuck in the wrong column can't wrongly show
-   or hide it. Rendered as a box-shadow ring rather than a real `border` so it
-   doesn't shift the card's layout or fight Kanboard's own category-colored
-   left border, and respects the card's rounded corners. */
+/* ── Claimed ticket highlight ─────────────────────────────────────────── */
+/* A golden ring marks every card an AI agent currently holds a CLAIM on —
+   driven by Marcus's lifecycle record (ai_agent_id set), not an activity
+   heartbeat, so it stays lit for the whole time a ticket is claimed, not
+   just while the agent is actively reporting progress. Marcus only ever
+   holds a claim while a ticket sits in Ready or In Progress (see the claim
+   invariant in HumanGatedWorkflow._on_status_changed) and releases it the
+   moment the card leaves either column — whether moved by a human or by
+   Marcus itself — so the ring disappears on the next poll below. Rendered
+   as a box-shadow ring rather than a real `border` so it doesn't shift the
+   card's layout or fight Kanboard's own category-colored left border, and
+   respects the card's rounded corners. */
 .task-board.marcus-ai-active {
     border-color: #f5b301 !important;
     /* The ring itself comes from the animation below. A CSS animation
@@ -466,15 +471,18 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
     var label   = document.getElementById('marcus-agent-label');
     var tooltip = document.getElementById('marcus-agent-tooltip');
 
-    // Ticket ids an AI agent is working RIGHT NOW — from Marcus's liveness
-    // signal (working_ticket_ids: tickets an agent has reported progress on in
-    // the last ~40s), NOT from ticket state/column. That keeps the golden ring
-    // a true "an agent is actively working this" indicator even if a state bug
-    // leaves a card stuck in a column. The ring clears when the agent stops
-    // reporting (finished, handed off, blocked, or went silent).
-    var activeTicketIds = Object.create(null);
+    // Ticket ids an AI agent currently holds a CLAIM on — from data.agents
+    // (every lifecycle record with ai_agent_id set), NOT the narrower
+    // activity-heartbeat signal (data.working_ticket_ids, still used above
+    // for the badge's own "N working" count). Marcus only ever holds a
+    // claim while the ticket sits in Ready or In Progress and releases it
+    // immediately on any other column move, so this stays lit for the
+    // ticket's whole claimed lifetime and clears within one poll of the
+    // claim actually being released — whether that happens because the
+    // agent finished, or because the card was dragged elsewhere.
+    var claimedTicketIds = Object.create(null);
 
-    // (Re)paint the golden ring onto exactly the active cards and strip it
+    // (Re)paint the golden ring onto exactly the claimed cards and strip it
     // from every other card. Idempotent — safe to call after each poll AND
     // whenever Kanboard redraws the board (its own auto-refresh replaces the
     // card DOM, which would otherwise drop our class). Marcus ticket ids are
@@ -483,7 +491,7 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
         var cards = document.querySelectorAll('.task-board[data-task-id]');
         for (var i = 0; i < cards.length; i++) {
             var id = String(cards[i].getAttribute('data-task-id'));
-            if (activeTicketIds[id]) {
+            if (claimedTicketIds[id]) {
                 cards[i].classList.add('marcus-ai-active');
             } else {
                 cards[i].classList.remove('marcus-ai-active');
@@ -526,11 +534,11 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
                         + active + '</strong> working<br>'
                         + (rows.length ? rows.join('<br>') : 'No claimed tickets.');
                 }
-                // Rebuild the active set from Marcus's activity-based liveness
-                // signal (not ticket state) and repaint the golden rings.
-                activeTicketIds = Object.create(null);
-                (data.working_ticket_ids || []).forEach(function (id) {
-                    activeTicketIds[String(id)] = true;
+                // Rebuild the claimed set from data.agents (every ticket
+                // with an active claim) and repaint the golden rings.
+                claimedTicketIds = Object.create(null);
+                agents.forEach(function (a) {
+                    claimedTicketIds[String(a.ticket_id)] = true;
                 });
                 applyAgentBorders();
             })

@@ -350,6 +350,37 @@ class TestMergeFailureClearsCounter:
         assert result is False
         assert "42" not in workflow._ticket_verify_rounds
 
+    @pytest.mark.asyncio
+    async def test_merge_failure_sends_ticket_back_for_rebase_not_a_human(
+        self, workflow
+    ):
+        """A failed auto-merge must not leak the slot: the ticket goes back
+        to READY/unclaimed (or is immediately re-picked-up under an
+        internal, worker-adoptable slot) for an AI agent to rebase, and
+        the posted comment asks for a rebase, not human intervention.
+        Mirrors the equivalent fix in _merge_ticket_to_main.
+        """
+        workflow._gate.set_project_gate(1, "ai")
+        workflow._gate.set_project_verify_count(1, 1)
+        workflow._verifier.verify = AsyncMock(return_value=_pass_result())
+        workflow._branch.merge_to_main = AsyncMock(return_value=False)
+
+        record = _make_record()
+        workflow._lifecycle.get_or_create("42", "kanboard")
+        workflow._lifecycle._records[("42", "kanboard")] = record
+
+        result = await workflow._autocomplete_ticket("42", record)
+
+        assert result is False
+        rec = workflow._lifecycle.get("42", "kanboard")
+        assert rec.state in (TicketState.READY, TicketState.IN_PROGRESS)
+        assert rec.ai_agent_id is None or str(rec.ai_agent_id).startswith("marcus-")
+        workflow._kanban.move_task_to_column.assert_any_call("42", "ready")
+        posted_bodies = [
+            c.args[-1] for c in workflow._kanban.add_comment.call_args_list
+        ]
+        assert any("rebase" in body.lower() for body in posted_bodies)
+
 
 class TestVerifierErrorFailsOpen:
     """An exception from the LLM verifier must not leave the ticket stuck."""

@@ -890,6 +890,34 @@ class TestClaimReleaseGaps:
         assert rec.ai_agent_id is None
 
     @pytest.mark.asyncio
+    async def test_blocked_move_releases_claim(self, workflow, lifecycle):
+        """Human drags an AI-claimed card to 'blocked' → claim released.
+
+        Unlike the todo-reset path, nothing in the BLOCKED branch of
+        _on_status_changed used to call release_ticket at all — the claim
+        stayed held with no later event ever able to free it (the same
+        one-ticket-per-agent deadlock risk as the todo-reset gap above).
+        Covered generically now: a claim survives ONLY in Ready/In
+        Progress, released on a move to anything else.
+        """
+        lifecycle.get_or_create("53", "kanboard")
+        lifecycle.transition("53", "kanboard", TicketState.READY)
+        lifecycle.transition("53", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.set_assignee("53", "kanboard", "alice")
+        lifecycle.claim_ticket("53", "kanboard", workflow._agent_id)
+
+        event = _make_event(
+            {"ticket_id": "53", "new_status": "blocked",
+             "old_status": "in_progress", "provider": "kanboard"}
+        )
+        await workflow._on_status_changed(event)
+
+        rec = lifecycle.get("53", "kanboard")
+        assert rec is not None
+        assert rec.state == TicketState.BLOCKED
+        assert rec.ai_agent_id is None
+
+    @pytest.mark.asyncio
     async def test_todo_reset_unblocks_other_tickets(
         self, workflow, lifecycle, mock_kanban
     ):
@@ -2641,13 +2669,23 @@ class TestReviewFixes:
         assert lifecycle.get("50", "kanboard").ai_agent_id is None
 
     @pytest.mark.asyncio
-    async def test_merge_failure_frees_slot_and_parks_waiting(
+    async def test_merge_failure_sends_ticket_back_to_ai_for_rebase(
         self, workflow, lifecycle, mock_kanban, mock_branch
     ):
-        """A failed merge parks the ticket in WFH and releases the slot.
+        """A failed merge parks the ticket in READY (not a human), posts a
+        rebase-needed comment, and moves the kanban card to "ready" — so
+        an AI agent picks it up to rebase and resolve the conflict itself.
 
-        The old behavior left it IN_PROGRESS and claimed forever — a
-        permanent slot leak (deadlock at cap=1).
+        _park_in_ready_for_rebase frees the slot and puts the ticket back
+        in _next_worker_ticket's candidate pool (READY/IN_PROGRESS), so
+        the _pickup_next_ticket() call right after synchronously reclaims
+        THIS same ticket under a fresh internal "marcus-" slot — a
+        worker-adoptable claim, not a real one (see _next_worker_ticket's
+        _held_by_worker check) — rather than leaving it idle until the
+        next poll. The old behavior left it IN_PROGRESS and claimed by
+        the ORIGINAL slot forever — a permanent slot leak (deadlock at
+        cap=1) — this proves that leak is gone: the ticket is workable
+        again, not stuck.
         """
         mock_branch.merge_to_main = AsyncMock(return_value=False)
         lifecycle.get_or_create("60", "kanboard")
@@ -2660,9 +2698,15 @@ class TestReviewFixes:
         await workflow._on_ticket_closed(event)
 
         rec = lifecycle.get("60", "kanboard")
-        assert rec.state == TicketState.WAITING_FOR_HUMAN
-        assert rec.ai_agent_id is None  # slot freed
-        mock_kanban.move_task_to_column.assert_any_call("60", "waiting for human")
+        assert rec.state in (TicketState.READY, TicketState.IN_PROGRESS)
+        # Not stuck under the ORIGINAL claim — either unclaimed, or
+        # re-claimed by an internal (worker-adoptable) slot.
+        assert rec.ai_agent_id is None or str(rec.ai_agent_id).startswith("marcus-")
+        assert rec.assignee == "alice"  # still assigned — worker-eligible
+        mock_kanban.move_task_to_column.assert_any_call("60", "ready")
+        # The comment tells the AI agent what to do, not a human.
+        posted_bodies = [c.args[-1] for c in mock_kanban.add_comment.call_args_list]
+        assert any("rebase" in body.lower() for body in posted_bodies)
 
     @pytest.mark.asyncio
     async def test_duplicate_signal_ready_does_not_repost_comment(
@@ -3267,6 +3311,55 @@ class TestDecomposition:
         mock_kanban.move_task_to_column.assert_any_await("202", "ready")
 
     @pytest.mark.asyncio
+    async def test_decompose_creates_a_subtask_entry_per_child(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Each child also gets a native Kanboard Subtask on the PARENT —
+        a separate, dedicated "Subtasks" section distinct from the
+        functional "is blocked by" link asserted above. The title embeds
+        the child's id as a prefix so _maybe_complete_parent can find and
+        update the right entry later without storing a subtask id."""
+        self._big_ticket(lifecycle)
+        mock_kanban.create_subtask = AsyncMock(return_value="90")
+
+        async def fake_llm(prompt):
+            return (
+                '{"subtasks": [{"title": "Backend", "description": "api", '
+                '"acceptance_criteria": "- [ ] api"}, {"title": "Frontend", '
+                '"description": "ui", "acceptance_criteria": "- [ ] ui"}]}'
+            )
+        workflow._llm_generate = fake_llm
+
+        created = {"n": 200}
+
+        async def fake_create(data):
+            created["n"] += 1
+            t = MagicMock()
+            t.id = str(created["n"])
+            t.name = data["name"]
+            return t
+
+        mock_kanban.create_task = AsyncMock(side_effect=fake_create)
+        mock_kanban.create_task_link = AsyncMock(return_value=True)
+        parent = MagicMock(description="do a lot")
+        parent.name = "Big"
+        parent.source_context = {"kanboard_task": {"project_id": 3}}
+        mock_kanban.get_task_by_id = AsyncMock(return_value=parent)
+
+        children = await workflow.decompose_ticket("100")
+
+        assert children == ["201", "202"]
+        subtask_titles = [
+            call.args[1] for call in mock_kanban.create_subtask.await_args_list
+        ]
+        assert subtask_titles == ["#201 Backend", "#202 Frontend"]
+        # Created ON the parent (args[0]), not on the child itself.
+        assert all(
+            call.args[0] == "100"
+            for call in mock_kanban.create_subtask.await_args_list
+        )
+
+    @pytest.mark.asyncio
     async def test_child_move_to_ready_failure_is_logged(
         self, workflow, lifecycle, mock_kanban, caplog
     ):
@@ -3457,7 +3550,9 @@ class TestDependencyGate:
 
 
 class TestParentAutoComplete:
-    """A parent completes automatically once all its sub-tickets are Done."""
+    """A parent goes to Waiting for Human once all its sub-tickets are
+    Done — never straight to Done automatically, since a human should
+    review the completed work first."""
 
     def _child(self, lifecycle, tid, parent):
         lifecycle.get_or_create(
@@ -3466,9 +3561,10 @@ class TestParentAutoComplete:
         )
 
     @pytest.mark.asyncio
-    async def test_parent_completes_when_all_children_done(
+    async def test_parent_awaits_review_when_all_children_done(
         self, workflow, lifecycle, mock_kanban
     ):
+        """All children Done → parent goes to Waiting for Human, not Done."""
         lifecycle.get_or_create("200", "kanboard")  # parent
         lifecycle.human_transition("200", "kanboard", TicketState.BLOCKED)
         self._child(lifecycle, "201", "200")
@@ -3481,7 +3577,10 @@ class TestParentAutoComplete:
 
         await workflow._maybe_complete_parent("202")
 
-        assert lifecycle.get("200", "kanboard").state == TicketState.DONE
+        rec = lifecycle.get("200", "kanboard")
+        assert rec.state == TicketState.WAITING_FOR_HUMAN
+        assert rec.ai_agent_id is None
+        mock_kanban.move_task_to_column.assert_any_call("200", "waiting for human")
 
     @pytest.mark.asyncio
     async def test_parent_not_completed_while_a_child_pending(
@@ -3501,6 +3600,73 @@ class TestParentAutoComplete:
         await workflow._maybe_complete_parent("211")
 
         assert lifecycle.get("210", "kanboard").state == TicketState.BLOCKED
+
+    @pytest.mark.asyncio
+    async def test_finished_child_syncs_its_own_subtask_entry_immediately(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """A single child finishing marks ITS subtask entry done right
+        away — not only once every sibling is also done — so the parent's
+        Subtasks section reflects real progress as it happens."""
+        mock_kanban.mark_subtask_done = AsyncMock(return_value=True)
+        lifecycle.get_or_create("215", "kanboard")  # parent
+        lifecycle.human_transition("215", "kanboard", TicketState.BLOCKED)
+        self._child(lifecycle, "216", "215")
+        self._child(lifecycle, "217", "215")
+        lifecycle.transition("216", "kanboard", TicketState.READY)
+        lifecycle.transition("216", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("216", "kanboard", TicketState.DONE)
+        # #217 still in progress — parent must not complete yet.
+        lifecycle.transition("217", "kanboard", TicketState.READY)
+        lifecycle.transition("217", "kanboard", TicketState.IN_PROGRESS)
+
+        await workflow._maybe_complete_parent("216")
+
+        mock_kanban.mark_subtask_done.assert_awaited_once_with("215", "#216 ")
+        assert lifecycle.get("215", "kanboard").state == TicketState.BLOCKED
+
+    @pytest.mark.asyncio
+    async def test_human_closing_reviewed_parent_marks_it_done(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """A human dragging the reviewed parent to Done completes it
+        directly — no git merge is attempted (the parent has no branch)."""
+        lifecycle.get_or_create("220", "kanboard")  # parent
+        lifecycle.human_transition("220", "kanboard", TicketState.BLOCKED)
+        self._child(lifecycle, "221", "220")
+        for c in ("221",):
+            lifecycle.transition(c, "kanboard", TicketState.READY)
+            lifecycle.transition(c, "kanboard", TicketState.IN_PROGRESS)
+            lifecycle.transition(c, "kanboard", TicketState.DONE)
+        await workflow._maybe_complete_parent("221")
+        assert lifecycle.get("220", "kanboard").state == TicketState.WAITING_FOR_HUMAN
+
+        event = _make_event({"ticket_id": "220", "provider": "kanboard"})
+        await workflow._on_ticket_closed(event)
+
+        rec = lifecycle.get("220", "kanboard")
+        assert rec.state == TicketState.DONE
+        mock_kanban.move_task_to_column.assert_any_call("220", "done")
+
+    @pytest.mark.asyncio
+    async def test_closing_parent_never_attempts_a_merge(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """A parent ticket has no branch — closing it must not call
+        merge_to_main at all (which would fail and wrongly trigger the
+        merge-conflict rebase-recovery flow meant for real branches)."""
+        lifecycle.get_or_create("230", "kanboard")  # parent
+        lifecycle.human_transition("230", "kanboard", TicketState.BLOCKED)
+        self._child(lifecycle, "231", "230")
+        lifecycle.transition("231", "kanboard", TicketState.READY)
+        lifecycle.transition("231", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("231", "kanboard", TicketState.DONE)
+        await workflow._maybe_complete_parent("231")
+
+        event = _make_event({"ticket_id": "230", "provider": "kanboard"})
+        await workflow._on_ticket_closed(event)
+
+        mock_branch.merge_to_main.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_on_ticket_new_does_not_clobber_subticket_marker(

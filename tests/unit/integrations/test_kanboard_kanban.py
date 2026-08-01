@@ -1781,6 +1781,99 @@ class TestDownloadAttachment:
 
 
 # ---------------------------------------------------------------------------
+# create_subtask / mark_subtask_done tests
+# ---------------------------------------------------------------------------
+
+
+class TestCreateSubtask:
+    """Test create_subtask()."""
+
+    @pytest.mark.asyncio
+    async def test_raises_if_not_connected(self, kanban):
+        """create_subtask() raises RuntimeError when client is None."""
+        with pytest.raises(RuntimeError, match="connect()"):
+            await kanban.create_subtask("10", "#11 Do the thing")
+
+    @pytest.mark.asyncio
+    async def test_returns_new_subtask_id(self, kanban):
+        """A successful createSubtask call returns its id as a string."""
+        kanban._client = AsyncMock()
+        kanban._rpc = AsyncMock(return_value=42)
+
+        result = await kanban.create_subtask("10", "#11 Do the thing")
+
+        assert result == "42"
+        kanban._rpc.assert_awaited_once_with(
+            "createSubtask", task_id=10, title="#11 Do the thing"
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_failure(self, kanban):
+        """A falsy createSubtask response yields None, not a crash."""
+        kanban._client = AsyncMock()
+        kanban._rpc = AsyncMock(return_value=False)
+
+        result = await kanban.create_subtask("10", "#11 Do the thing")
+
+        assert result is None
+
+
+class TestMarkSubtaskDone:
+    """Test mark_subtask_done()."""
+
+    @pytest.mark.asyncio
+    async def test_raises_if_not_connected(self, kanban):
+        """mark_subtask_done() raises RuntimeError when client is None."""
+        with pytest.raises(RuntimeError, match="connect()"):
+            await kanban.mark_subtask_done("10", "#11 ")
+
+    @pytest.mark.asyncio
+    async def test_marks_matching_subtask_done(self, kanban):
+        """The subtask whose title starts with the prefix is set to done
+        (status=2) via updateSubtask, keyed by its own id."""
+        kanban._client = AsyncMock()
+
+        async def fake_rpc(method, **params):
+            if method == "getAllSubtasks":
+                return [
+                    {"id": 5, "title": "#9 Some other child"},
+                    {"id": 6, "title": "#11 Do the thing"},
+                ]
+            if method == "updateSubtask":
+                return True
+            return None
+
+        kanban._rpc = AsyncMock(side_effect=fake_rpc)
+
+        result = await kanban.mark_subtask_done("10", "#11 ")
+
+        assert result is True
+        update_call = [
+            c for c in kanban._rpc.call_args_list if c.args[0] == "updateSubtask"
+        ][0]
+        assert update_call.kwargs == {"id": 6, "task_id": 10, "status": 2}
+
+    @pytest.mark.asyncio
+    async def test_no_matching_subtask_returns_false(self, kanban):
+        """No subtask matches the prefix → False, no updateSubtask call."""
+        kanban._client = AsyncMock()
+
+        async def fake_rpc(method, **params):
+            if method == "getAllSubtasks":
+                return [{"id": 5, "title": "#9 Some other child"}]
+            return None
+
+        kanban._rpc = AsyncMock(side_effect=fake_rpc)
+
+        result = await kanban.mark_subtask_done("10", "#11 ")
+
+        assert result is False
+        assert all(
+            c.args[0] != "updateSubtask" for c in kanban._rpc.call_args_list
+        )
+
+
+# ---------------------------------------------------------------------------
 # assign_task tests
 # ---------------------------------------------------------------------------
 

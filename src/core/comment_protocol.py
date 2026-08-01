@@ -85,6 +85,7 @@ _TITLE_TYPE_MAP = (
     ("Ready for Review", "ready_for_review"),
     ("Dev Environment", "dev_env_started"),
     ("Merged to", "merged"),
+    ("Merge Conflict", "merge_conflict"),
     ("PASSED", "verification_round_passed"),
     ("Round", "verification_round_failed"),
     ("Issues Found", "verification_failed"),
@@ -116,6 +117,9 @@ class CommentType(Enum):
         Hot-reload dev environment is available.
     MERGED : str
         Branch was merged to main.
+    MERGE_CONFLICT : str
+        Merge to main failed; the ticket is going back to an AI agent to
+        rebase and resolve conflicts (not to a human).
     ERROR : str
         An error occurred; needs human attention.
     VERIFICATION_FAILED : str
@@ -133,6 +137,7 @@ class CommentType(Enum):
     READY_FOR_REVIEW = "ready_for_review"
     DEV_ENV_STARTED = "dev_env_started"
     MERGED = "merged"
+    MERGE_CONFLICT = "merge_conflict"
     ERROR = "error"
     VERIFICATION_FAILED = "verification_failed"
     VERIFICATION_ROUND_PASSED = "verification_round_passed"
@@ -513,6 +518,48 @@ class CommentFormatter:
             f"This ticket is complete.\n\n"
             f"If you reopen the ticket, Marcus will rebase the branch on the "
             f"latest `{main_branch}` and continue with the new requirements."
+            f"{_FOOTER}"
+        )
+        return body
+
+    @classmethod
+    def merge_conflict(
+        cls,
+        ticket_id: str,
+        branch_name: str,
+        main_branch: str = "main",
+    ) -> str:
+        """Comment posted when merging the ticket branch to main fails.
+
+        Unlike :meth:`error`, this does not ask a human to intervene — the
+        ticket is going straight back to an AI agent (moved to the Ready
+        column) to rebase the branch and resolve the conflict itself, the
+        same as any other implementation detail.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Ticket identifier.
+        branch_name : str
+            Branch that failed to merge.
+        main_branch : str
+            The integration branch (default ``"main"``).
+
+        Returns
+        -------
+        str
+            Full comment body.
+        """
+        body = (
+            f"{cls._header(CommentType.MERGE_CONFLICT, ticket_id)}\n"
+            f"### Marcus Agent — Merge Conflict\n\n"
+            f"Merging `{branch_name}` into `{main_branch}` failed — `{main_branch}` "
+            f"has moved on and now conflicts with this branch.\n\n"
+            f"**Next step:** rebase `{branch_name}` on the latest `{main_branch}`, "
+            f"resolve the conflicting changes, and push. This ticket has been "
+            f"moved back to Ready for an AI agent to pick up and do that.\n\n"
+            f"Once the conflicts are resolved and the branch is pushed, this "
+            f"will go through review again before merging."
             f"{_FOOTER}"
         )
         return body

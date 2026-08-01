@@ -496,6 +496,73 @@ class KanboardKanban(KanbanInterface):
         )
         return bool(result)
 
+    #: Kanboard's SubtaskModel status constants (v1.2.53 app/Model/
+    #: SubtaskModel.php) — 0=todo, 1=in progress, 2=done.
+    _SUBTASK_STATUS_DONE = 2
+
+    async def create_subtask(self, task_id: str, title: str) -> Optional[str]:
+        """Create a native Kanboard subtask on *task_id*.
+
+        Subtasks render in Kanboard's own built-in "Subtasks" section on
+        the task's detail view — a distinct UI element from "Internal
+        Links" (``create_task_link``). Used to give a decomposed parent
+        ticket a clear, dedicated list of its children, separate from the
+        functional dependency link Marcus's own gating logic relies on.
+
+        Parameters
+        ----------
+        task_id : str
+            The task to attach the subtask to (the parent ticket).
+        title : str
+            Subtask title.
+
+        Returns
+        -------
+        Optional[str]
+            The new subtask's id, or ``None`` on failure.
+        """
+        if self._client is None:
+            raise RuntimeError("Call connect() before create_subtask()")
+        result = await self._rpc(
+            "createSubtask", task_id=int(task_id), title=title
+        )
+        return str(result) if result else None
+
+    async def mark_subtask_done(self, task_id: str, title_prefix: str) -> bool:
+        """Mark done the subtask on *task_id* whose title starts with
+        *title_prefix*, matching the id embedded by :meth:`create_subtask`.
+
+        No-op (returns ``False``) if no matching subtask is found — a
+        missing subtask (e.g. created before this feature existed, or the
+        earlier ``createSubtask`` call failed) must never block completing
+        the actual ticket it mirrors.
+
+        Parameters
+        ----------
+        task_id : str
+            The task the subtask lives on (the parent ticket).
+        title_prefix : str
+            Prefix identifying which subtask to update.
+
+        Returns
+        -------
+        bool
+            ``True`` if a matching subtask was found and updated.
+        """
+        if self._client is None:
+            raise RuntimeError("Call connect() before mark_subtask_done()")
+        subtasks = await self._rpc("getAllSubtasks", task_id=int(task_id))
+        for st in subtasks or []:
+            if str(st.get("title", "")).startswith(title_prefix):
+                await self._rpc(
+                    "updateSubtask",
+                    id=int(st["id"]),
+                    task_id=int(task_id),
+                    status=self._SUBTASK_STATUS_DONE,
+                )
+                return True
+        return False
+
     async def update_task(
         self, task_id: str, updates: Dict[str, Any]
     ) -> Optional[Task]:

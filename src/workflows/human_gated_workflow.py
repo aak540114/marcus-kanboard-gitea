@@ -625,6 +625,21 @@ class HumanGatedWorkflow:
         * ``done`` → drive :meth:`_on_ticket_closed` (merge to main). A
           Done-column move is a column move, not a Kanboard task-close, so
           the merge must be triggered here too.
+
+        Claim invariant
+        ----------------
+        An AI agent may hold a claim on a ticket ONLY while it sits in the
+        Ready or In Progress column — those are the only two columns
+        "an agent is (or is about to be) actively working this" is true
+        for. Every move to any other column (Todo, Blocked, Waiting for
+        Human, Done, or a custom one) releases the claim here, before any
+        other branch below runs — regardless of whether the move was made
+        by a human or by Marcus itself (this handler fires the same way
+        either way: from BoardWatcher's poll diff or the Kanboard webhook).
+        This is a backstop as much as a rule: most individual branches
+        below already release the claim for their own reason (todo reset,
+        done/merge, review-signal into waiting_for_human) — BLOCKED was
+        the one gap, left claimed with no later event to release it.
         """
         data = event.data
         ticket_id = data["ticket_id"]
@@ -633,6 +648,15 @@ class HumanGatedWorkflow:
         record = self._lifecycle.get(ticket_id, self._provider)
         if record is None:
             record = self._lifecycle.get_or_create(ticket_id, self._provider)
+
+        if (
+            new_status not in (TaskStatus.READY.value, TaskStatus.IN_PROGRESS.value)
+            and record.ai_agent_id is not None
+        ):
+            try:
+                self._lifecycle.release_ticket(ticket_id, self._provider)
+            except KeyError:
+                pass
 
         # Block human attempts to set the AI-only state.
         if new_status == TaskStatus.WAITING_FOR_HUMAN.value:
@@ -789,6 +813,14 @@ class HumanGatedWorkflow:
         if record is None:
             return
 
+        # A decomposed parent ticket is a tracking shell with no branch of
+        # its own to merge — its children did the real work. Complete it
+        # directly rather than falling into the merge path below, which
+        # would attempt a git merge on a branch that doesn't exist.
+        if self._children_of(ticket_id):
+            await self._complete_parent_ticket(ticket_id, record)
+            return
+
         # Human closed a ticket that AI never actually started (no branch to
         # merge). Under the parallel-agent cap an assigned ticket can sit in
         # READY (or TODO) waiting for a free slot; if the human then drags it
@@ -920,27 +952,30 @@ class HumanGatedWorkflow:
             await self._pickup_next_ticket()
             return True
         else:
-            await self._post_error(
-                ticket_id,
-                f"Merge of `{branch_name}` to `{main_branch}` failed — "
-                "there may be conflicts.  Please merge manually or rebase the branch.",
+            comment = CommentFormatter.merge_conflict(
+                ticket_id=ticket_id,
+                branch_name=branch_name,
+                main_branch=main_branch,
             )
-            # Park the ticket in WAITING_FOR_HUMAN and free the slot. The old
-            # behavior left it IN_PROGRESS and *claimed* — permanently leaking
-            # one parallel slot (a full deadlock at cap=1), since no later
-            # event ever released it. Parking removes it from the available
-            # pool (no re-merge loop) and lets a human resolve the conflict.
-            self._park_in_waiting_for_human(
+            await self._post_comment(ticket_id, comment)
+            # Send the ticket back to an AI agent to rebase and resolve the
+            # conflict itself, rather than parking it for a human — this is
+            # an implementation detail like any other (Invariant #2). The
+            # old behavior left it IN_PROGRESS and *claimed* — permanently
+            # leaking one parallel slot (a full deadlock at cap=1), since no
+            # later event ever released it. Parking in READY removes it
+            # from that trap AND keeps it in the available pool so the next
+            # poll picks it straight back up (no re-merge loop, since the
+            # merge itself is never retried without new commits).
+            self._park_in_ready_for_rebase(
                 ticket_id,
-                reason="Merge to main failed; awaiting human conflict resolution",
+                reason="Merge to main failed; branch needs rebase and conflict resolution",
             )
             try:
-                await self._kanban.move_task_to_column(
-                    ticket_id, "waiting for human"
-                )
+                await self._kanban.move_task_to_column(ticket_id, "ready")
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
-                    "Could not move %s to waiting-for-human after merge fail: %s",
+                    "Could not move %s to ready after merge fail: %s",
                     ticket_id,
                     exc,
                 )
@@ -1460,6 +1495,7 @@ class HumanGatedWorkflow:
             return []
 
         link = getattr(self._kanban, "create_task_link", None)
+        create_subtask = getattr(self._kanban, "create_subtask", None)
         owner = record.assignee if self._is_human_owner(record.assignee) else None
         child_ids: List[str] = []
         for s in subs:
@@ -1578,6 +1614,17 @@ class HumanGatedWorkflow:
                     await link(ticket_id, child_id, 3)
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("Could not link sub-ticket: %s", exc)
+            if create_subtask is not None:
+                try:
+                    # A native Kanboard Subtask on the PARENT, separate from
+                    # the functional dependency link above — gives the
+                    # parent's own task view a dedicated "Subtasks" section
+                    # listing every child clearly. The "#<child_id> " prefix
+                    # lets _maybe_complete_parent find and update the right
+                    # entry later without storing a subtask id anywhere.
+                    await create_subtask(ticket_id, f"#{child_id} {s['title']}")
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Could not create subtask entry: %s", exc)
             child_ids.append(child_id)
 
         if child_ids:
@@ -2735,11 +2782,12 @@ class HumanGatedWorkflow:
         logger.info("Ticket %s blocked on dependencies: %s", ticket_id, blockers)
 
     async def _maybe_complete_parent(self, child_id: str) -> None:
-        """Complete a parent ticket once ALL its sub-tickets are DONE.
-
-        The parent is a tracking shell (no branch of its own to merge), so
-        it is marked DONE directly. Its completion may in turn unblock other
-        tickets that depended on it.
+        """Move a parent ticket to WAITING_FOR_HUMAN once ALL its
+        sub-tickets are DONE — the parent has no branch of its own to
+        merge or verify, so a human reviews the completed children and
+        marks the parent Done themselves (see :meth:`_complete_parent_ticket`,
+        wired into :meth:`_on_ticket_closed`), the same as any other
+        ticket a human closes.
         """
         child = self._lifecycle.get(child_id, self._provider)
         if child is None:
@@ -2747,8 +2795,25 @@ class HumanGatedWorkflow:
         parent_id = self._parent_of(child)
         if parent_id is None:
             return
+
+        if child.state == TicketState.DONE:
+            # Reflect THIS child's completion on the parent's native
+            # Subtasks section right away — not only once every sibling
+            # is also done, so the list fills in as work actually finishes.
+            mark_subtask_done = getattr(self._kanban, "mark_subtask_done", None)
+            if mark_subtask_done is not None:
+                try:
+                    await mark_subtask_done(parent_id, f"#{child_id} ")
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "Could not sync subtask status for %s: %s", child_id, exc
+                    )
+
         parent = self._lifecycle.get(parent_id, self._provider)
-        if parent is None or parent.state == TicketState.DONE:
+        if parent is None or parent.state in (
+            TicketState.DONE,
+            TicketState.WAITING_FOR_HUMAN,
+        ):
             return
         children = self._children_of(parent_id)
         if not children or not all(
@@ -2756,6 +2821,46 @@ class HumanGatedWorkflow:
         ):
             return
 
+        self._park_in_waiting_for_human(
+            parent_id, reason="All sub-tickets complete; awaiting human review"
+        )
+        try:
+            await self._kanban.move_task_to_column(parent_id, "waiting for human")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not move parent %s to waiting-for-human: %s", parent_id, exc
+            )
+        await self._post_comment(
+            parent_id,
+            "✅ **All sub-tickets are complete** — ready for your review. "
+            "Move this ticket to Done once you're satisfied.",
+        )
+        logger.info("Parent %s ready for human review (all children done)", parent_id)
+
+    async def _complete_parent_ticket(
+        self, parent_id: str, record: TicketRecord
+    ) -> None:
+        """Mark a decomposed parent ticket DONE directly.
+
+        A parent is a tracking shell with no branch of its own — its
+        children did the real work — so closing it (a human approving it
+        after :meth:`_maybe_complete_parent` parked it in Waiting for
+        Human, or dragging it straight to Done) must never attempt a git
+        merge: there is nothing to merge, and a failed merge on an empty
+        branch would incorrectly trigger the rebase-recovery flow meant
+        for tickets that actually have conflicting commits. Called from
+        :meth:`_on_ticket_closed` instead of :meth:`_merge_ticket_to_main`
+        whenever the closed ticket has sub-tickets.
+
+        Parameters
+        ----------
+        parent_id : str
+            Parent ticket identifier.
+        record : TicketRecord
+            The parent's current lifecycle record.
+        """
+        if record.state == TicketState.DONE:
+            return
         try:
             self._lifecycle.release_ticket(parent_id, self._provider)
         except KeyError:
@@ -2765,7 +2870,7 @@ class HumanGatedWorkflow:
                 parent_id,
                 self._provider,
                 TicketState.DONE,
-                reason="All sub-tickets complete",
+                reason="Parent ticket closed",
             )
         except (InvalidTransitionError, KeyError):
             pass
@@ -2779,9 +2884,10 @@ class HumanGatedWorkflow:
             logger.warning("Could not move parent %s to done: %s", parent_id, exc)
         await self._post_comment(
             parent_id,
-            "✅ **All sub-tickets are complete** — this parent ticket is done.",
+            "✅ **Parent ticket complete** — all sub-tickets are merged and "
+            "this ticket is done.",
         )
-        logger.info("Parent %s auto-completed (all children done)", parent_id)
+        logger.info("Parent %s completed", parent_id)
         await self._resume_tickets_blocked_by(parent_id)
 
     async def _resolve_project_repo_mapping(
@@ -3310,11 +3416,14 @@ class HumanGatedWorkflow:
         """Move a ticket to WAITING_FOR_HUMAN and release its claim.
 
         ``WAITING_FOR_HUMAN`` is only reachable from ``IN_PROGRESS``, so this
-        walks ``TODO → READY → IN_PROGRESS → WAITING_FOR_HUMAN`` as far as the
-        state machine allows. Used to take a ticket out of the *available*
-        pool (``READY``/``IN_PROGRESS``) so it awaits a human without being
+        walks ``TODO → READY → IN_PROGRESS → WAITING_FOR_HUMAN`` (BLOCKED
+        joins the path via IN_PROGRESS too — a decomposed parent whose last
+        child just finished sits in BLOCKED) as far as the state machine
+        allows. Used to take a ticket out of the *available* pool
+        (``READY``/``IN_PROGRESS``) so it awaits a human without being
         re-selected by :meth:`_pickup_next_ticket` in a loop — e.g. a missing
-        project description or a merge conflict. Also frees the agent slot.
+        project description, or all of a parent's sub-tickets completing.
+        Also frees the agent slot.
 
         Parameters
         ----------
@@ -3326,16 +3435,17 @@ class HumanGatedWorkflow:
         next_state = {
             TicketState.TODO: TicketState.READY,
             TicketState.READY: TicketState.IN_PROGRESS,
+            TicketState.BLOCKED: TicketState.IN_PROGRESS,
             TicketState.IN_PROGRESS: TicketState.WAITING_FOR_HUMAN,
         }
-        # At most three hops to climb from TODO to WAITING_FOR_HUMAN.
+        # At most four hops to climb from TODO/BLOCKED to WAITING_FOR_HUMAN.
         for _ in range(len(next_state)):
             cur = self._lifecycle.get(ticket_id, self._provider)
             if cur is None or cur.state == TicketState.WAITING_FOR_HUMAN:
                 break
             target = next_state.get(cur.state)
             if target is None:
-                # BLOCKED / REOPENED / DONE — not on the WFH path. Leaving the
+                # REOPENED / DONE — not on the WFH path. Leaving the
                 # claim released below is enough; these are not "available".
                 break
             try:
@@ -3344,6 +3454,43 @@ class HumanGatedWorkflow:
                 )
             except InvalidTransitionError:
                 break
+        try:
+            self._lifecycle.release_ticket(ticket_id, self._provider)
+        except KeyError:
+            pass
+
+    def _park_in_ready_for_rebase(self, ticket_id: str, reason: str) -> None:
+        """Move a ticket back to READY and release its claim, for a merge
+        conflict the AI agent must resolve itself.
+
+        Unlike :meth:`_park_in_waiting_for_human` (which takes a ticket OUT
+        of the available pool for a human to unblock), this puts it BACK
+        IN: READY + still assigned + unclaimed is exactly what
+        :meth:`_next_worker_ticket` selects from, so the next agent poll
+        picks the ticket straight back up. Forces the state directly to
+        READY via ``human_transition`` — none of IN_PROGRESS,
+        WAITING_FOR_HUMAN, or BLOCKED (the only states a failed merge can
+        be attempted from) have READY as a legal AI-transition target, and
+        this is Marcus correcting the record to match the board move it
+        just made, not a normal AI-initiated step. The branch and its
+        commit history are untouched — :meth:`~src.core.git_branch_manager.
+        BranchManager.create_branch` resumes an existing branch rather than
+        recreating it — so whichever agent picks this up next finds the
+        same branch (and the rebase-needed comment) where it was left.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Ticket identifier.
+        reason : str
+            Reason recorded on the transition.
+        """
+        try:
+            self._lifecycle.human_transition(
+                ticket_id, self._provider, TicketState.READY, reason=reason
+            )
+        except (InvalidTransitionError, KeyError):
+            pass
         try:
             self._lifecycle.release_ticket(ticket_id, self._provider)
         except KeyError:
@@ -4150,11 +4297,29 @@ class HumanGatedWorkflow:
         if not merged:
             # Clean up the verify-round counter so a retry starts fresh.
             self._ticket_verify_rounds.pop(ticket_id, None)
-            await self._post_error(
-                ticket_id,
-                f"Auto-merge of `{branch_name}` to `{main_branch}` failed — "
-                "there may be conflicts.  Please merge manually or rebase the branch.",
+            comment = CommentFormatter.merge_conflict(
+                ticket_id=ticket_id,
+                branch_name=branch_name,
+                main_branch=main_branch,
             )
+            await self._post_comment(ticket_id, comment)
+            # Send the ticket back to an AI agent to rebase and resolve the
+            # conflict itself — see the matching comment in
+            # _merge_ticket_to_main. Without this the ticket stayed
+            # IN_PROGRESS and claimed forever, leaking a parallel slot.
+            self._park_in_ready_for_rebase(
+                ticket_id,
+                reason="Auto-merge to main failed; branch needs rebase and conflict resolution",
+            )
+            try:
+                await self._kanban.move_task_to_column(ticket_id, "ready")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Could not move %s to ready after auto-merge fail: %s",
+                    ticket_id,
+                    exc,
+                )
+            await self._pickup_next_ticket()
             return False
 
         try:
