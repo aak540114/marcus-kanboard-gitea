@@ -3922,6 +3922,128 @@ class TestParentAutoComplete:
         assert workflow._parent_of(rec) == "310"
 
 
+class TestParentAutoCompleteEndToEnd:
+    """Same guarantee as TestParentAutoComplete (all children Done -> parent
+    to Waiting for Human), but driven through the REAL event handlers
+    (_on_ticket_closed) instead of calling _maybe_complete_parent directly,
+    so a bug in the surrounding event plumbing — not just the helper's own
+    logic — would show up here."""
+
+    async def _decompose_with(self, workflow, mock_kanban, lifecycle):
+        """Run a 2-child decompose against a Ready parent owned by alice."""
+        lifecycle.get_or_create("400", "kanboard")
+        lifecycle.transition("400", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("400", "kanboard", "alice")
+        lifecycle.update_acceptance_criteria(
+            "400", "kanboard",
+            "- [ ] a\n- [ ] b\n- [ ] c\n- [ ] d", "hash",
+        )
+
+        async def fake_llm(prompt):
+            return (
+                '{"subtasks": [{"title": "Backend", "description": "api", '
+                '"acceptance_criteria": "- [ ] api"}, {"title": "Frontend", '
+                '"description": "ui", "acceptance_criteria": "- [ ] ui"}]}'
+            )
+
+        workflow._llm_generate = fake_llm
+        created = {"n": 400}
+
+        async def fake_create(data):
+            created["n"] += 1
+            t = MagicMock()
+            t.id = str(created["n"])
+            t.name = data["name"]
+            return t
+
+        mock_kanban.create_task = AsyncMock(side_effect=fake_create)
+        mock_kanban.create_task_link = AsyncMock(return_value=True)
+        mock_kanban.assign_task = AsyncMock(return_value=True)
+        parent = MagicMock(description="do a lot")
+        parent.name = "Big"
+        parent.source_context = {"kanboard_task": {"project_id": 3}}
+        parent.status = "ready"
+        mock_kanban.get_task_by_id = AsyncMock(return_value=parent)
+        return await workflow.decompose_ticket("400")
+
+    @pytest.mark.asyncio
+    async def test_blocked_parent_moves_to_waiting_for_human_via_real_events(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """Decompose a parent, drive both children to Done through the same
+        _on_ticket_closed path a human's "drag card to Done" produces, and
+        confirm the parent's board card is actually moved — not just its
+        internal lifecycle record."""
+        child_ids = await self._decompose_with(workflow, mock_kanban, lifecycle)
+        assert len(child_ids) == 2
+        assert lifecycle.get("400", "kanboard").state == TicketState.BLOCKED
+
+        for cid in child_ids:
+            lifecycle.transition(cid, "kanboard", TicketState.IN_PROGRESS)
+
+        mock_kanban.move_task_to_column.reset_mock()
+
+        # A human drags each child's card to Done. Kanboard fires this as a
+        # column move (ticket.status_changed), NOT a task-close event — so
+        # _on_status_changed, not _on_ticket_closed directly, is the real
+        # entry point (see _on_status_changed's DONE branch).
+        def _done_event(cid):
+            return _make_event(
+                {"ticket_id": cid, "provider": "kanboard", "new_status": "done"}
+            )
+
+        # First child closes: parent has one sub-ticket still open, stays put.
+        await workflow._on_status_changed(_done_event(child_ids[0]))
+        assert lifecycle.get("400", "kanboard").state == TicketState.BLOCKED
+        assert mock_kanban.move_task_to_column.call_args_list[-1].args != (
+            "400",
+            "waiting for human",
+        )
+
+        # Second (last) child closes: parent must now move to WFH — both in
+        # Marcus's own record AND on the board itself.
+        await workflow._on_status_changed(_done_event(child_ids[1]))
+        rec = lifecycle.get("400", "kanboard")
+        assert rec.state == TicketState.WAITING_FOR_HUMAN
+        mock_kanban.move_task_to_column.assert_any_call("400", "waiting for human")
+
+    @pytest.mark.asyncio
+    async def test_parent_wfh_move_failure_is_logged(
+        self, workflow, lifecycle, mock_kanban, caplog
+    ):
+        """If the board has no 'Waiting for Human' column for this project,
+        move_task_to_column returns False (no exception) and the parent's
+        card silently stays in Blocked forever, even though Marcus's own
+        record already says WAITING_FOR_HUMAN — exactly the "children are
+        all done but the card never leaves Blocked" symptom a human sees
+        on the board. That gap must be surfaced at WARNING, not swallowed
+        (matches the same check already done for the parent's earlier move
+        to Blocked in decompose_ticket)."""
+        child_ids = await self._decompose_with(workflow, mock_kanban, lifecycle)
+        for cid in child_ids:
+            lifecycle.transition(cid, "kanboard", TicketState.IN_PROGRESS)
+            lifecycle.transition(cid, "kanboard", TicketState.DONE)
+
+        async def move(ticket_id, column):
+            return not (ticket_id == "400" and column == "waiting for human")
+
+        mock_kanban.move_task_to_column = AsyncMock(side_effect=move)
+
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            await workflow._maybe_complete_parent(child_ids[0])
+            await workflow._maybe_complete_parent(child_ids[1])
+
+        # Internal lifecycle state still reaches WAITING_FOR_HUMAN
+        # regardless of the board-side move outcome.
+        assert lifecycle.get("400", "kanboard").state == TicketState.WAITING_FOR_HUMAN
+        assert any(
+            "400" in r.message and "waiting for human" in r.message.lower()
+            for r in caplog.records
+        )
+
+
 class TestActivityHeartbeat:
     """The board 'actively worked' highlight is driven by a liveness heartbeat
     (agent progress reports), decoupled from ticket state.

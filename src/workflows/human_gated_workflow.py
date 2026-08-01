@@ -2993,11 +2993,30 @@ class HumanGatedWorkflow:
         self._park_in_waiting_for_human(
             parent_id, reason="All sub-tickets complete; awaiting human review"
         )
+        # Check the result: move_task_to_column returns False (no exception)
+        # when the board has no matching column or the task actually lives
+        # in a different Kanboard project than expected — exactly how the
+        # parent's lifecycle record could already say WAITING_FOR_HUMAN
+        # while its board card silently stays in Blocked forever (nothing
+        # re-checks a ticket whose column hasn't changed again). Surface
+        # that at WARNING so it's diagnosable, matching the same check on
+        # the parent's earlier move to Blocked in decompose_ticket.
+        moved = False
         try:
-            await self._kanban.move_task_to_column(parent_id, "waiting for human")
+            moved = await self._kanban.move_task_to_column(
+                parent_id, "waiting for human"
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Could not move parent %s to waiting-for-human: %s", parent_id, exc
+            )
+        if not moved:
+            logger.warning(
+                "Parent %s did NOT move to the 'Waiting for Human' column "
+                "(does this project's board have a column named 'Waiting "
+                "for Human'?). It is WAITING_FOR_HUMAN in Marcus's "
+                "lifecycle regardless.",
+                parent_id,
             )
         await self._post_comment(
             parent_id,
