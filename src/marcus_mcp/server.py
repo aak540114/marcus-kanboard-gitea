@@ -3401,6 +3401,35 @@ def _server_is_shutting_down(server: Any) -> bool:
     return bool(getattr(uv, "should_exit", False) or getattr(uv, "force_exit", False))
 
 
+def _is_internal_agent_slot(agent_id: Optional[str]) -> bool:
+    """Return ``True`` for a ``"marcus-<slot>"`` internal auto-start
+    reservation — a ticket Marcus pre-claimed for itself ahead of any real
+    agent adopting it, not a real, connected AI agent.
+
+    HumanGatedWorkflow's human-gated auto-start can pre-claim several
+    READY+assigned tickets into internal slots (up to its configured
+    parallel-agent capacity) before any agent has actually polled
+    ``marcus_work`` — so with e.g. capacity 3 and one real connected
+    agent, up to 3 tickets can carry a claim while only 1 is genuinely
+    being worked. ``/api/active-agents`` must exclude these from the
+    ``agents`` list it returns: without this, the board's golden-ring
+    highlight and the badge tooltip's per-ticket rows both light up every
+    pre-staged reservation identically to a real agent's ticket, which
+    reads as "N agents working" when only one is.
+
+    Parameters
+    ----------
+    agent_id : Optional[str]
+        The claim's ``ai_agent_id`` value.
+
+    Returns
+    -------
+    bool
+        ``True`` if this is an internal reservation, not a real agent.
+    """
+    return bool(agent_id) and str(agent_id).startswith("marcus-")
+
+
 #: Cap on webhook request bodies (/webhooks/kanboard, /webhooks/gitea).
 #: Both routes are exempt from bearer-token auth — they authenticate via
 #: their own token/HMAC signature instead — and that check only runs
@@ -4882,9 +4911,13 @@ function save() {{
             - ``active_agent_count``: agents ACTIVELY working a claimed ticket
               (progress heartbeat live) — a strict subset of connected.
 
-            ``agents`` lists tickets currently claimed by an agent, each with
-            the working agent's self-reported account ``usage`` (if any), so a
-            ticket can show its agent's subscription usage/limit.
+            ``agents`` lists tickets currently claimed by a REAL agent, each
+            with the working agent's self-reported account ``usage`` (if
+            any), so a ticket can show its agent's subscription usage/limit.
+            Excludes internal ``marcus-<slot>`` auto-start reservations (see
+            :func:`_is_internal_agent_slot`) — those are tickets Marcus
+            pre-claimed for itself ahead of any agent adopting them, not
+            tickets a connected agent is actually working.
 
             Response body
             -------------
@@ -4919,6 +4952,7 @@ function save() {{
                 }
                 for r in lm.all_records()
                 if r.ai_agent_id is not None
+                and not _is_internal_agent_slot(r.ai_agent_id)
             ]
 
             # Presence + usage come from the workflow's in-memory heartbeats
