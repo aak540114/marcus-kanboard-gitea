@@ -81,13 +81,12 @@ class TestMergeToMainAbortsOnFailure:
         assert ("merge", "--abort") not in _calls(mgr._git)
 
     @pytest.mark.asyncio
-    async def test_successful_merge_keeps_the_branch_by_default(self):
-        """A completed ticket's branch must survive the merge unless a
-        caller explicitly opts into deletion. Marcus's own callers
-        (_merge_ticket_to_main and the AI-gate auto-merge path) never pass
-        delete_after, so the branch history for a Done ticket stays
-        available (e.g. for later inspection or a manual reopen) instead
-        of vanishing the moment the card crosses into Done."""
+    async def test_successful_merge_deletes_local_branch_but_keeps_remote(self):
+        """By default, a completed ticket's LOCAL branch is cleaned up —
+        it's just Marcus's own throwaway working copy — but the REMOTE
+        branch must survive: it holds the agent's actual commit history,
+        and Marcus's job is to merge a ticket into main, not manage the
+        user's remote repo housekeeping for them."""
         mgr = _mgr()
         mgr._git = AsyncMock(return_value=(0, "", ""))
 
@@ -95,10 +94,21 @@ class TestMergeToMainAbortsOnFailure:
 
         assert ok is True
         calls = _calls(mgr._git)
-        assert ("branch", "-d", "ticket/kanboard/7") not in calls
+        assert ("branch", "-d", "ticket/kanboard/7") in calls
         assert not any(
             c[0] == "push" and "--delete" in c for c in calls
         )
+
+    @pytest.mark.asyncio
+    async def test_delete_after_false_keeps_the_local_branch_too(self):
+        """delete_after=False opts out of the local cleanup as well."""
+        mgr = _mgr()
+        mgr._git = AsyncMock(return_value=(0, "", ""))
+
+        ok = await mgr.merge_to_main("ticket/kanboard/7", delete_after=False)
+
+        assert ok is True
+        assert ("branch", "-d", "ticket/kanboard/7") not in _calls(mgr._git)
 
 
 class TestMergeFetchesAgentBranch:

@@ -372,7 +372,7 @@ class BranchManager:
         branch_name: str,
         *,
         commit_message: Optional[str] = None,
-        delete_after: bool = False,
+        delete_after: bool = True,
     ) -> bool:
         """Merge *branch_name* into the main branch.
 
@@ -381,7 +381,7 @@ class BranchManager:
         2. Pull latest main from remote.
         3. Merge *branch_name* with a descriptive commit.
         4. Push main.
-        5. Optionally delete the ticket branch locally and remotely.
+        5. Optionally delete the LOCAL copy of the ticket branch.
 
         Parameters
         ----------
@@ -390,11 +390,13 @@ class BranchManager:
         commit_message : Optional[str]
             Merge commit message.  Defaults to a templated message.
         delete_after : bool
-            Delete the branch after a successful merge.  Default ``False``
-            — Marcus's own callers never opt into this, so a ticket's
-            branch history survives past Done (useful for later inspection
-            or a manual reopen) instead of vanishing the moment the card
-            is merged.
+            Delete the LOCAL copy of the branch after a successful merge.
+            Default ``True`` — this clone's local branch is Marcus's own
+            throwaway working copy, safe to clean up. The REMOTE branch is
+            never deleted by this method at all (regardless of this flag):
+            the agent's actual commit history lives there, and Marcus's
+            job is to merge it into main, not manage the user's repo
+            housekeeping for them.
 
         Returns
         -------
@@ -465,7 +467,7 @@ class BranchManager:
         logger.info("Merged %s → %s", branch_name, main)
 
         if delete_after:
-            await self._delete_branch(branch_name)
+            await self._delete_local_branch(branch_name)
 
         return True
 
@@ -628,10 +630,12 @@ class BranchManager:
             )
         return result.returncode, result.stdout, result.stderr
 
-    async def _delete_branch(self, branch_name: str) -> None:
-        """Delete local and remote copies of *branch_name* (best-effort)."""
-        # Local.
+    async def _delete_local_branch(self, branch_name: str) -> None:
+        """Delete the LOCAL copy of *branch_name* only (best-effort).
+
+        The remote copy is deliberately left alone — it holds the agent's
+        actual commit history, and Marcus merges tickets into main, it
+        doesn't manage the user's remote repo housekeeping for them.
+        """
         await self._git("branch", "-d", branch_name)
-        # Remote.
-        await self._git("push", self.config.remote, "--delete", branch_name)
-        logger.info("Deleted branch %s (local + remote)", branch_name)
+        logger.info("Deleted local branch %s (remote branch preserved)", branch_name)
