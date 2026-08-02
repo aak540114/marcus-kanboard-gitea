@@ -3274,6 +3274,49 @@ class HumanGatedWorkflow:
 
         return repo_path
 
+    async def sync_main_branch_for_project(
+        self, kanboard_project_id: int
+    ) -> Optional[str]:
+        """Pull a project's main branch from the remote into Marcus's local clone.
+
+        The project_id-keyed analog of :meth:`_sync_branch_for_ticket`, for
+        the project-level "main branch preview" — the caller already knows
+        the project (there's no ticket to resolve one from), so this skips
+        straight to :meth:`_resolve_project_repo_mapping` instead of first
+        looking up a ticket's kanboard project id.
+
+        Best-effort, same as :meth:`_sync_branch_for_ticket`: a failed sync
+        is logged, never raised — the caller proceeds regardless (a stale
+        preview is better than none).
+
+        Parameters
+        ----------
+        kanboard_project_id : int
+            The project whose main branch should be synced.
+
+        Returns
+        -------
+        Optional[str]
+            The resolved local repo path (or ``None``), so the caller
+            (the main-branch preview route) doesn't redo the project→repo
+            lookup, which can trigger on-demand repo provisioning.
+        """
+        mapping = await self._resolve_project_repo_mapping(kanboard_project_id)
+        repo_path = mapping.get("local_repo_path") if mapping else None
+
+        try:
+            branch_mgr = self._branch_for_repo_path(repo_path)
+            main_branch = getattr(branch_mgr.config, "main_branch", "main")
+            await branch_mgr.sync_branch(main_branch)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not sync main branch for project %d: %s",
+                kanboard_project_id,
+                exc,
+            )
+
+        return repo_path
+
     async def start_dev_environment(self, ticket_id: str) -> Optional[str]:
         """Spin up the hot-reload dev environment for a ticket branch.
 

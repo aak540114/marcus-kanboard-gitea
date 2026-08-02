@@ -282,6 +282,39 @@ class ProjectSyncWorkflow:
         """
         return self._mapping.get(f"kanboard:{kanboard_project_id}")
 
+    def get_project_id_for_repo_name(self, repo_name: str) -> Optional[int]:
+        """Reverse-lookup: Gitea repo name/slug -> kanboard_project_id.
+
+        Used by the Gitea webhook receiver to resolve which project's
+        main branch was pushed to, so a same-named "main" branch across
+        different projects' repos doesn't cross-refresh the wrong
+        project's preview — unlike ticket branches, whose
+        ``ticket/<provider>/<id>`` names are globally unique, "main" is
+        not.
+
+        Iterates :meth:`all_mappings` — no persisted reverse index; the
+        mapping file is small (one entry per project), so a linear scan
+        on each webhook delivery is cheap and avoids a second on-disk
+        index to keep in sync.
+
+        Parameters
+        ----------
+        repo_name : str
+            The Gitea repo's name/slug, e.g. from a push webhook
+            payload's ``repository.name`` field.
+
+        Returns
+        -------
+        Optional[int]
+            The mapped Kanboard project id, or ``None`` if no mapping
+            matches.
+        """
+        for mapping in self._mapping.values():
+            if mapping.get("repo_slug") == repo_name:
+                pid = mapping.get("kanboard_project_id")
+                return int(pid) if pid is not None else None
+        return None
+
     def all_mappings(self) -> Dict[str, Dict[str, Any]]:
         """Return all project → repo mappings.
 

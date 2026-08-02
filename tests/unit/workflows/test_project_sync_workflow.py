@@ -348,6 +348,40 @@ class TestGetRepoForProject:
         assert workflow.get_repo_for_project(1)["gitea_repo_url"] != "mutated"
 
 
+class TestGetProjectIdForRepoName:
+    """Reverse lookup used by the Gitea webhook receiver to route a push
+    to a project's main branch to the correct project's preview — unlike
+    ticket branches (globally unique ticket/<provider>/<id> names), a
+    branch literally named "main" is not unique across projects, so
+    resolving repo -> project explicitly is required to avoid refreshing
+    the wrong project's preview."""
+
+    @pytest.mark.asyncio
+    async def test_matches_by_repo_slug(self, workflow):
+        await workflow._on_project_created(_make_event(1, "Shopping Cart"))
+        assert workflow.get_project_id_for_repo_name("shopping-cart") == 1
+
+    def test_returns_none_when_no_match(self, workflow):
+        assert workflow.get_project_id_for_repo_name("nonexistent-repo") is None
+
+    def test_returns_none_on_empty_mapping_table(self, workflow):
+        assert workflow.all_mappings() == {}
+        assert workflow.get_project_id_for_repo_name("anything") is None
+
+    @pytest.mark.asyncio
+    async def test_distinguishes_between_multiple_projects(self, workflow, gitea_mgr):
+        gitea_mgr.create_repo = AsyncMock(
+            side_effect=[
+                "http://localhost:3000/root/shopping-cart.git",
+                "http://localhost:3000/root/inventory.git",
+            ]
+        )
+        await workflow._on_project_created(_make_event(1, "Shopping Cart"))
+        await workflow._on_project_created(_make_event(2, "Inventory"))
+        assert workflow.get_project_id_for_repo_name("shopping-cart") == 1
+        assert workflow.get_project_id_for_repo_name("inventory") == 2
+
+
 class TestLoadMapping:
     def test_loads_existing_mapping_from_disk(self, tmp_path, gitea_mgr):
         repos_path = tmp_path / "project_repos.json"

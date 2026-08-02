@@ -56,3 +56,41 @@ class TestDevEnvStartingPage:
         assert "MAX_WAIT_MS" in page
         # On timeout it offers a direct link to the preview URL, not only retry.
         assert "Open preview" in page
+
+    def test_default_label_matches_previous_ticket_wording(self) -> None:
+        """No label given -> unchanged from before the label kwarg existed,
+        a regression guard for the ticket preview page's existing wording."""
+        page = _dev_env_starting_page("7", "kanboard", "http://localhost:9123")
+        assert "Building preview — ticket 7" in page
+        assert "Building preview for ticket 7…" in page
+
+    def test_custom_label_overrides_title_text(self) -> None:
+        """A custom label replaces "ticket <id>" in both <title> and <h1>,
+        for surfaces that aren't a ticket at all (e.g. a project's main
+        branch preview)."""
+        page = _dev_env_starting_page(
+            "main-7", "kanboard", "http://localhost:9123",
+            label="project 7 (main branch)",
+        )
+        assert "Building preview — project 7 (main branch)" in page
+        assert "Building preview for project 7 (main branch)…" in page
+        assert "ticket main-7" not in page
+
+    def test_custom_label_does_not_change_status_poll_url(self) -> None:
+        """The label is purely cosmetic — the poll still targets ticket_id
+        and provider exactly as passed in."""
+        page = _dev_env_starting_page(
+            "main-7", "kanboard", "http://localhost:9123", label="project 7",
+        )
+        assert json.dumps("main-7") in page
+        assert "/api/dev-env/status" in page
+
+    def test_label_is_html_escaped(self) -> None:
+        """A label is untrusted the same way a ticket id is — must never
+        render as raw markup."""
+        page = _dev_env_starting_page(
+            "main-7", "kanboard", "http://localhost:9123",
+            label="<script>evil()</script>",
+        )
+        assert "<script>evil()</script></h1>" not in page
+        assert "&lt;script&gt;evil()&lt;/script&gt;" in page

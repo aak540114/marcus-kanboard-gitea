@@ -2025,6 +2025,62 @@ class TestStartDevEnvironmentResolvesRepoPath:
 
 
 # ---------------------------------------------------------------------------
+# sync_main_branch_for_project: pulls a project's main branch into Marcus's
+# local clone, for the project-level "main branch preview" feature — the
+# project_id-keyed analog of _sync_branch_for_ticket, used when there's no
+# ticket to resolve a project from (the caller already has the project_id).
+# ---------------------------------------------------------------------------
+
+
+class TestSyncMainBranchForProject:
+    @pytest.mark.asyncio
+    async def test_no_project_sync_uses_injected_branch_manager(
+        self, workflow, mock_branch
+    ):
+        """No project_sync configured on the base `workflow` fixture →
+        _branch_for_repo_path(None) returns the injected mock_branch (same
+        as _sync_branch_for_ticket's equivalent no-project-sync case), and
+        the sync still runs against it."""
+        repo_path = await workflow.sync_main_branch_for_project(7)
+
+        mock_branch.sync_branch.assert_awaited_once_with(
+            mock_branch.config.main_branch
+        )
+        assert repo_path is None
+
+    @pytest.mark.asyncio
+    async def test_syncs_via_resolved_project_mapping(self, workflow):
+        """A resolvable project mapping's repo_path is used to build a
+        per-repo BranchManager (a real one, distinct from the injected
+        default — same as _branch_for_repo_path's own behavior for any
+        truthy repo_path), and the resolved path is returned to the caller
+        so it doesn't have to redo the project->repo lookup."""
+        workflow._project_sync = MagicMock()
+        workflow._project_sync.get_repo_for_project = MagicMock(
+            return_value={"local_repo_path": "./data/repos/shopping-cart"}
+        )
+
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.sync_branch",
+            new_callable=AsyncMock,
+        ) as sync_branch:
+            repo_path = await workflow.sync_main_branch_for_project(7)
+
+        assert repo_path == "./data/repos/shopping-cart"
+        sync_branch.assert_awaited_once_with("main")
+
+    @pytest.mark.asyncio
+    async def test_sync_branch_exception_is_swallowed(self, workflow, mock_branch):
+        """A failed sync must not raise — a stale preview is better than a
+        crashed route."""
+        mock_branch.sync_branch = AsyncMock(side_effect=RuntimeError("git fetch failed"))
+
+        repo_path = await workflow.sync_main_branch_for_project(7)
+
+        assert repo_path is None  # base workflow fixture has no configured repo_path
+
+
+# ---------------------------------------------------------------------------
 # get_project_description
 # ---------------------------------------------------------------------------
 

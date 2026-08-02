@@ -3716,7 +3716,9 @@ async def _resolve_ticket_repo_path(
     return mapping.get("local_repo_path") if mapping else None
 
 
-def _dev_env_starting_page(ticket_id: str, provider: str, url: str) -> str:
+def _dev_env_starting_page(
+    ticket_id: str, provider: str, url: str, *, label: Optional[str] = None
+) -> str:
     """Build the interim "building preview" HTML page for ``/dev-env/view``.
 
     A dev-environment container starts asynchronously: ``docker run -d``
@@ -3738,6 +3740,15 @@ def _dev_env_starting_page(ticket_id: str, provider: str, url: str) -> str:
         Kanban provider name (also pre-validated by the caller).
     url : str
         The final preview URL to redirect to once the app is serving.
+    label : Optional[str]
+        Human-readable display label for the title/h1 text (e.g.
+        ``"project 7 (main branch)"``). Defaults to ``f"ticket
+        {ticket_id}"`` to preserve the existing per-ticket wording
+        exactly. Only affects display text — the polling logic still
+        targets ``/api/dev-env/status?ticket_id=<ticket_id>&provider=
+        <provider>`` unconditionally, which is already fully generic and
+        needs no change to support a synthetic ``main-<project_id>``
+        ticket_id.
 
     Returns
     -------
@@ -3750,13 +3761,14 @@ def _dev_env_starting_page(ticket_id: str, provider: str, url: str) -> str:
     ticket_js = json.dumps(ticket_id)
     provider_js = json.dumps(provider)
     url_js = json.dumps(url)
-    ticket_html = html.escape(ticket_id)
+    display_label = label if label is not None else f"ticket {ticket_id}"
+    display_html = html.escape(display_label)
     return f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Building preview — ticket {ticket_html}</title>
+<title>Building preview — {display_html}</title>
 <style>
   :root {{ color-scheme: light dark; }}
   body {{ font-family: system-ui, -apple-system, sans-serif; margin: 0;
@@ -3780,7 +3792,7 @@ def _dev_env_starting_page(ticket_id: str, provider: str, url: str) -> str:
 <body>
 <div class="card">
   <div class="spinner" id="spin"></div>
-  <h1 id="title">Building preview for ticket {ticket_html}…</h1>
+  <h1 id="title">Building preview for {display_html}…</h1>
   <p id="detail">Installing dependencies and starting the app. This can take
      up to a minute the first time.</p>
   <p><span id="elapsed">0</span>s elapsed</p>
@@ -4336,8 +4348,32 @@ if __name__ == "__main__":
                     if handler is not None:
                         await handler(branch_name, commit_messages)
 
+                async def _resolve_project_id_for_repo(
+                    repo_name: str,
+                ) -> Optional[int]:
+                    project_sync = getattr(server, "_project_sync", None)
+                    if project_sync is None:
+                        return None
+                    pid = project_sync.get_project_id_for_repo_name(repo_name)
+                    return int(pid) if pid is not None else None
+
+                # Resolve main_branch from the configured BranchManager if
+                # available, else fall back to the global default "main" —
+                # same lookup dev_env_main_view uses for the same reason.
+                main_branch_name = "main"
+                hgw_for_webhook = getattr(server, "_human_gated_workflow", None)
+                branch_cfg = getattr(
+                    getattr(hgw_for_webhook, "_branch", None), "config", None
+                )
+                if branch_cfg is not None:
+                    main_branch_name = getattr(branch_cfg, "main_branch", "main")
+
                 receiver = GiteaWebhookReceiver(
-                    dev_env_manager=dev_mgr, on_commits=_announce_commits
+                    dev_env_manager=dev_mgr,
+                    on_commits=_announce_commits,
+                    resolve_project_id=_resolve_project_id_for_repo,
+                    provider=server.provider,
+                    main_branch=main_branch_name,
                 )
                 server._gitea_webhook_receiver = receiver  # type: ignore[attr-defined]
 
@@ -4889,6 +4925,234 @@ function save() {{
                 get_logs = getattr(dev_mgr, "get_last_logs", None)
                 if get_logs is not None:
                     last_logs = get_logs(ticket_id, provider)
+            response = JSONResponse(
+                {
+                    "running": info is not None,
+                    "serving": serving,
+                    "url": info.url if info else None,
+                    "command": last_command,
+                    "logs": last_logs,
+                }
+            )
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            return response
+
+        async def dev_env_main_view(request: Request) -> Response:
+            """
+            Start (or look up) the hot-reload preview of a project's MAIN
+            branch and redirect the browser to it — the project-level
+            counterpart to ``/dev-env/view``'s per-ticket preview.
+
+            Query params:
+                project_id  (required)
+                provider    (optional, default 'kanboard')
+
+            Uses the synthetic ``DevEnvironmentManager`` identity
+            ``f"main-{project_id}"`` (same provider) so the existing
+            manager, entirely opaque about what a "ticket_id" means, needs
+            no changes to serve a non-ticket branch.
+            """
+            project_id_str = request.query_params.get("project_id", "")
+            provider = request.query_params.get("provider", server.provider)
+
+            if not project_id_str:
+                return HTMLResponse(
+                    "<h1>Missing project_id</h1>"
+                    "<p>Add <code>?project_id=&lt;id&gt;</code> to the URL.</p>",
+                    status_code=400,
+                )
+
+            # Same command-injection concern as dev_env_view: project_id and
+            # provider flow into a synthetic ticket_id used in `docker run`/
+            # `sh -c` calls inside DevEnvironmentManager.
+            _SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+            if not _SAFE_ID_RE.match(project_id_str) or not _SAFE_ID_RE.match(provider):
+                return HTMLResponse(
+                    "<h1>Invalid project_id or provider</h1>"
+                    "<p>Only letters, digits, dots, hyphens, and underscores are allowed.</p>",
+                    status_code=400,
+                )
+            try:
+                project_id = int(project_id_str)
+            except ValueError:
+                return HTMLResponse("<h1>Invalid project_id</h1>", status_code=400)
+
+            synthetic_id = f"main-{project_id}"
+
+            try:
+                from src.core.dev_environment import DevEnvironmentManager
+                from src.core.project_description import ProjectDescriptionManager
+
+                dev_mgr = getattr(server, "_dev_env_manager", None)
+                if dev_mgr is None:
+                    dev_mgr = DevEnvironmentManager(
+                        settings_manager=_get_dev_env_settings_mgr(server)
+                    )
+                    server._dev_env_manager = dev_mgr  # type: ignore[attr-defined]
+
+                # ── Resolve tech stack from project description (identical
+                #    to dev_env_view's stack resolution) ──────────────────
+                project_stack = None
+                desc_mgr = getattr(server, "_project_desc_mgr", None)
+                if desc_mgr is None:
+                    desc_mgr = ProjectDescriptionManager()
+                    server._project_desc_mgr = desc_mgr  # type: ignore[attr-defined]
+                project_stack = desc_mgr.get_stack(project_id)
+                if project_stack is None:
+                    desc_url = f"/project-description?project_id={project_id}"
+                    return HTMLResponse(
+                        f"<h1>Project description needed</h1>"
+                        f"<p>Marcus could not determine the tech stack for this project. "
+                        f"Please fill in the <strong>Tech Stack</strong> section of the "
+                        f'<a href="{desc_url}">Project Description</a> '
+                        f"and try again.</p>",
+                        status_code=400,
+                    )
+
+                # ── repo_path via the same helper dev_env_view uses. Its
+                #    name says "ticket" but it is entirely project_id-driven
+                #    already — no ticket to resolve one from here. ────────
+                repo_path = await _resolve_ticket_repo_path(server, project_id_str)
+
+                # ── Sync main from Gitea into Marcus's local clone before
+                #    start (deliberate deviation from dev_env_view, which
+                #    does not pre-sync — a ticket's branch is created fresh
+                #    by Marcus itself, while a project's main predates this
+                #    feature entirely and may be stale relative to Gitea
+                #    from before any webhook wiring existed for it). ─────
+                main_branch_name = "main"
+                hgw = getattr(server, "_human_gated_workflow", None)
+                if hgw is not None:
+                    synced_repo_path = await hgw.sync_main_branch_for_project(
+                        project_id
+                    )
+                    if synced_repo_path:
+                        repo_path = synced_repo_path
+                    branch_cfg = getattr(getattr(hgw, "_branch", None), "config", None)
+                    if branch_cfg is not None:
+                        main_branch_name = getattr(branch_cfg, "main_branch", "main")
+
+                info = dev_mgr.get_info(synthetic_id, provider)
+                if info is None:
+                    info = await dev_mgr.start(
+                        ticket_id=synthetic_id,
+                        provider=provider,
+                        branch_name=main_branch_name,
+                        project_stack=project_stack,
+                        repo_path=repo_path,
+                    )
+
+                is_serving = getattr(dev_mgr, "is_serving", None)
+                serving_now = False
+                if info and info.url and is_serving is not None:
+                    serving_now = await asyncio.get_event_loop().run_in_executor(
+                        None, is_serving, synthetic_id, provider
+                    )
+                if serving_now:
+                    return RedirectResponse(info.url, status_code=302)
+
+                if info and info.url:
+                    return HTMLResponse(
+                        _dev_env_starting_page(
+                            synthetic_id,
+                            provider,
+                            info.url,
+                            label=f"project {project_id} (main branch)",
+                        )
+                    )
+
+                return HTMLResponse(
+                    f"<h1>Main-branch preview for project {project_id} is starting…</h1>"
+                    "<p>Refresh in a few seconds.</p>",
+                    status_code=202,
+                )
+            except Exception as exc:
+                logger.error(
+                    "dev_env_main_view error for project %s: %s", project_id_str, exc
+                )
+                return HTMLResponse(
+                    f"<h1>Error starting main-branch preview</h1><pre>{exc}</pre>",
+                    status_code=500,
+                )
+
+        async def dev_env_main_stop(request: Request) -> JSONResponse:
+            """Stop a running main-branch preview and tear down its container.
+
+            Query params:
+                project_id  (required)
+                provider    (optional, default 'kanboard')
+
+            Response body — same shape as ``/dev-env/stop``:
+            ``{"stopped": true}``  — preview was running and is now stopped.
+            ``{"stopped": false}`` — no preview was running for that project.
+            """
+            project_id_str = request.query_params.get("project_id", "")
+            provider = request.query_params.get("provider", server.provider)
+
+            dev_mgr = getattr(server, "_dev_env_manager", None)
+            if not project_id_str or dev_mgr is None:
+                response = JSONResponse({"stopped": False})
+                response.headers["Access-Control-Allow-Origin"] = "*"
+                return response
+
+            try:
+                stopped = await dev_mgr.stop(f"main-{project_id_str}", provider)
+                response = JSONResponse({"stopped": stopped})
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "dev_env_main_stop error for project %s: %s", project_id_str, exc
+                )
+                response = JSONResponse({"stopped": False, "error": str(exc)}, status_code=500)
+
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            return response
+
+        async def dev_env_main_status(request: Request) -> JSONResponse:
+            """Return whether a main-branch preview is running for a project.
+
+            Query params:
+                project_id  (required)
+                provider    (optional, default 'kanboard')
+
+            Response body — same shape as ``/api/dev-env/status``:
+            ``{"running": true, "serving": true, "url": "http://localhost:9234",
+               "command": ..., "logs": ...}``
+            """
+            project_id_str = request.query_params.get("project_id", "")
+            provider = request.query_params.get("provider", server.provider)
+            ticket_id = f"main-{project_id_str}" if project_id_str else ""
+
+            dev_mgr = getattr(server, "_dev_env_manager", None)
+            if dev_mgr and ticket_id:
+                prune = getattr(dev_mgr, "prune_if_dead", None)
+                if prune is not None:
+                    try:
+                        await prune(ticket_id, provider)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Main preview liveness check failed: %s", exc)
+
+            info = dev_mgr.get_info(ticket_id, provider) if dev_mgr and ticket_id else None
+            serving = False
+            if info is not None:
+                is_serving = getattr(dev_mgr, "is_serving", None)
+                if is_serving is not None:
+                    try:
+                        serving = await asyncio.get_event_loop().run_in_executor(
+                            None, is_serving, ticket_id, provider
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Main preview serving check failed: %s", exc)
+
+            last_command = None
+            last_logs = None
+            if dev_mgr and ticket_id:
+                get_cmd = getattr(dev_mgr, "get_last_command", None)
+                if get_cmd is not None:
+                    last_command = get_cmd(ticket_id, provider)
+                get_logs = getattr(dev_mgr, "get_last_logs", None)
+                if get_logs is not None:
+                    last_logs = get_logs(ticket_id, provider)
+
             response = JSONResponse(
                 {
                     "running": info is not None,
@@ -5496,6 +5760,13 @@ function save() {{
                 Route("/dev-env/view", dev_env_view, methods=["GET"]),
                 Route("/dev-env/stop", dev_env_stop, methods=["GET", "POST"]),
                 Route("/api/dev-env/status", dev_env_status, methods=["GET"]),
+                Route("/dev-env/main/view", dev_env_main_view, methods=["GET"]),
+                Route(
+                    "/dev-env/main/stop", dev_env_main_stop, methods=["GET", "POST"]
+                ),
+                Route(
+                    "/api/dev-env/main/status", dev_env_main_status, methods=["GET"]
+                ),
                 Route("/api/active-agents", active_agents, methods=["GET"]),
                 Route("/api/ticket-links", ticket_links, methods=["GET"]),
                 Route("/api/project-repo", project_repo, methods=["GET"]),

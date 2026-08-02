@@ -18,6 +18,14 @@
  *             starting a new one fails until an existing one is stopped.
  *             &#8734; (infinity) means no limit — the default until a
  *             human sets one here.
+ * Section 6 — Main-branch preview Start/Stop buttons. Project-level (not
+ *             per-ticket) — deploys the project's `main` branch instead of
+ *             a ticket's branch, so a human can preview what's currently
+ *             live/merged. Auto-reloads on every push to main (a ticket
+ *             merge or a direct push), same as a ticket preview reloads on
+ *             every push to its own branch. Counts against the same Max
+ *             dev environments limit above (Section 5) — no separate
+ *             reservation.
  *
  * The gate and verify_count settings persist via Marcus /api/gate-setting/project.
  * Default gate is "human"; default verify_count is 0.
@@ -45,6 +53,16 @@ $projectSeenUrl   = $marcusUrl . '/api/project-seen?project_id=' . urlencode((st
                   . ($marcusToken !== '' ? '&token=' . urlencode($marcusToken) : '');
 $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
     . ($marcusToken !== '' ? '?token=' . urlencode($marcusToken) : '');
+$devEnvMainViewUrl = $marcusUrl . '/dev-env/main/view'
+                  . '?project_id=' . urlencode((string) $projectId)
+                  . '&provider='   . urlencode('kanboard')
+                  . ($marcusToken !== '' ? '&token=' . urlencode($marcusToken) : '');
+$devEnvMainStopUrl = $marcusUrl . '/dev-env/main/stop'
+                  . '?project_id=' . urlencode((string) $projectId)
+                  . '&provider='   . urlencode('kanboard');
+$devEnvMainStatusUrl = $marcusUrl . '/api/dev-env/main/status'
+                  . '?project_id=' . urlencode((string) $projectId)
+                  . '&provider='   . urlencode('kanboard');
 ?>
 <style>
 /* ── Active agents badge ──────────────────────────────────────────────── */
@@ -244,6 +262,30 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
         box-shadow: 0 0 0 2px #f5b301, 0 0 9px 2px rgba(245, 179, 1, 0.5) !important;
     }
 }
+
+/* ── Main-branch preview buttons ─────────────────────────────────────── */
+.marcus-main-preview-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 600;
+    text-decoration: none;
+    border: 1px solid;
+    cursor: pointer;
+}
+.marcus-main-preview-btn.start {
+    background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe;
+}
+.marcus-main-preview-btn.open {
+    background: #f0fdf4; color: #15803d; border-color: #bbf7d0;
+}
+.marcus-main-preview-btn.stop {
+    background: #fef2f2; color: #b91c1c; border-color: #fca5a5;
+}
+.marcus-main-preview-btn:disabled { opacity: 0.6; cursor: default; }
 </style>
 
 <div style="padding: 0 16px 2px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
@@ -321,6 +363,11 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
         <span class="marcus-gate-saving" id="marcus-devenv-saving">saving&hellip;</span>
     </div>
 
+    <!-- Project-level main-branch preview (Start/Stop) -->
+    <span id="marcus-main-preview-wrap" style="display:inline-flex;align-items:center;gap:6px;">
+        <span style="font-size:12px;color:#aaa;">Checking main preview&hellip;</span>
+    </span>
+
 </div>
 
 <script>
@@ -332,6 +379,9 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
     var PROJECT_REPO_URL = <?= json_encode($projectRepoUrl) ?>;
     var PROJECT_SEEN_URL = <?= json_encode($projectSeenUrl) ?>;
     var EVENTS_STREAM_URL = <?= json_encode($eventsStreamUrl) ?>;
+    var DEV_ENV_MAIN_VIEW_URL   = <?= json_encode($devEnvMainViewUrl) ?>;
+    var DEV_ENV_MAIN_STOP_URL   = <?= json_encode($devEnvMainStopUrl) ?>;
+    var DEV_ENV_MAIN_STATUS_URL = <?= json_encode($devEnvMainStatusUrl) ?>;
     var PROJECT_ID       = <?= json_encode((int) $projectId) ?>;
     var MARCUS_TOKEN     = <?= json_encode($marcusToken) ?>;
     var INTERVAL         = 15000;
@@ -724,5 +774,57 @@ $eventsStreamUrl  = $marcusUrl . '/api/events/stream'
             devEnvSaving.style.display = 'none';
         });
     };
+
+    /* ── Project-level main-branch preview (Start/Stop) ─────────────────
+       Deploys the project's `main` branch instead of a ticket's branch —
+       distinct from the per-ticket Start/Stop Preview buttons in the task
+       sidebar. Auto-reloads on every push to main via the same Gitea
+       webhook mechanism that refreshes ticket previews; this widget only
+       needs to reflect whether one is currently running. One-shot check
+       on load (no polling loop), matching the task sidebar's own
+       Start/Stop Preview widget — the board already reloads on relevant
+       events via the EventSource block above, which re-runs this check. */
+    (function () {
+        var wrap = document.getElementById('marcus-main-preview-wrap');
+        if (!wrap || !PROJECT_ID) { return; }
+
+        function renderStopped() {
+            wrap.innerHTML =
+                '<a href="' + DEV_ENV_MAIN_VIEW_URL + '" target="_blank" '
+                + 'rel="noopener noreferrer" class="marcus-main-preview-btn start">'
+                + '&#128064; Start Main Preview'
+                + '</a>';
+        }
+
+        function renderRunning(previewUrl) {
+            wrap.innerHTML =
+                '<a href="' + mEsc(previewUrl) + '" target="_blank" '
+                + 'rel="noopener noreferrer" class="marcus-main-preview-btn open">'
+                + '&#127758; Open Main Preview'
+                + '</a>'
+                + '<button class="marcus-main-preview-btn stop" id="marcus-main-stop-btn">'
+                + '&#9632; Stop Main Preview'
+                + '</button>';
+
+            document.getElementById('marcus-main-stop-btn').addEventListener('click', function () {
+                this.disabled = true;
+                this.textContent = 'Stopping…';
+                fetch(DEV_ENV_MAIN_STOP_URL, {
+                    method: 'POST', cache: 'no-store', headers: marcusHeaders(),
+                })
+                    .then(function (r) { return r.json(); })
+                    .then(function () { renderStopped(); })
+                    .catch(function () { renderStopped(); });
+            });
+        }
+
+        fetch(DEV_ENV_MAIN_STATUS_URL, { cache: 'no-store', headers: marcusHeaders() })
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                if (data.running && data.url) { renderRunning(data.url); }
+                else { renderStopped(); }
+            })
+            .catch(function () { renderStopped(); });
+    }());
 }());
 </script>

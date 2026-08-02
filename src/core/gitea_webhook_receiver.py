@@ -65,6 +65,9 @@ class GiteaWebhookReceiver:
         dev_env_manager: Any,
         secret: Optional[str] = None,
         on_commits: Optional[Any] = None,
+        resolve_project_id: Optional[Any] = None,
+        provider: str = "kanboard",
+        main_branch: str = "main",
     ) -> None:
         """Initialise the receiver.
 
@@ -75,11 +78,33 @@ class GiteaWebhookReceiver:
             list[str]) -> Any`` invoked when a ticket branch receives a push
             with commits. Used to post a "commits pushed" progress comment on
             the ticket. Best-effort: an exception here never fails the
-            webhook. ``None`` disables it.
+            webhook. ``None`` disables it. Never invoked for a push to
+            ``main_branch`` — it exists to comment on a specific TICKET,
+            and ``main`` isn't any ticket's branch.
+        resolve_project_id : Optional[Any]
+            Optional async callable ``(repo_name: str) -> Optional[int]``
+            that resolves a pushed Gitea repo's name to its Kanboard
+            project id. Required to act on a push to ``main_branch`` —
+            without it, a main-branch push is accepted but ignored (no way
+            to know which project's preview to refresh). Duck-typed the
+            same way as ``on_commits``, to keep this receiver decoupled
+            from ``ProjectSyncWorkflow`` directly.
+        provider : str
+            Kanban provider name to use when refreshing a main-branch
+            preview (Gitea has no concept of "kanban provider"; Marcus is
+            single-provider per deployment). Defaults to ``"kanboard"``.
+        main_branch : str
+            The branch name treated as a project's "main" branch for the
+            purposes of triggering a main-preview refresh. Defaults to
+            ``"main"``, matching ``BranchManagerConfig.main_branch``'s
+            global default.
         """
         self._dev_env = dev_env_manager
         self._secret = secret or os.getenv("GITEA_WEBHOOK_TOKEN")
         self._on_commits = on_commits
+        self._resolve_project_id = resolve_project_id
+        self._provider = provider
+        self._main_branch = main_branch
 
     async def handle_request(
         self, body: bytes, *, signature: Optional[str] = None
@@ -123,12 +148,19 @@ class GiteaWebhookReceiver:
         branch_name = branch_match.group(1)
 
         ticket_match = _TICKET_BRANCH_RE.match(branch_name)
-        if not ticket_match:
+        is_main = branch_name == self._main_branch
+
+        if not ticket_match and not is_main:
             logger.debug(
-                "Gitea webhook: branch %r doesn't match ticket/<provider>/<id> — ignoring",
+                "Gitea webhook: branch %r doesn't match ticket/<provider>/<id> "
+                "and isn't %r — ignoring",
                 branch_name,
+                self._main_branch,
             )
             return True
+
+        if is_main and not ticket_match:
+            return await self._handle_main_push(repo_name)
 
         # Announce pushed commits on the ticket (best-effort). This is what
         # makes real code progress visible on the board even when the agent
@@ -172,6 +204,83 @@ class GiteaWebhookReceiver:
             logger.debug(
                 "Gitea webhook: no running dev env for branch=%s (repo=%s)",
                 branch_name,
+                repo_name,
+            )
+        return True
+
+    async def _handle_main_push(self, repo_name: str) -> bool:
+        """Handle a push to a project's main branch.
+
+        Resolves the pushed repo to its Kanboard project id via the
+        injected ``resolve_project_id`` callable, then refreshes that
+        project's main-branch preview directly by its synthetic env id
+        (``main-{project_id}``) — NOT via ``refresh_by_branch``, which
+        matches by branch name alone and would be ambiguous across
+        multiple projects that each have a branch literally named
+        ``"main"`` (unlike ticket branches, whose ``ticket/<provider>/<id>``
+        names are globally unique).
+
+        Parameters
+        ----------
+        repo_name : str
+            The pushed repo's name, from the webhook payload's
+            ``repository.name`` field.
+
+        Returns
+        -------
+        bool
+            ``True`` if the delivery was accepted (including a
+            main-branch push for a repo with no resolver configured, no
+            mapped project, or no running main preview — all legitimate
+            no-ops). ``False`` only if resolving the project id or
+            refreshing raised.
+        """
+        if self._resolve_project_id is None:
+            logger.debug(
+                "Gitea webhook: main push for repo=%s but no project "
+                "resolver configured — ignoring",
+                repo_name,
+            )
+            return True
+
+        try:
+            project_id = await self._resolve_project_id(repo_name)
+        except Exception:
+            logger.exception(
+                "Error resolving project id for main push (repo=%s)",
+                repo_name,
+            )
+            return False
+
+        if project_id is None:
+            logger.debug(
+                "Gitea webhook: main push for unmapped repo=%s — ignoring",
+                repo_name,
+            )
+            return True
+
+        try:
+            refreshed = await self._dev_env.refresh(
+                f"main-{project_id}", self._provider
+            )
+        except Exception:
+            logger.exception(
+                "Error refreshing main preview for project=%s (repo=%s)",
+                project_id,
+                repo_name,
+            )
+            return False
+
+        if refreshed:
+            logger.info(
+                "Gitea webhook -> refreshed main preview (project=%s, repo=%s)",
+                project_id,
+                repo_name,
+            )
+        else:
+            logger.debug(
+                "Gitea webhook: no running main preview for project=%s (repo=%s)",
+                project_id,
                 repo_name,
             )
         return True

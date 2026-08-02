@@ -191,6 +191,138 @@ class TestRefreshTriggering:
         )
 
 
+class TestMainBranchPush:
+    """A push to a project's main branch refreshes that project's
+    main-branch preview directly by its synthetic id (main-<project_id>) —
+    NOT via refresh_by_branch, which matches by branch name alone and
+    would be ambiguous across multiple projects that each have a branch
+    literally named "main" (unlike ticket branches, whose
+    ticket/<provider>/<id> names are globally unique)."""
+
+    @pytest.mark.asyncio
+    async def test_main_push_with_resolver_refreshes_by_project_id(
+        self, mock_dev_env
+    ):
+        resolve_project_id = AsyncMock(return_value=7)
+        receiver = GiteaWebhookReceiver(
+            dev_env_manager=mock_dev_env,
+            resolve_project_id=resolve_project_id,
+            provider="kanboard",
+        )
+        body = _push_body("main", repo_name="shopping-cart")
+
+        result = await receiver.handle_request(body)
+
+        assert result is True
+        resolve_project_id.assert_awaited_once_with("shopping-cart")
+        mock_dev_env.refresh.assert_awaited_once_with("main-7", "kanboard")
+        mock_dev_env.refresh_by_branch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_main_push_unresolvable_repo_ignored(self, mock_dev_env):
+        resolve_project_id = AsyncMock(return_value=None)
+        receiver = GiteaWebhookReceiver(
+            dev_env_manager=mock_dev_env, resolve_project_id=resolve_project_id
+        )
+        body = _push_body("main", repo_name="unmapped-repo")
+
+        result = await receiver.handle_request(body)
+
+        assert result is True
+        mock_dev_env.refresh.assert_not_called()
+        mock_dev_env.refresh_by_branch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_main_push_without_resolver_configured_ignored(
+        self, receiver, mock_dev_env
+    ):
+        """Default receiver fixture has no resolver — a main push is
+        accepted as a legitimate no-op, not an error."""
+        body = _push_body("main")
+
+        result = await receiver.handle_request(body)
+
+        assert result is True
+        mock_dev_env.refresh.assert_not_called()
+        mock_dev_env.refresh_by_branch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_main_push_resolver_exception_returns_false(self, mock_dev_env):
+        resolve_project_id = AsyncMock(side_effect=RuntimeError("mapping file locked"))
+        receiver = GiteaWebhookReceiver(
+            dev_env_manager=mock_dev_env, resolve_project_id=resolve_project_id
+        )
+        body = _push_body("main")
+
+        result = await receiver.handle_request(body)
+
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_main_push_refresh_exception_returns_false(self, mock_dev_env):
+        mock_dev_env.refresh = AsyncMock(side_effect=RuntimeError("docker exec failed"))
+        resolve_project_id = AsyncMock(return_value=7)
+        receiver = GiteaWebhookReceiver(
+            dev_env_manager=mock_dev_env, resolve_project_id=resolve_project_id
+        )
+        body = _push_body("main")
+
+        result = await receiver.handle_request(body)
+
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_main_push_does_not_invoke_on_commits(self, mock_dev_env):
+        on_commits = AsyncMock()
+        resolve_project_id = AsyncMock(return_value=7)
+        receiver = GiteaWebhookReceiver(
+            dev_env_manager=mock_dev_env,
+            on_commits=on_commits,
+            resolve_project_id=resolve_project_id,
+        )
+        body = _push_body_with_commits("main", ["merge: ticket/kanboard/5"])
+
+        await receiver.handle_request(body)
+
+        on_commits.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_custom_main_branch_name_respected(self, mock_dev_env):
+        resolve_project_id = AsyncMock(return_value=3)
+        receiver = GiteaWebhookReceiver(
+            dev_env_manager=mock_dev_env,
+            resolve_project_id=resolve_project_id,
+            main_branch="trunk",
+        )
+
+        # Push to the configured main branch ("trunk") triggers the main path.
+        await receiver.handle_request(_push_body("trunk"))
+        mock_dev_env.refresh.assert_awaited_once_with("main-3", "kanboard")
+
+        # Push to "main" (no longer the configured main branch, and not a
+        # ticket branch either) is now ignored.
+        mock_dev_env.refresh.reset_mock()
+        result = await receiver.handle_request(_push_body("main"))
+        assert result is True
+        mock_dev_env.refresh.assert_not_called()
+        mock_dev_env.refresh_by_branch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_returns_true_when_no_main_preview_running(self, mock_dev_env):
+        """A well-formed main-branch push with nothing to refresh is still
+        a successfully processed delivery, not an error — mirrors the
+        equivalent ticket-branch test."""
+        mock_dev_env.refresh = AsyncMock(return_value=False)
+        resolve_project_id = AsyncMock(return_value=7)
+        receiver = GiteaWebhookReceiver(
+            dev_env_manager=mock_dev_env, resolve_project_id=resolve_project_id
+        )
+
+        result = await receiver.handle_request(_push_body("main"))
+
+        assert result is True
+
+
 def _push_body_with_commits(branch: str, messages: list) -> bytes:
     """Gitea push payload carrying commit objects."""
     return json.dumps(
