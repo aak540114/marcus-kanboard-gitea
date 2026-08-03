@@ -97,6 +97,35 @@ services:
       # Docker service name) counts as private. Required for the
       # auto-seeded webhook (see scripts/setup.sh) to actually fire.
       WEBHOOK_ALLOW_PRIVATE_NETWORKS: "true"
+      # SQLite lock-contention hardening. Kanboard stores PHP sessions IN
+      # the same SQLite file it stores tasks in (PicoDb\SessionHandler),
+      # so every human page load/AJAX call writes to it — concurrently
+      # with Marcus's own polling/RPC writes from potentially several AI
+      # agents. Kanboard's PicoDb driver (libs/picodb/lib/PicoDb/
+      # StatementHandler.php) has NO retry-on-lock logic of its own: a
+      # single busy-timeout expiry throws an uncaught PicoDb\SQLException
+      # ("General error: 5 database is locked") that crashes the whole
+      # PHP request. This is a long-standing, never-fully-fixed upstream
+      # limitation (kanboard/kanboard#3845, #4362, #5248 going back to
+      # 2018) rooted in SQLite's single-writer model. These two settings
+      # don't eliminate the possibility, only shrink the contention
+      # window — see README/docker-compose for the fuller mitigation
+      # discussion if it recurs under real load.
+      #   DB_WAL_MODE: Kanboard's own app/constants.php already defaults
+      #   this to true (getenv('DB_WAL_MODE') ?: true), so this is
+      #   belt-and-suspenders — pinned explicitly rather than trusting a
+      #   silent default, matching how Marcus's own SQLite usage
+      #   (src/integrations/providers/sqlite_kanban.py,
+      #   src/cost_tracking/cost_store.py) always sets WAL explicitly too.
+      #   WAL lets human UI reads proceed without blocking on Marcus's
+      #   writes (and vice versa) instead of every access fighting over
+      #   one exclusive file lock.
+      #   DB_TIMEOUT: PDO::ATTR_TIMEOUT, i.e. how long a write waits on a
+      #   busy lock before PicoDb gives up and throws. Kanboard's PicoDb
+      #   Sqlite driver defaults this to 30s; raised to 60s here for more
+      #   headroom under concurrent multi-agent polling.
+      DB_WAL_MODE: "true"
+      DB_TIMEOUT: "60"
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost/healthcheck"]
       interval: 15s
