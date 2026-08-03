@@ -286,9 +286,71 @@ $devEnvMainStatusUrl = $marcusUrl . '/api/dev-env/main/status'
     background: #fef2f2; color: #b91c1c; border-color: #fca5a5;
 }
 .marcus-main-preview-btn:disabled { opacity: 0.6; cursor: default; }
+
+/* ── Controls row ─────────────────────────────────────────────────────
+   Kanboard's own project header (.project-header, in its project.css)
+   lays out the project dropdown, view switcher, and search/filter box
+   with FLOAT, not flexbox — .dropdown-component/.views-switcher-component
+   float left, .filter-box-component floats too. An un-cleared block
+   placed after them (which is what this row was, with only inline
+   styles) only gets pushed down as far as needed to clear whichever
+   float is tallest AT THAT HORIZONTAL POSITION — in practice, wherever
+   the search box happens to end, which reads as "randomly starts below
+   the search input". `clear: both` instead puts this row deterministically
+   on its own new line below the ENTIRE header row every time, flush left.
+   `flex-wrap: nowrap` + a thin horizontal scrollbar (instead of wrapping)
+   keeps every control on one line even on a narrow viewport. */
+#marcus-controls-row {
+    clear: both;
+    padding: 8px 16px 2px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: thin;
+    scrollbar-color: #c7ccd4 transparent;
+}
+#marcus-controls-row::-webkit-scrollbar { height: 6px; }
+#marcus-controls-row::-webkit-scrollbar-track { background: transparent; }
+#marcus-controls-row::-webkit-scrollbar-thumb {
+    background: #c7ccd4;
+    border-radius: 3px;
+}
+#marcus-controls-row::-webkit-scrollbar-thumb:hover { background: #9aa1ac; }
+#marcus-controls-row > * { flex-shrink: 0; }
+
+/* ── Independent per-column scrolling ────────────────────────────────
+   Kanboard renders the whole board as one table, and by default a
+   column with many cards grows the WHOLE PAGE — scrolling down to see
+   the rest of that column scrolls every other column's cards out of
+   view too. Capping each column's own task-list (.board-task-list,
+   Kanboard's own class — one per column per swimlane) to a max-height
+   with its own scrollbar keeps every column independently reachable.
+   The column header is a SEPARATE table row above .board-task-list
+   (see table_column.php vs. table_tasks.php in Kanboard's source), so
+   it naturally stays visible without needing sticky positioning — it
+   was never part of what scrolls. The max-height below is a fallback
+   for when JS is unavailable; applyColumnScrollHeights() (see the
+   <script> block) replaces it with a precisely measured value on load,
+   resize, and every board refresh. */
+.board-task-list {
+    max-height: calc(100vh - 320px);
+    min-height: 60px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: #c7ccd4 transparent;
+}
+.board-task-list::-webkit-scrollbar { width: 6px; }
+.board-task-list::-webkit-scrollbar-track { background: transparent; }
+.board-task-list::-webkit-scrollbar-thumb {
+    background: #c7ccd4;
+    border-radius: 3px;
+}
+.board-task-list::-webkit-scrollbar-thumb:hover { background: #9aa1ac; }
 </style>
 
-<div style="padding: 0 16px 2px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+<div id="marcus-controls-row">
 
     <!-- Project access toggle (master switch) -->
     <button id="marcus-access-toggle" class="marcus-access-toggle off"
@@ -402,6 +464,39 @@ $devEnvMainStatusUrl = $marcusUrl . '/api/dev-env/main/status'
             return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
         });
     }
+
+    /* ── Independent per-column scroll height ───────────────────────────
+       The CSS max-height on .board-task-list (above) is a rough fallback;
+       this replaces it with the ACTUAL room available below each column
+       in the current viewport, so a column's scrollbar starts exactly
+       where the viewport ends rather than a guessed constant — accurate
+       regardless of how tall Marcus's own header rows end up (which
+       varies with viewport width, since #marcus-controls-row can wrap the
+       overall header taller on a narrow screen even though it no longer
+       wraps internally). Re-run on load, on resize, and after every board
+       DOM mutation (Kanboard's own periodic AJAX refresh rebuilds the
+       column markup, which would otherwise drop the inline height) —
+       piggybacks on the MutationObserver already watching the board for
+       the golden-ring feature, so this doesn't need a second observer. */
+    function applyColumnScrollHeights() {
+        var lists = document.querySelectorAll('.board-task-list');
+        var vh = window.innerHeight;
+        for (var i = 0; i < lists.length; i++) {
+            var top = lists[i].getBoundingClientRect().top;
+            var available = vh - top - 16;
+            lists[i].style.maxHeight = Math.max(120, available) + 'px';
+        }
+    }
+    // This <script> tag is rendered INSIDE the header hook, which sits
+    // before the board table in the document (see Kanboard's
+    // board/view_private.php: projectHeader renders first, then
+    // table_container) — .board-task-list doesn't exist in the DOM yet
+    // at the point this synchronous script runs, so an immediate call
+    // here would be a silent no-op. DOMContentLoaded guarantees the full
+    // board table has been parsed first; this script is not deferred/
+    // async, so it always registers before that event can fire.
+    document.addEventListener('DOMContentLoaded', applyColumnScrollHeights);
+    window.addEventListener('resize', applyColumnScrollHeights);
 
     /* ── Project access toggle (master switch) ─────────────────────────
        Whether Marcus/AI agents may work on THIS project's tickets at
@@ -611,8 +706,9 @@ $devEnvMainStatusUrl = $marcusUrl . '/api/dev-env/main/status'
     setInterval(updateAgents, INTERVAL);
 
     // Kanboard periodically re-renders the board (its own AJAX auto-refresh),
-    // which rebuilds the card DOM and would drop our class. Re-apply from the
-    // cached active set whenever the board subtree changes. Debounced so a
+    // which rebuilds the card DOM and would drop our class (and the inline
+    // column-scroll-height style — same rebuild problem, same fix). Re-apply
+    // both from cache whenever the board subtree changes. Debounced so a
     // burst of mutations triggers a single repaint.
     (function () {
         var boardEl = document.getElementById('board') || document.body;
@@ -621,7 +717,11 @@ $devEnvMainStatusUrl = $marcusUrl . '/api/dev-env/main/status'
         var obs = new MutationObserver(function () {
             if (scheduled) { return; }
             scheduled = true;
-            setTimeout(function () { scheduled = false; applyAgentBorders(); }, 100);
+            setTimeout(function () {
+                scheduled = false;
+                applyAgentBorders();
+                applyColumnScrollHeights();
+            }, 100);
         });
         obs.observe(boardEl, { childList: true, subtree: true });
     }());
