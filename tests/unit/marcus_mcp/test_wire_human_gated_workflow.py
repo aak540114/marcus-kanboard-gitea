@@ -18,6 +18,7 @@ from src.core.events import Events
 from src.marcus_mcp.server import (
     _get_dev_env_settings_mgr,
     _get_gate_settings_mgr,
+    _main_preview_ticket_id,
     _read_bounded_body,
     _resolve_ticket_branch,
     _resolve_ticket_repo_path,
@@ -395,6 +396,45 @@ class TestResolveTicketRepoPath:
         result = await _resolve_ticket_repo_path(server, "5")
 
         assert result is None
+
+
+class TestMainPreviewTicketId:
+    """_main_preview_ticket_id builds the canonical DevEnvironmentManager
+    identity for a project's main-branch preview from a raw project_id
+    query-string value.
+
+    /dev-env/main/view, /dev-env/main/stop, and /api/dev-env/main/status
+    must all agree on the SAME key for the same project — dev_env_main_view
+    used to normalize project_id through int() before building the
+    synthetic id while dev_env_main_stop/dev_env_main_status used the raw
+    query string directly, so a non-canonical numeric string (a leading
+    zero, say) registered under one key and looked up under a different
+    one — the status/stop routes silently reported "nothing running" for
+    an actually-running, now-unreachable (leaked) container. This shared
+    helper makes that impossible by construction: every route builds the
+    id the exact same way.
+    """
+
+    def test_builds_canonical_id_from_plain_int_string(self):
+        assert _main_preview_ticket_id("7") == "main-7"
+
+    def test_normalizes_leading_zero(self):
+        """This is the exact mismatch that caused the bug: dev_env_main_view
+        registers under the int-normalized key ("main-7"), so any other
+        route building the key from the raw string ("main-07") would miss
+        it entirely."""
+        assert _main_preview_ticket_id("07") == "main-7"
+
+    def test_normalizes_leading_plus_and_whitespace(self):
+        assert _main_preview_ticket_id("+7") == "main-7"
+        assert _main_preview_ticket_id(" 7 ") == "main-7"
+
+    def test_empty_string_returns_empty(self):
+        assert _main_preview_ticket_id("") == ""
+
+    def test_non_numeric_returns_empty(self):
+        assert _main_preview_ticket_id("not-a-number") == ""
+        assert _main_preview_ticket_id("7; rm -rf /") == ""
 
 
 def _make_task_with_project(project_id):

@@ -1702,17 +1702,23 @@ class HumanGatedWorkflow:
             # the result: move_task_to_column returns False (no exception)
             # when the board has no matching column, which is exactly how a
             # parent silently stayed in Ready. Surface that at WARNING so it's
-            # diagnosable instead of vanishing at debug level.
+            # diagnosable instead of vanishing at debug level. Track whether
+            # the call itself raised separately from a clean False return —
+            # otherwise a raised exception (already logged with the real
+            # error) ALSO falls through to the "no such column?" diagnostic
+            # below, which is actively misleading for e.g. an RPC timeout.
             moved = False
+            raised = False
             try:
                 moved = await self._kanban.move_task_to_column(ticket_id, "blocked")
             except Exception as exc:  # noqa: BLE001
+                raised = True
                 logger.warning(
                     "Could not move decomposed parent %s to blocked column: %s",
                     ticket_id,
                     exc,
                 )
-            if not moved:
+            if not moved and not raised:
                 logger.warning(
                     "Decomposed parent %s did NOT move to the 'Blocked' column "
                     "(does this project's board have a column named 'Blocked'?). "
@@ -3012,17 +3018,23 @@ class HumanGatedWorkflow:
         # while its board card silently stays in Blocked forever (nothing
         # re-checks a ticket whose column hasn't changed again). Surface
         # that at WARNING so it's diagnosable, matching the same check on
-        # the parent's earlier move to Blocked in decompose_ticket.
+        # the parent's earlier move to Blocked in decompose_ticket. Track
+        # whether the call raised separately from a clean False return —
+        # otherwise an exception (already logged with the real error) ALSO
+        # falls through to the "no such column?" diagnostic below, which is
+        # actively misleading for e.g. an RPC timeout.
         moved = False
+        raised = False
         try:
             moved = await self._kanban.move_task_to_column(
                 parent_id, "waiting for human"
             )
         except Exception as exc:  # noqa: BLE001
+            raised = True
             logger.warning(
                 "Could not move parent %s to waiting-for-human: %s", parent_id, exc
             )
-        if not moved:
+        if not moved and not raised:
             logger.warning(
                 "Parent %s did NOT move to the 'Waiting for Human' column "
                 "(does this project's board have a column named 'Waiting "

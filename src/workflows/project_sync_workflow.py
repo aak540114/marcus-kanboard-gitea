@@ -310,7 +310,14 @@ class ProjectSyncWorkflow:
             matches.
         """
         for mapping in self._mapping.values():
-            if mapping.get("repo_slug") == repo_name:
+            # Prefer the stored slug — for disambiguated or empty-name
+            # repos, re-slugifying the project name yields the WRONG slug.
+            # Fall back to name-derived for pre-repo_slug mapping files
+            # (same fallback ensure_repo() uses for the identical reason).
+            slug = mapping.get("repo_slug") or _slugify(
+                mapping.get("kanboard_project_name") or ""
+            )
+            if slug == repo_name:
                 pid = mapping.get("kanboard_project_id")
                 return int(pid) if pid is not None else None
         return None

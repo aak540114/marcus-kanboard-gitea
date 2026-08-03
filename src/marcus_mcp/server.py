@@ -3716,6 +3716,39 @@ async def _resolve_ticket_repo_path(
     return mapping.get("local_repo_path") if mapping else None
 
 
+def _main_preview_ticket_id(project_id_str: str) -> str:
+    """Build the canonical ``DevEnvironmentManager`` identity for a
+    project's main-branch preview from a raw ``project_id`` query param.
+
+    ``/dev-env/main/view``, ``/dev-env/main/stop``, and
+    ``/api/dev-env/main/status`` must all agree on the exact same key for
+    the same project. Normalizing through ``int()`` here (rather than each
+    route building ``f"main-{project_id_str}"`` from whatever string it
+    happened to receive) is what guarantees that: a non-canonical numeric
+    string — a leading zero, a leading ``+``, stray whitespace — would
+    otherwise register under one key and get looked up under a different
+    one, silently reporting "nothing running" for an actually-running
+    (and now unreachable, leaked) container.
+
+    Parameters
+    ----------
+    project_id_str : str
+        Raw ``project_id`` query parameter (may be empty or non-numeric).
+
+    Returns
+    -------
+    str
+        ``f"main-{int(project_id_str)}"``, or ``""`` if *project_id_str*
+        is empty or not a valid integer.
+    """
+    if not project_id_str:
+        return ""
+    try:
+        return f"main-{int(project_id_str)}"
+    except ValueError:
+        return ""
+
+
 def _dev_env_starting_page(
     ticket_id: str, provider: str, url: str, *, label: Optional[str] = None
 ) -> str:
@@ -4977,7 +5010,7 @@ function save() {{
             except ValueError:
                 return HTMLResponse("<h1>Invalid project_id</h1>", status_code=400)
 
-            synthetic_id = f"main-{project_id}"
+            synthetic_id = _main_preview_ticket_id(project_id_str)
 
             try:
                 from src.core.dev_environment import DevEnvironmentManager
@@ -5088,15 +5121,16 @@ function save() {{
             """
             project_id_str = request.query_params.get("project_id", "")
             provider = request.query_params.get("provider", server.provider)
+            synthetic_id = _main_preview_ticket_id(project_id_str)
 
             dev_mgr = getattr(server, "_dev_env_manager", None)
-            if not project_id_str or dev_mgr is None:
+            if not synthetic_id or dev_mgr is None:
                 response = JSONResponse({"stopped": False})
                 response.headers["Access-Control-Allow-Origin"] = "*"
                 return response
 
             try:
-                stopped = await dev_mgr.stop(f"main-{project_id_str}", provider)
+                stopped = await dev_mgr.stop(synthetic_id, provider)
                 response = JSONResponse({"stopped": stopped})
             except Exception as exc:  # noqa: BLE001
                 logger.error(
@@ -5120,7 +5154,7 @@ function save() {{
             """
             project_id_str = request.query_params.get("project_id", "")
             provider = request.query_params.get("provider", server.provider)
-            ticket_id = f"main-{project_id_str}" if project_id_str else ""
+            ticket_id = _main_preview_ticket_id(project_id_str)
 
             dev_mgr = getattr(server, "_dev_env_manager", None)
             if dev_mgr and ticket_id:

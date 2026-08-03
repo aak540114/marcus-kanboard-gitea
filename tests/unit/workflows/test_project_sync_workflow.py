@@ -368,6 +368,24 @@ class TestGetProjectIdForRepoName:
         assert workflow.all_mappings() == {}
         assert workflow.get_project_id_for_repo_name("anything") is None
 
+    def test_falls_back_to_slugified_name_for_pre_repo_slug_mapping(self, workflow):
+        """A mapping written before the repo_slug field existed has no
+        such key — ensure_repo() already falls back to re-slugifying
+        kanboard_project_name for this exact case (see its own docstring
+        at the matching `cached.get("repo_slug") or _slugify(...)` line);
+        this reverse lookup must degrade the same way, or a project whose
+        mapping predates that field silently never gets its main-branch
+        preview refreshed on push (no error, just a permanent no-op)."""
+        workflow._mapping["kanboard:9"] = {
+            "kanboard_project_id": 9,
+            "kanboard_project_name": "Shopping Cart",
+            "gitea_repo_url": "http://localhost:3000/root/shopping-cart.git",
+            "local_repo_path": "./repos/shopping-cart",
+            # No "repo_slug" key — pre-repo_slug mapping file.
+        }
+
+        assert workflow.get_project_id_for_repo_name("shopping-cart") == 9
+
     @pytest.mark.asyncio
     async def test_distinguishes_between_multiple_projects(self, workflow, gitea_mgr):
         gitea_mgr.create_repo = AsyncMock(

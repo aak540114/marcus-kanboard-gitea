@@ -3667,6 +3667,63 @@ class TestDecomposition:
         )
 
     @pytest.mark.asyncio
+    async def test_parent_move_to_blocked_exception_logs_once_not_twice(
+        self, workflow, lifecycle, mock_kanban, caplog
+    ):
+        """When the parent's move to Blocked RAISES (e.g. an RPC timeout)
+        rather than cleanly returning False, only the exception itself
+        should be logged — not also the generic "no such column?"
+        diagnostic, which is misleading for a transient error that has
+        nothing to do with a missing column."""
+        self._big_ticket(lifecycle)
+
+        async def fake_llm(prompt):
+            return (
+                '{"subtasks": [{"title": "Backend", "description": "api", '
+                '"acceptance_criteria": "- [ ] api"}, {"title": "Frontend", '
+                '"description": "ui", "acceptance_criteria": "- [ ] ui"}]}'
+            )
+        workflow._llm_generate = fake_llm
+
+        created = {"n": 200}
+
+        async def fake_create(data):
+            created["n"] += 1
+            t = MagicMock()
+            t.id = str(created["n"])
+            t.name = data["name"]
+            return t
+
+        mock_kanban.create_task = AsyncMock(side_effect=fake_create)
+        mock_kanban.create_task_link = AsyncMock(return_value=True)
+        parent = MagicMock(description="do a lot")
+        parent.name = "Big"
+        parent.source_context = {"kanboard_task": {"project_id": 3}}
+        mock_kanban.get_task_by_id = AsyncMock(return_value=parent)
+
+        async def move(ticket_id, column):
+            if ticket_id == "100" and column == "blocked":
+                raise RuntimeError("kanboard RPC timeout")
+            return True
+
+        mock_kanban.move_task_to_column = AsyncMock(side_effect=move)
+
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            children = await workflow.decompose_ticket("100")
+
+        assert children == ["201", "202"]
+        assert lifecycle.get("100", "kanboard").state == TicketState.BLOCKED
+        parent_warnings = [
+            r for r in caplog.records
+            if "100" in r.message and "blocked" in r.message.lower()
+        ]
+        assert len(parent_warnings) == 1
+        assert "kanboard RPC timeout" in parent_warnings[0].message
+        assert "does this project" not in parent_warnings[0].message
+
+    @pytest.mark.asyncio
     async def test_atomic_ticket_not_decomposed(
         self, workflow, lifecycle, mock_kanban
     ):
@@ -4098,6 +4155,42 @@ class TestParentAutoCompleteEndToEnd:
             "400" in r.message and "waiting for human" in r.message.lower()
             for r in caplog.records
         )
+
+    @pytest.mark.asyncio
+    async def test_parent_wfh_move_exception_logs_once_not_twice(
+        self, workflow, lifecycle, mock_kanban, caplog
+    ):
+        """When move_task_to_column RAISES (e.g. an RPC timeout) rather
+        than cleanly returning False, only the exception itself should be
+        logged — not also the generic "no such column?" diagnostic, which
+        is misleading for a transient error that has nothing to do with a
+        missing column."""
+        child_ids = await self._decompose_with(workflow, mock_kanban, lifecycle)
+        for cid in child_ids:
+            lifecycle.transition(cid, "kanboard", TicketState.IN_PROGRESS)
+            lifecycle.transition(cid, "kanboard", TicketState.DONE)
+
+        async def move(ticket_id, column):
+            if ticket_id == "400" and column == "waiting for human":
+                raise RuntimeError("kanboard RPC timeout")
+            return True
+
+        mock_kanban.move_task_to_column = AsyncMock(side_effect=move)
+
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            await workflow._maybe_complete_parent(child_ids[0])
+            await workflow._maybe_complete_parent(child_ids[1])
+
+        assert lifecycle.get("400", "kanboard").state == TicketState.WAITING_FOR_HUMAN
+        parent_warnings = [
+            r for r in caplog.records
+            if "400" in r.message and "waiting" in r.message.lower()
+        ]
+        assert len(parent_warnings) == 1
+        assert "kanboard RPC timeout" in parent_warnings[0].message
+        assert "does this project" not in parent_warnings[0].message
 
 
 class TestActivityHeartbeat:
