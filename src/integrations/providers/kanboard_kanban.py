@@ -181,6 +181,13 @@ class KanboardKanban(KanbanInterface):
         self._columns_loaded: Set[int] = set()
         # project name — populated in connect()
         self._project_name: str = ""
+        # project id -> name, for every project resolved via
+        # get_project_name() beyond the configured self._project_id —
+        # populated lazily. get_all_tasks() reads this cache (never
+        # triggers an RPC itself) so its per-poll "checking project N" log
+        # line can show a name once one becomes known, without adding an
+        # RPC call to a path that already runs on every marcus_work poll.
+        self._project_names: Dict[int, str] = {}
 
         self._client: Optional[httpx.AsyncClient] = None
         self._rpc_id: int = 0
@@ -370,6 +377,23 @@ class KanboardKanban(KanbanInterface):
 
         tasks: List[Task] = []
         for pid in project_ids:
+            # Visibility into what a poll actually did: get_all_tasks() is
+            # what HumanGatedWorkflow._rescan_boards() calls on every
+            # marcus_work poll from an agent, so without this a human
+            # watching the logs has no way to tell which project(s) Marcus
+            # just checked. Reads self._project_names directly (never
+            # calls get_project_name(), which can issue an RPC on a cache
+            # miss) — this runs on every poll for every in-scope project,
+            # so it must never add a request of its own. Falls back to the
+            # bare id when the name isn't cached yet; it gets filled in
+            # (here and for all subsequent polls) whichever code path
+            # calls get_project_name() for this id first.
+            name = self._project_names.get(pid)
+            logger.info(
+                "Checking Kanboard project %s%s for tasks",
+                pid,
+                f" ({name})" if name else "",
+            )
             await self._ensure_columns_loaded(pid)
             active = await self._rpc("getAllTasks", project_id=pid, status_id=1)
             closed = await self._rpc("getAllTasks", project_id=pid, status_id=0)
@@ -1198,7 +1222,15 @@ class KanboardKanban(KanbanInterface):
         single configured ``self._project_id``), this looks up *any*
         project id — needed when a ticket belongs to a different project
         than the one this instance was configured against (e.g. resolving
-        the project name to create a Gitea repo on demand).
+        the project name to create a Gitea repo on demand). Successful
+        lookups are cached in ``self._project_names`` so a repeated call
+        for the same id never re-hits the RPC — ``get_all_tasks()`` reads
+        that same cache (without calling this method, to stay RPC-free)
+        on every poll, for every in-scope project. A failed/not-found
+        lookup is deliberately NOT cached, so a project that doesn't
+        resolve yet (transient error, or genuinely doesn't exist yet) gets
+        retried on the next call rather than being stuck returning
+        ``None`` forever.
 
         Parameters
         ----------
@@ -1215,6 +1247,9 @@ class KanboardKanban(KanbanInterface):
             raise RuntimeError("Call connect() before get_project_name()")
         if project_id == self._project_id and self._project_name:
             return self._project_name
+        cached = self._project_names.get(project_id)
+        if cached:
+            return cached
         try:
             project = await self._rpc("getProjectById", project_id=project_id)
         except Exception as exc:  # noqa: BLE001
@@ -1223,7 +1258,10 @@ class KanboardKanban(KanbanInterface):
         if not project:
             return None
         name = project.get("name")
-        return str(name) if name else None
+        if not name:
+            return None
+        self._project_names[project_id] = str(name)
+        return str(name)
 
     async def report_blocker(
         self,

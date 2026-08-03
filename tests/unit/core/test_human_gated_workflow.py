@@ -1172,6 +1172,49 @@ class TestFirstSightRecovery:
         mock_kanban.move_task_to_column.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_new_ticket_assigned_but_todo_still_records_assignee(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """First sight of an assigned-but-Todo ticket must still record the
+        assignee, even though AI must not start work yet.
+
+        BoardWatcher only emits ticket.assigned on a CHANGE relative to its
+        own in-memory snapshot — and that snapshot's baseline already
+        matches the board's assignee from the moment of first sight (this
+        ticket was already assigned before Marcus ever polled it), so no
+        LATER ticket.assigned event ever fires to backfill it. If first
+        sight doesn't record the assignee here, when a human later moves
+        the card to Ready — without touching assignment again, since it's
+        already assigned — no event corrects the gap either: Marcus's own
+        lifecycle record permanently shows unassigned even though the
+        board has always shown a real owner. _is_unassigned/
+        _is_human_owner (and therefore _next_worker_ticket's hand-out
+        gate) read this persisted field, not a live Kanboard lookup, so
+        this silently and indefinitely blocks the ticket from ever being
+        handed to an agent."""
+        event = _make_event(
+            {
+                "ticket_id": "34",
+                "provider": "kanboard",
+                "task": {
+                    "id": "34",
+                    "title": "Assigned but not yet ready",
+                    "description": "",
+                    "status": "todo",
+                    "assignee": "dave",
+                },
+            }
+        )
+        await workflow._on_ticket_new(event)
+
+        rec = lifecycle.get("34", "kanboard")
+        assert rec is not None
+        assert rec.assignee == "dave"
+        # Still must not start AI work — that gate is unchanged.
+        assert rec.ai_agent_id is None
+        mock_kanban.move_task_to_column.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_new_ticket_ready_but_unassigned_does_not_start_ai(
         self, workflow, lifecycle, mock_kanban
     ):
@@ -4753,6 +4796,49 @@ class TestProjectAccessGate:
         assert msg.count("is not enabled for Marcus") == 1
         for tid in ("21", "28"):
             assert f"#{tid}" in msg
+
+    @pytest.mark.asyncio
+    async def test_withheld_reasons_surface_unassigned_ready_tickets(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """A Ready ticket nobody has assigned yet must be named in the
+        no_work message — not silently omitted.
+
+        Without this, an agent polling marcus_work sees only "no tickets
+        are ready right now" even though a real, ready ticket exists —
+        the ONLY reason it isn't handed out is that no human has claimed
+        it. An agent with no visibility into that has to go dig through
+        other tool calls to find the ticket and guess why, which in
+        practice led to a wrong diagnosis (confusing the unrelated
+        per-ticket gate_mode setting for the real cause)."""
+        self._wire_task_project(mock_kanban, 7)
+        lifecycle.get_or_create("39", "kanboard")
+        lifecycle.transition("39", "kanboard", TicketState.READY)
+        # No set_assignee() call — genuinely unassigned.
+
+        result = await workflow.orchestrate_work(agent_id="worker-F")
+
+        msg = result["message"]
+        assert "#39" in msg
+        assert "no assignee" in msg.lower() or "unassigned" in msg.lower()
+
+    @pytest.mark.asyncio
+    async def test_withheld_reasons_ignore_unassigned_ticket_in_disabled_project(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """An unassigned Ready ticket in a project Marcus isn't even
+        enabled for must not be surfaced — the actionable instruction
+        there is "enable the project", not "assign the ticket", and the
+        disabled-project reason already covers assigned tickets in that
+        same project."""
+        self._wire_task_project(mock_kanban, 7)
+        mock_project_access.is_enabled = MagicMock(return_value=False)
+        lifecycle.get_or_create("40", "kanboard")
+        lifecycle.transition("40", "kanboard", TicketState.READY)
+
+        result = await workflow.orchestrate_work(agent_id="worker-G")
+
+        assert "#40" not in result["message"]
 
     @pytest.mark.asyncio
     async def test_project_id_lookup_is_cached_per_ticket(

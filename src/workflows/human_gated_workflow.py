@@ -411,10 +411,22 @@ class HumanGatedWorkflow:
         # the first column at creation anyway.
         board_status = task.get("status") or ""
         board_assignee = task.get("assignee") or ""
-        if board_assignee and board_assignee != "0" and board_status in (
-            TaskStatus.READY.value,
-            TaskStatus.IN_PROGRESS.value,
-        ):
+        has_assignee = bool(board_assignee) and board_assignee != "0"
+
+        # Record the board's real assignee on first sight UNCONDITIONALLY —
+        # not gated on the column being Ready/In Progress. A ticket assigned
+        # while still in Todo (then later moved to Ready without touching
+        # assignment again, since it's already assigned) would otherwise
+        # never get an assignee recorded at all: BoardWatcher only emits
+        # ticket.assigned on a CHANGE relative to its own snapshot, and that
+        # snapshot's baseline already matches the board's assignee from this
+        # exact moment, so no LATER diff event ever corrects the gap.
+        # _is_unassigned()/_is_human_owner() (and so _next_worker_ticket's
+        # hand-out gate) read this persisted field, not a live Kanboard
+        # lookup — a permanently-empty assignee here silently and
+        # indefinitely blocks the ticket from ever being handed to an
+        # agent, even though the board has always shown a real owner.
+        if has_assignee:
             try:
                 self._lifecycle.set_assignee(
                     ticket_id, self._provider, board_assignee
@@ -422,6 +434,11 @@ class HumanGatedWorkflow:
             except KeyError:
                 pass
             record = self._lifecycle.get(ticket_id, self._provider) or record
+
+        if has_assignee and board_status in (
+            TaskStatus.READY.value,
+            TaskStatus.IN_PROGRESS.value,
+        ):
             if record.ai_agent_id is None:
                 # Mirror the board column BEFORE attempting the start —
                 # same reasoning as the column-move resume in
@@ -1795,6 +1812,7 @@ class HumanGatedWorkflow:
         """
         paused: List[str] = []
         blocked: List[str] = []
+        unassigned: List[str] = []
         # Kanboard project id → tickets held up by that project's toggle.
         # Grouped, because one toggle unblocks all of them: listing the
         # same instruction once per ticket buries the single action the
@@ -1805,6 +1823,22 @@ class HumanGatedWorkflow:
             if rec.provider != self._provider:
                 continue
             if not self._is_human_owner(rec.assignee):
+                # A Ready-but-unassigned ticket in an ENABLED project is a
+                # distinct, common reason marcus_work returns no_work — the
+                # generic "no tickets are ready" message doesn't mention
+                # this ticket at all, since it isn't a hand-out candidate
+                # to begin with (not "withheld", simply not eligible). An
+                # agent with no visibility into that has to go dig through
+                # other tool calls to find it and guess why — in practice
+                # leading to a wrong diagnosis (mistaking the unrelated
+                # per-ticket gate_mode setting for the real cause).
+                # Skipped for a disabled project: the actionable
+                # instruction there is "enable the project", already
+                # covered below for assigned tickets in the same project.
+                if rec.state == TicketState.READY:
+                    pid = await self._resolve_kanboard_project_id(rec.ticket_id)
+                    if pid is None or self._project_access.is_enabled(pid):
+                        unassigned.append(f"#{rec.ticket_id}")
                 continue
             if rec.state == TicketState.WAITING_FOR_HUMAN:
                 paused.append(f"#{rec.ticket_id}")
@@ -1844,6 +1878,12 @@ class HumanGatedWorkflow:
                 f"{len(blocked)} ticket(s) are blocked by dependencies: "
                 + ", ".join(blocked)
                 + "."
+            )
+        if unassigned:
+            reasons.append(
+                f"{len(unassigned)} ticket(s) — {', '.join(unassigned)} — "
+                "are Ready but have no assignee yet. Assign one (any human) "
+                "in Kanboard to make it available to an agent."
             )
         return reasons
 

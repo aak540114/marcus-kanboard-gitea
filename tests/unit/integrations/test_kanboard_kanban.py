@@ -481,6 +481,58 @@ class TestGetAllTasks:
         assert set(polled) == {7, 8}
 
     @pytest.mark.asyncio
+    async def test_logs_which_project_it_checks(self, kanban, caplog):
+        """A human watching Marcus's logs must be able to see which
+        project(s) it checked on a given poll cycle (get_all_tasks() is
+        what _rescan_boards() calls on every marcus_work poll — see
+        HumanGatedWorkflow.orchestrate_work) — not just a silent RPC
+        round-trip with no visibility into what Marcus is doing. Must not
+        cost an extra RPC call to look up a project name: this runs on
+        every poll, for every in-scope project."""
+        kanban._client = AsyncMock()
+        kanban.set_project_scope(lambda: [7, 8])
+        kanban._columns_loaded = {7, 8}
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response([]), _rpc_response([]),
+                _rpc_response([]), _rpc_response([]),
+            ]
+        )
+
+        import logging
+
+        with caplog.at_level(logging.INFO):
+            await kanban.get_all_tasks()
+
+        assert any("7" in r.message for r in caplog.records)
+        assert any("8" in r.message for r in caplog.records)
+        # Only the 4 getAllTasks calls (2 projects x active+closed) — no
+        # extra RPC spent just to look up a project name for the log line.
+        assert kanban._client.post.await_count == 4
+
+    @pytest.mark.asyncio
+    async def test_logs_project_name_when_already_cached(self, kanban, caplog):
+        """When a project's name has already been resolved elsewhere (the
+        cache _project_names gets populated by get_project_name(), used by
+        e.g. the main-branch preview routes), the log line shows it — a
+        bare id is correct but a name reads far better in the logs."""
+        kanban._client = AsyncMock()
+        kanban.set_project_scope(lambda: [7])
+        kanban._columns_loaded = {7}
+        kanban._project_names[7] = "Shopping Cart"
+        kanban._client.post = AsyncMock(
+            side_effect=[_rpc_response([]), _rpc_response([])]
+        )
+
+        import logging
+
+        with caplog.at_level(logging.INFO):
+            await kanban.get_all_tasks()
+
+        assert any("Shopping Cart" in r.message for r in caplog.records)
+        assert kanban._client.post.await_count == 2
+
+    @pytest.mark.asyncio
     async def test_without_a_scope_reads_every_project(self, kanban):
         """Unscoped, Marcus reads EVERY board.
 
@@ -1949,6 +2001,42 @@ class TestGetProjectName:
     async def test_raises_if_not_connected(self, kanban):
         with pytest.raises(RuntimeError, match="connect()"):
             await kanban.get_project_name(1)
+
+    @pytest.mark.asyncio
+    async def test_caches_a_looked_up_project_name(self, kanban):
+        """A second lookup of the same non-configured project id is served
+        from cache, without a second RPC call — get_all_tasks() calls this
+        (indirectly, via the cache dict) on every poll cycle for every
+        in-scope project, so an uncached repeat lookup would mean an extra
+        RPC per project per poll."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            return_value=_rpc_response({"id": 7, "name": "Other Project"})
+        )
+
+        first = await kanban.get_project_name(7)
+        second = await kanban.get_project_name(7)
+
+        assert first == "Other Project"
+        assert second == "Other Project"
+        assert kanban._client.post.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_failed_lookup_is_not_cached(self, kanban):
+        """A project that doesn't (yet) resolve must not be cached as
+        permanently unknown — the next call should retry via RPC rather
+        than being stuck returning None forever."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(return_value=_rpc_response(None))
+
+        first = await kanban.get_project_name(999)
+        kanban._client.post = AsyncMock(
+            return_value=_rpc_response({"id": 999, "name": "Now Exists"})
+        )
+        second = await kanban.get_project_name(999)
+
+        assert first is None
+        assert second == "Now Exists"
 
 
 class TestGetProjectMetrics:

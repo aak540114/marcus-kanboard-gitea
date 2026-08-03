@@ -33,7 +33,13 @@ classifiers = [
 ]
 
 dependencies = [
-    "mcp>=1.10.0",
+    "mcp>=1.10.0,<2.0.0",
+    # mcp 2.0 restructures the package (mcp.server.fastmcp — what
+    # src/marcus_mcp/server.py actually imports — is gone/moved), so an
+    # unbounded >=1.10.0 silently resolves to a release that breaks the
+    # import outright on a fresh install. Confirmed live: a clean install
+    # pulled mcp 2.0.0 and failed with `ModuleNotFoundError: No module
+    # named 'mcp.server.fastmcp'`.
     # Transitive pins forced by mcp 1.10's streamable_http transport.
     # Without anyio>=4.5 the server raises TypeError on every HTTP MCP
     # request (PEP 585 subscript on a non-generic function in anyio 3.x)
