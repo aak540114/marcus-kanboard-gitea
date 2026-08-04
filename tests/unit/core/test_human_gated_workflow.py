@@ -18,6 +18,7 @@ All external dependencies (kanban, branch manager, dev env, AC generator)
 are mocked; no file I/O or network calls occur.
 """
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -3158,6 +3159,44 @@ class TestOrchestrateWork:
         assert workflow._classify_report_intent("BLOCKED - y") == "blocked"
         assert workflow._classify_report_intent("wrote a test") == "progress"
 
+    @pytest.mark.asyncio
+    async def test_done_report_ignores_a_ticket_id_the_agent_does_not_own(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """Regression: ticket_id is an unauthenticated echo of what Marcus
+        previously returned to the caller, not an authority — an agent
+        that actually holds ticket A but reports 'DONE' against a
+        DIFFERENT ticket_id (e.g. a stale/hallucinated value, or another
+        agent's ticket) must have the report applied to its OWN real
+        ticket, not the arbitrary one it named. Previously the caller-
+        supplied ticket_id was trusted outright, so a mismatched id could
+        mark someone ELSE's in-progress ticket ready-for-review (or, on
+        an AI gate, merge it to main) while that other agent's real work
+        was still incomplete."""
+        # Agent w5 actually holds ticket 10.
+        lifecycle.get_or_create("10", "kanboard")
+        lifecycle.transition("10", "kanboard", TicketState.READY)
+        lifecycle.claim_ticket("10", "kanboard", "w5")
+        lifecycle.transition("10", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.set_assignee("10", "kanboard", "w5")
+
+        # Ticket 11 is a DIFFERENT agent's real in-progress work.
+        lifecycle.get_or_create("11", "kanboard")
+        lifecycle.transition("11", "kanboard", TicketState.READY)
+        lifecycle.claim_ticket("11", "kanboard", "w6")
+        lifecycle.transition("11", "kanboard", TicketState.IN_PROGRESS)
+
+        res = await workflow.orchestrate_work(
+            agent_id="w5", ticket_id="11", report="DONE - shipped it"
+        )
+
+        # The report must land on w5's own ticket (10), never on 11.
+        assert res["ticket_id"] == "10"
+        assert lifecycle.get("10", "kanboard").state == TicketState.WAITING_FOR_HUMAN
+        # Ticket 11 — owned by a different agent — must be untouched.
+        assert lifecycle.get("11", "kanboard").state == TicketState.IN_PROGRESS
+        assert lifecycle.get("11", "kanboard").ai_agent_id == "w6"
+
 
 class TestReclaimStuckTicket:
     """An agent that loses track of its own ticket must not leave it
@@ -3315,6 +3354,58 @@ class TestReclaimStuckTicket:
 
         assert res["status"] == "working"
         assert res["ticket_id"] == "60"
+
+    @pytest.mark.asyncio
+    async def test_two_different_new_agents_cannot_both_reclaim_the_same_ticket(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Regression: _reclaim_stuck_ticket ignored claim_ticket()'s
+        return value AND unconditionally called release_ticket() right
+        before claiming — so two concurrent _reclaim_stuck_ticket calls
+        for two DIFFERENT new agent_ids, both racing for the same stuck
+        ticket, could each release-then-claim it in turn. Both would
+        then believe they own it (both return the ticket id), even
+        though the lifecycle store — the single source of truth for
+        "who owns this ticket" — can only actually record one of them.
+        This defeats claim_ticket's own documented guarantee that "at
+        most one AI agent holds a claim on a given ticket at any time"."""
+        self._stuck_ticket(lifecycle, "61", held_by="agent-old")
+
+        # Force a genuine event-loop yield at the same await point the
+        # real code hits (_may_touch), so both concurrent calls reach
+        # their release/claim pair having both already computed "ticket
+        # 61 is the most-stale candidate" from the SAME pre-race state —
+        # reproducing the actual interleaving a live deployment would see
+        # (two real network-bound _resolve_kanboard_project_id calls),
+        # which an all-synchronous AsyncMock chain doesn't naturally
+        # produce (nothing truly suspends, so gather() would otherwise
+        # just run the two calls back-to-back with no real overlap).
+        real_may_touch = workflow._may_touch
+
+        async def yielding_may_touch(ticket_id):
+            await asyncio.sleep(0)
+            return await real_may_touch(ticket_id)
+
+        workflow._may_touch = yielding_may_touch
+
+        result_a, result_b = await asyncio.gather(
+            workflow._reclaim_stuck_ticket("agent-A"),
+            workflow._reclaim_stuck_ticket("agent-B"),
+        )
+
+        results = {result_a, result_b}
+        # At most one of the two concurrent callers may believe it
+        # reclaimed ticket 61 — the other must get None (nothing left to
+        # reclaim), never both claiming success on the same ticket.
+        assert results in ({"61", None}, {None})
+        # And the lifecycle record's actual owner must match whichever
+        # caller "won" (if either did) — no split-brain state where
+        # both callers were told a different story than the store holds.
+        current_owner = lifecycle.get("61", "kanboard").ai_agent_id
+        if result_a == "61":
+            assert current_owner == "agent-A"
+        if result_b == "61":
+            assert current_owner == "agent-B"
 
 
 class TestReopenGuard:

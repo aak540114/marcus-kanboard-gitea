@@ -746,7 +746,7 @@ class ProjectMonitor:
             if task.status == TaskStatus.IN_PROGRESS:
                 if now - task.updated_at > stall_threshold:
                     # Task is stalled, create a risk
-                    hours_stalled = stall_threshold.total_seconds() / 3600
+                    hours_stalled = (now - task.updated_at).total_seconds() / 3600
                     risk = ProjectRisk(
                         risk_type="stalled_task",
                         description=(

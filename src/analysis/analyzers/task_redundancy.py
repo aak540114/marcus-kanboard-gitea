@@ -553,8 +553,10 @@ or commentary."""
 
         formatted = []
         for msg in relevant_convos:
-            formatted.append(f"""[{msg.timestamp.isoformat()}] {msg.direction} "
-                f"(agent: {msg.agent_id}):
-  {msg.content[:300]}""")
+            formatted.append(
+                f"[{msg.timestamp.isoformat()}] {msg.direction} "
+                f"(agent: {msg.agent_id}):\n"
+                f"  {msg.content[:300]}"
+            )
 
         return "\n\n".join(formatted)

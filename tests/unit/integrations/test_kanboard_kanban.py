@@ -315,6 +315,40 @@ class TestToTask:
         task = kanban._to_task(_make_raw_task(project_id=5))
         assert task.project_id == "5"
 
+    def test_project_name_for_configured_project(self, kanban):
+        """A task from the statically configured project gets its name."""
+        kanban._column_status_map = {1: TaskStatus.TODO}
+        kanban._project_id = 1
+        kanban._project_name = "Shopping Cart"
+        task = kanban._to_task(_make_raw_task(project_id=1))
+        assert task.project_name == "Shopping Cart"
+
+    def test_project_name_for_other_project_in_scope(self, kanban):
+        """Regression: a task from a DIFFERENT project than the one
+        statically configured in connect() must get its OWN project's
+        name, not the configured project's name. Previously project_name
+        was hardcoded to self._project_name regardless of which project
+        the task actually belonged to, so every task polled from a
+        non-configured project (get_all_tasks() polls every in-scope
+        project, not just the configured one) was mislabeled with the
+        configured project's name."""
+        kanban._column_status_map = {1: TaskStatus.TODO}
+        kanban._project_id = 1
+        kanban._project_name = "Shopping Cart"
+        kanban._project_names = {7: "Inventory Service"}
+        task = kanban._to_task(_make_raw_task(project_id=7))
+        assert task.project_name == "Inventory Service"
+
+    def test_project_name_for_unknown_project_is_empty(self, kanban):
+        """A project id that hasn't been resolved by get_project_name()
+        or the poll-logging cache yet falls back to an empty string
+        rather than misreporting some other project's name."""
+        kanban._column_status_map = {1: TaskStatus.TODO}
+        kanban._project_id = 1
+        kanban._project_name = "Shopping Cart"
+        task = kanban._to_task(_make_raw_task(project_id=99))
+        assert task.project_name == ""
+
     def test_source_context_carries_raw_project_id(self, kanban):
         """Regression: source_context must carry the raw (int) Kanboard
         project_id so HumanGatedWorkflow can resolve gate_mode/verify_count/

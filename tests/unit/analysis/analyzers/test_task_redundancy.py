@@ -596,6 +596,33 @@ class TestTaskRedundancyAnalyzer:
         # llm_interpretation is a top-level field, not in raw_data
         assert isinstance(result.llm_interpretation, str)
 
+    @pytest.mark.unit
+    def test_format_conversations_produces_clean_text(self, mock_ai_engine):
+        """Regression: _format_conversations used a malformed multi-line
+        f-string (an unterminated inner f"..." nested inside an outer
+        f\"\"\"...\"\"\") that leaked a stray quote and the literal
+        characters 'f"' into every formatted excerpt instead of a clean
+        header line. This corrupted the evidence text sent to the LLM for
+        redundancy detection."""
+        from src.analysis.aggregator import Message
+
+        analyzer = TaskRedundancyAnalyzer(ai_engine=mock_ai_engine)
+        msg = Message(
+            timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            direction="from_pm",
+            agent_id="agent-1",
+            content="This task is already completed",
+        )
+
+        formatted = analyzer._format_conversations([msg])
+
+        assert 'f"' not in formatted
+        assert formatted.count('"') == 0
+        assert formatted == (
+            "[2026-01-01T00:00:00+00:00] from_pm (agent: agent-1):\n"
+            "  This task is already completed"
+        )
+
 
 class TestTaskRedundancyIntegration:
     """Integration-style tests for TaskRedundancyAnalyzer.

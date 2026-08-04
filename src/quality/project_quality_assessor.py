@@ -592,6 +592,16 @@ class ProjectQualityAssessor:
 
     def _calculate_code_quality_score(self, metrics: CodeQualityMetrics) -> float:
         """Calculate overall code quality score (0-1)."""
+        if metrics == CodeQualityMetrics():
+            # No GitHub data was ever collected for this project (GitHub
+            # not configured, or collection failed) — every raw metric is
+            # still its untouched 0.0 default. Several entries below are
+            # "penalty" metrics where 0 is the BEST possible value (e.g.
+            # 1.0 - security_issues), so with nothing else measured they'd
+            # be the only scores to survive the `s > 0` filter and average
+            # to a false-positive "perfect" 1.0. Report "unknown" (0.0)
+            # instead of a score this method never actually measured.
+            return 0.0
         scores = [
             metrics.test_coverage,
             metrics.code_review_coverage,
@@ -607,6 +617,12 @@ class ProjectQualityAssessor:
 
     def _calculate_process_quality_score(self, metrics: ProcessQualityMetrics) -> float:
         """Calculate overall process quality score (0-1)."""
+        if metrics == ProcessQualityMetrics():
+            # See _calculate_code_quality_score: an untouched default means
+            # no GitHub data was ever collected, so this dimension's
+            # penalty-inverted entries (e.g. 1.0 - rollback_rate) must not
+            # be reported as a false-positive "perfect" 1.0.
+            return 0.0
         scores = [
             metrics.pr_approval_rate,
             1.0 - min(metrics.avg_review_time_hours / 48, 1.0),  # Normalize to 48 hours

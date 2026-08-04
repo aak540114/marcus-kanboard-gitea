@@ -39,6 +39,16 @@ from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+#: Without this, a git subprocess (push/fetch/pull against an unreachable
+#: or slow-to-respond remote) can block the executor thread indefinitely —
+#: same hazard dev_environment.py's docker calls already guard against
+#: (see _DOCKER_CMD_TIMEOUT there), just never applied here. That thread
+#: is never returned to the shared default ThreadPoolExecutor, so enough
+#: concurrent stuck git calls (e.g. several tickets merging while the
+#: remote is degraded) can starve unrelated run_in_executor work across
+#: Marcus, not just git operations.
+_GIT_CMD_TIMEOUT = 60
+
 
 @dataclass
 class BranchManagerConfig:
@@ -608,15 +618,26 @@ class BranchManager:
         env["GIT_COMMITTER_EMAIL"] = self.config.git_user_email
 
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                env=env,
-            ),
-        )
+        try:
+            result = await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=_GIT_CMD_TIMEOUT,
+                ),
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "git %s timed out after %ds", " ".join(args), _GIT_CMD_TIMEOUT
+            )
+            return (
+                1,
+                "",
+                f"git {' '.join(args)} timed out after {_GIT_CMD_TIMEOUT}s",
+            )
         if result.returncode != 0 and args[0] not in (
             "show-ref",  # returns 1 when ref not found — expected
             "rebase",  # returns 1 on conflicts — handled by caller

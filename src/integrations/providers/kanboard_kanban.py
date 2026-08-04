@@ -1215,6 +1215,35 @@ class KanboardKanban(KanbanInterface):
         }
         return metrics
 
+    def _project_name_for(self, raw_project_id: Any) -> str:
+        """Best-effort, RPC-free project name lookup for a raw task's project.
+
+        Used by :meth:`_to_task`, which is synchronous and runs per-task on
+        every poll, so it cannot await :meth:`get_project_name`. Reads only
+        the caches already populated by ``connect()``/``get_project_name()``;
+        a project id neither cache knows about yet (never resolved by
+        ``get_project_name()`` or ``get_all_tasks()``'s poll-logging line)
+        falls back to an empty string rather than misreporting some other
+        project's name.
+
+        Parameters
+        ----------
+        raw_project_id : Any
+            The ``project_id`` field from a raw Kanboard task dict.
+
+        Returns
+        -------
+        str
+            The project's name if known, else ``""``.
+        """
+        try:
+            pid = int(raw_project_id)
+        except (TypeError, ValueError):
+            return ""
+        if pid == self._project_id:
+            return self._project_name
+        return self._project_names.get(pid, "")
+
     async def get_project_name(self, project_id: int) -> Optional[str]:
         """Return a Kanboard project's name by id.
 
@@ -1790,7 +1819,7 @@ class KanboardKanban(KanbanInterface):
             updated_at=updated_at,
             due_date=due_date,
             project_id=str(raw.get("project_id", self._project_id)),
-            project_name=self._project_name,
+            project_name=self._project_name_for(raw.get("project_id")),
             labels=labels,
             estimated_hours=estimated_hours,
             # HumanGatedWorkflow reads kanboard_project_id from here

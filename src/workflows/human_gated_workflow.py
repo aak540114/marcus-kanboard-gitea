@@ -1974,7 +1974,7 @@ class HumanGatedWorkflow:
         """
         now_wall = datetime.now(timezone.utc)
         now_mono = time.monotonic()
-        stale: List[Tuple[float, str]] = []
+        stale: List[Tuple[float, str, str]] = []
         for record in self._lifecycle.all_records():
             if record.provider != self._provider:
                 continue
@@ -1994,16 +1994,32 @@ class HumanGatedWorkflow:
             claim_age = (now_wall - record.updated_at).total_seconds()
             age = min(heartbeat_age, claim_age)
             if age > _STUCK_AGENT_TIMEOUT_SECONDS:
-                stale.append((age, record.ticket_id))
+                stale.append((age, record.ticket_id, held_by))
 
         stale.sort(reverse=True)  # most stale first
-        for _, ticket_id in stale:
+        for _, ticket_id, expected_holder in stale:
             if not await self._may_touch(ticket_id):
+                continue
+            # Re-verify the ticket is STILL held by the same stale agent
+            # right before acting — the await above (_may_touch) is a real
+            # yield point, so a concurrent _reclaim_stuck_ticket call for a
+            # DIFFERENT new agent_id may have already reclaimed this exact
+            # ticket while we were suspended. Without this check, our own
+            # unconditional release_ticket() would silently steal back a
+            # claim a concurrent caller just legitimately won, and both
+            # callers would believe they own the ticket even though the
+            # lifecycle store can only actually record one of them.
+            current = self._lifecycle.get(ticket_id, self._provider)
+            if current is None or str(current.ai_agent_id or "") != expected_holder:
                 continue
             try:
                 self._lifecycle.release_ticket(ticket_id, self._provider)
-                self._lifecycle.claim_ticket(ticket_id, self._provider, agent_id)
+                claimed = self._lifecycle.claim_ticket(
+                    ticket_id, self._provider, agent_id
+                )
             except KeyError:
+                continue
+            if not claimed:
                 continue
             self._mark_progress_activity(ticket_id)
             minutes = int(_STUCK_AGENT_TIMEOUT_SECONDS // 60)
@@ -2069,9 +2085,25 @@ class HumanGatedWorkflow:
         self._mark_agent_seen(agent_id)
         if usage is not None:
             self._record_agent_usage(agent_id, usage)
-        active = (ticket_id or "").strip() or self._lifecycle.get_agent_ticket(
-            agent_id
-        )
+        # ticket_id is an unauthenticated echo of what Marcus itself
+        # returned in a prior response (see the docstring above), never an
+        # authority — an agent reporting DONE/BLOCKED against some other
+        # agent's in-progress ticket (LLM mix-up, stale/hallucinated value
+        # after context compaction, or a bare copy-paste) must not be able
+        # to act on it. get_agent_ticket() is the lifecycle store's actual
+        # record of what this agent_id holds, so it — not the caller's
+        # claim — decides which ticket "active" refers to.
+        own_ticket = self._lifecycle.get_agent_ticket(agent_id)
+        requested = (ticket_id or "").strip()
+        if requested and own_ticket and requested != own_ticket:
+            logger.warning(
+                "agent %s supplied ticket_id=%s but actually holds %s; "
+                "using its real claim instead",
+                agent_id,
+                requested,
+                own_ticket,
+            )
+        active = own_ticket
 
         # 1. A report on the worker's active ticket → summarize + act.
         if report and report.strip() and active:

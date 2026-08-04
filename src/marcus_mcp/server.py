@@ -1977,14 +1977,18 @@ class MarcusServer:
             @app.tool()  # type: ignore[misc]
             async def add_feature(
                 description: str,
-                context: Optional[Dict[str, Any]] = None,
+                integration_point: str = "auto_detect",
             ) -> Dict[str, Any]:
-                """Add a feature to existing project using natural language."""
+                """Add a feature to existing project using natural language.
+
+                integration_point : one of "auto_detect", "after_current",
+                "parallel", "new_phase" (default "auto_detect").
+                """
                 from .tools.nlp import add_feature as impl
 
                 return await impl(
                     feature_description=description,
-                    integration_point="current",
+                    integration_point=integration_point,
                     state=server,
                 )
 
@@ -1992,15 +1996,14 @@ class MarcusServer:
 
             @app.tool()  # type: ignore[misc]
             async def get_usage_report(
-                start_date: Optional[str] = None,
-                end_date: Optional[str] = None,
-                group_by: str = "day",
+                days: int = 7,
             ) -> Dict[str, Any]:
-                """Generate usage analytics and audit reports."""
+                """Generate usage analytics and audit reports for the last
+                `days` days."""
                 from .tools.audit_tools import get_usage_report as impl
 
                 return await impl(
-                    days=7,
+                    days=days,
                     state=server,
                 )
 

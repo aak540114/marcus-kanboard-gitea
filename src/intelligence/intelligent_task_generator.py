@@ -467,7 +467,7 @@ class IntelligentTaskGenerator:
             # Ensure phase is a string
             phase_str = str(template.get("phase", "backend"))
             task = self._create_task_from_template(
-                customized_template, phase_str, context
+                customized_template, phase_str, context, feature_name=feature.name
             )
             tasks.append(task)
 
@@ -704,7 +704,11 @@ class IntelligentTaskGenerator:
         return customized
 
     def _create_task_from_template(
-        self, template: Dict[str, Any], phase: str, context: ProjectContext
+        self,
+        template: Dict[str, Any],
+        phase: str,
+        context: ProjectContext,
+        feature_name: Optional[str] = None,
     ) -> Task:
         """Create Task object from template."""
         # Generate unique ID
@@ -763,6 +767,16 @@ class IntelligentTaskGenerator:
             "phase": phase,
             "generated": True,
             "dependencies_names": template.get("dependencies", []),
+            # Which Feature this task was templated for, if any (unset for
+            # project-wide integration/testing/deployment tasks). Lets
+            # _extract_dependencies prefer resolving a dependency name
+            # against this task's OWN feature first — templates are
+            # reused verbatim across every feature in the same category
+            # (see _categorize_feature/_customize_template_for_feature),
+            # so two features can legitimately produce tasks with the
+            # identical literal name, and a single global name→id map
+            # would silently wire a dependency to the WRONG feature's task.
+            "feature_name": feature_name,
         }
 
         return task
@@ -770,17 +784,38 @@ class IntelligentTaskGenerator:
     def _extract_dependencies(self, tasks: List[Task]) -> Dict[str, List[str]]:
         """Extract dependencies between tasks."""
         dependencies = {}
-        task_name_to_id = {task.name: task.id for task in tasks}
+        # A single global name->id map is ambiguous: the same template set
+        # (e.g. every "user_authentication"-categorized feature) is reused
+        # verbatim across features, so two features can produce tasks with
+        # the identical literal name ("Implement user registration", ...).
+        # Resolve each task's dependency names against its OWN feature's
+        # tasks first (feature_name, stashed by _create_task_from_template),
+        # only falling back to the global map for cross-feature references
+        # (e.g. integration/testing-phase tasks that legitimately depend on
+        # a specific feature's task by name).
+        task_name_to_id: Dict[str, str] = {}
+        per_feature_name_to_id: Dict[str, Dict[str, str]] = {}
+        for task in tasks:
+            task_name_to_id[task.name] = task.id
+            feature_name = None
+            if hasattr(task, "source_context") and task.source_context:
+                feature_name = task.source_context.get("feature_name")
+            if feature_name:
+                per_feature_name_to_id.setdefault(feature_name, {})[
+                    task.name
+                ] = task.id
 
         for task in tasks:
             # Safely extract dependency names from source_context or metadata
             # (for backward compatibility)
             dep_names = []
+            feature_name = None
 
             # Try source_context first (preferred)
             try:
                 if hasattr(task, "source_context") and task.source_context:
                     dep_names = task.source_context.get("dependencies_names", [])
+                    feature_name = task.source_context.get("feature_name")
             except (AttributeError, TypeError):
                 pass
 
@@ -798,14 +833,20 @@ class IntelligentTaskGenerator:
                     dep_names = []
 
             task_deps = []
+            own_feature_map = (
+                per_feature_name_to_id.get(feature_name, {}) if feature_name else {}
+            )
 
             for dep_name in dep_names:
-                if dep_name in task_name_to_id:
-                    task_deps.append(task_name_to_id[dep_name])
+                dep_id = own_feature_map.get(dep_name) or task_name_to_id.get(
+                    dep_name
+                )
+                if dep_id is not None:
+                    task_deps.append(dep_id)
                     if hasattr(task, "dependencies") and hasattr(
                         task.dependencies, "append"
                     ):
-                        task.dependencies.append(task_name_to_id[dep_name])
+                        task.dependencies.append(dep_id)
 
             dependencies[task.id] = task_deps
 

@@ -257,6 +257,27 @@ def get_tool_definitions(role: str = "agent") -> List[types.Tool]:
                             "'curl -f http://localhost:8000/health'."
                         ),
                     },
+                    "verifications": {
+                        "type": "array",
+                        "description": (
+                            "Preferred over start_command (#523 Slice B): a "
+                            "list of per-outcome verification commands. "
+                            "Marcus runs each and rejects the completion if "
+                            "any exits non-zero. Takes precedence over "
+                            "start_command when both are provided."
+                        ),
+                        "items": {"type": "object"},
+                    },
+                    "evidence": {
+                        "type": "object",
+                        "description": (
+                            "For app types with a behavior-evidence contract "
+                            "(issue #677): evidence captured by running the "
+                            "assembled product (web -> dom + console_errors; "
+                            "pipeline -> output; CLI -> exit_code + stdout). "
+                            "Marcus judges it against the per-type bar."
+                        ),
+                    },
                 },
                 "required": ["agent_id", "task_id", "status"],
             },
@@ -1480,6 +1501,8 @@ async def handle_tool_call(
                     state=state,
                     start_command=arguments.get("start_command"),
                     readiness_probe=arguments.get("readiness_probe"),
+                    verifications=arguments.get("verifications"),
+                    evidence=arguments.get("evidence"),
                 )
 
         elif name == "report_blocker":

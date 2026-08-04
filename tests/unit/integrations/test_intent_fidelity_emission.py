@@ -8,8 +8,16 @@ path returns.  These tests cover:
 - Both decomposer paths emit with the expected payload shape.
 - No-op when ``intent_fidelity_score`` is ``None`` (coverage didn't
   run, e.g. flag off or no outcomes extracted).
-- No-op when ``self.state`` has no ``events`` attribute or events is
-  falsy (CLI / test paths without a wired event bus).
+- When ``self.state`` has no ``events`` attribute, or events is falsy
+  (``config.features.events=False`` — a real, supported deployment
+  config, not just a test double), the internal ``PLANNING_INTENT_
+  FIDELITY`` event publish is skipped, but the Phase 0 cost-signal
+  stash (``self._project_intent_fidelity_score`` etc., #546) and the
+  PostHog telemetry forward must still run — neither depends on the
+  event bus. Regression: they used to share the same early return as
+  the event publish, so any deployment with events disabled silently
+  left ``runs.intent_fidelity_score``/``coverage_before_fill``/
+  ``coverage_after_fill`` NULL forever.
 
 The helper itself is implementation-agnostic of which decomposer
 called it — these tests pin the payload shape directly rather than
@@ -301,13 +309,12 @@ class TestEmitIntentFidelityEvent:
         )
 
     @pytest.mark.asyncio
-    async def test_noop_when_state_has_no_events_attr(self) -> None:
-        """State without an ``events`` attribute is treated as no-bus.
-
-        Some test harnesses pass a stripped-down state object that
-        omits the event system entirely.  The helper must not raise
-        ``AttributeError`` — it should silently no-op.
-        """
+    async def test_event_publish_skipped_when_state_has_no_events_attr(
+        self,
+    ) -> None:
+        """State without an ``events`` attribute skips the event publish
+        without raising ``AttributeError`` — but still stashes the Phase 0
+        cost signals (see module docstring regression note)."""
 
         class StrippedState:
             """State stand-in with no events attribute."""
@@ -323,9 +330,15 @@ class TestEmitIntentFidelityEvent:
             gap_filled_outcomes=[],
         )
 
+        assert creator._project_intent_fidelity_score == 0.8
+
     @pytest.mark.asyncio
-    async def test_noop_when_events_is_falsy(self) -> None:
-        """state.events is None — also a silent no-op."""
+    async def test_event_publish_skipped_when_events_is_falsy(self) -> None:
+        """Regression: state.events=None (config.features.events off)
+        must still stash the Phase 0 cost signals — only the internal
+        event publish depends on the event bus. Previously both were
+        gated behind the same early return, so this left
+        runs.intent_fidelity_score NULL forever on any such deployment."""
         state = MagicMock()
         state.events = None
         creator = _make_creator(state=state)
@@ -334,9 +347,11 @@ class TestEmitIntentFidelityEvent:
             project_name="snake-v32",
             decomposer="feature_based",
             intent_fidelity_score=0.5,
-            coverage_before_fill={},
+            coverage_before_fill={"play": ["t1"], "score": []},
             coverage_after_fill=None,
             gap_filled_outcomes=[],
         )
 
-        # No raise — and nothing to assert on a None.
+        assert creator._project_intent_fidelity_score == 0.5
+        assert creator._project_coverage_before_fill == 0.5
+        assert creator._project_coverage_after_fill == 0.5

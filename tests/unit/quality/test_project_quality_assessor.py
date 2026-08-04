@@ -455,6 +455,33 @@ class TestProjectQualityAssessor:
         # With evenly distributed tasks, balance should be high
         assert balance > 0.7
 
+    def test_code_quality_score_is_zero_with_no_github_data(self, quality_assessor):
+        """Regression: with no GitHub data ever collected (default-
+        constructed metrics), the score previously came out as a
+        false-positive-perfect 1.0 — several of the averaged metrics are
+        "penalty" scores (e.g. 1.0 - security_issues) that equal 1.0 by
+        default and were the ONLY entries surviving the `s > 0` filter
+        once everything else was legitimately 0. An unmeasured dimension
+        must report 0 (unknown), not 1 (perfect)."""
+        score = quality_assessor._calculate_code_quality_score(CodeQualityMetrics())
+        assert score == 0.0
+
+    def test_process_quality_score_is_zero_with_no_github_data(self, quality_assessor):
+        """Same regression as code quality, for the process dimension."""
+        score = quality_assessor._calculate_process_quality_score(
+            ProcessQualityMetrics()
+        )
+        assert score == 0.0
+
+    def test_code_quality_score_still_reflects_real_github_data(
+        self, quality_assessor
+    ):
+        """The zero-default guard must not swallow a genuinely populated
+        metrics object — only the untouched all-defaults case."""
+        metrics = CodeQualityMetrics(test_coverage=0.85, code_review_coverage=0.95)
+        score = quality_assessor._calculate_code_quality_score(metrics)
+        assert score > 0.5
+
     def test_extract_quality_insights(self, quality_assessor):
         """Test quality insights extraction"""
         # Arrange

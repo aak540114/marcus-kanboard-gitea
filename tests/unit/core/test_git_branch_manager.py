@@ -10,11 +10,16 @@ every subsequent git operation for every other ticket fails with
 "you have not concluded your merge".
 """
 
-from unittest.mock import AsyncMock
+import subprocess
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.core.git_branch_manager import BranchManager, BranchManagerConfig
+from src.core.git_branch_manager import (
+    _GIT_CMD_TIMEOUT,
+    BranchManager,
+    BranchManagerConfig,
+)
 
 
 def _mgr() -> BranchManager:
@@ -25,6 +30,45 @@ def _mgr() -> BranchManager:
 def _calls(git_mock) -> list:
     """Return the list of git argv tuples issued via the mocked _git."""
     return [c.args for c in git_mock.call_args_list]
+
+
+class TestGitCommandTimeout:
+    """Regression: BranchManager._git ran subprocess.run with no timeout=,
+    so an unresponsive remote (network partition, stalled TCP negotiation,
+    a credential prompt on a misconfigured remote) could block the shared
+    executor thread forever — the exact hazard dev_environment.py already
+    guards its docker calls against, just never applied to git."""
+
+    @pytest.mark.asyncio
+    async def test_timeout_expired_returns_a_failure_tuple_not_a_hang(self):
+        """A timed-out git call must resolve to (nonzero, "", stderr),
+        matching _git's normal contract, instead of raising uncaught or
+        blocking indefinitely."""
+        mgr = _mgr()
+
+        with patch(
+            "src.core.git_branch_manager.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="git push", timeout=60),
+        ):
+            returncode, stdout, stderr = await mgr._git("push", "origin", "main")
+
+        assert returncode != 0
+        assert "timed out" in stderr
+
+    @pytest.mark.asyncio
+    async def test_subprocess_run_is_called_with_a_timeout(self):
+        """Every git subprocess call must pass timeout= — the bug was its
+        total absence, not a wrong value."""
+        mgr = _mgr()
+        fake_result = MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch(
+            "src.core.git_branch_manager.subprocess.run",
+            return_value=fake_result,
+        ) as mock_run:
+            await mgr._git("status")
+
+        assert mock_run.call_args.kwargs.get("timeout") == _GIT_CMD_TIMEOUT
 
 
 class TestMergeToMainAbortsOnFailure:

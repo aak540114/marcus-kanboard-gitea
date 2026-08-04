@@ -905,6 +905,69 @@ class TestDependencyManagement:
         assert dependencies["task-1"] == []
         assert task.dependencies == []
 
+    def test_dependency_resolves_within_own_feature_not_a_same_named_task(
+        self, task_generator
+    ):
+        """Regression: feature_task_templates are reused verbatim across
+        every feature in the same category (e.g. every "user_
+        authentication"-categorized feature gets a task literally named
+        "Implement user registration"), so two DIFFERENT features can
+        legitimately produce tasks with the identical name. A single
+        global name->id map collapsed to whichever task with that name
+        came last, wiring a dependency to the WRONG feature's task and
+        silently dropping the correct one from anyone's dependency list.
+        Each task's dependency names must resolve against its OWN
+        feature's tasks first."""
+
+        def _make_task(task_id, name, feature_name, dep_names):
+            return Task(
+                id=task_id,
+                name=name,
+                description="",
+                status=TaskStatus.TODO,
+                priority=Priority.MEDIUM,
+                assigned_to=None,
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+                due_date=None,
+                estimated_hours=4.0,
+                dependencies=[],
+                source_context={
+                    "dependencies_names": dep_names,
+                    "feature_name": feature_name,
+                },
+            )
+
+        # Two features in the same category ("User Login", "Admin User
+        # Management") both produce a task named "Implement user
+        # registration" and a task named "Implement user login" that
+        # depends on it — exactly the template-reuse collision.
+        login_reg = _make_task("t1", "Implement user registration", "User Login", [])
+        login_login = _make_task(
+            "t2",
+            "Implement user login",
+            "User Login",
+            ["Implement user registration"],
+        )
+        admin_reg = _make_task(
+            "t3", "Implement user registration", "Admin User Management", []
+        )
+        admin_login = _make_task(
+            "t4",
+            "Implement user login",
+            "Admin User Management",
+            ["Implement user registration"],
+        )
+
+        dependencies = task_generator._extract_dependencies(
+            [login_reg, login_login, admin_reg, admin_login]
+        )
+
+        # Each feature's login task must depend on ITS OWN registration
+        # task, not the other feature's.
+        assert dependencies["t2"] == ["t1"]
+        assert dependencies["t4"] == ["t3"]
+
 
 class TestProjectMetrics:
     """Test project duration and team size calculations."""

@@ -563,20 +563,26 @@ class NaturalLanguageProjectCreator(NaturalLanguageTaskCreator):
         """
         if intent_fidelity_score is None:
             return
-        if not (hasattr(self.state, "events") and self.state.events):
-            return
-        await self.state.events.publish_nowait(
-            EventTypes.PLANNING_INTENT_FIDELITY,
-            "nlp_orchestrator",
-            {
-                "project_name": project_name,
-                "decomposer": decomposer,
-                "intent_fidelity_score": intent_fidelity_score,
-                "coverage_before_fill": coverage_before_fill,
-                "coverage_after_fill": coverage_after_fill,
-                "gap_filled_outcomes": gap_filled_outcomes,
-            },
-        )
+        # Only the internal event publish depends on the event bus — the
+        # Phase 0 cost-signal stash and PostHog telemetry forward below
+        # are independent of it and must still run when events are off
+        # (config.features.events=False sets self.state.events to None).
+        # This used to be a single early return covering all three, which
+        # silently left runs.intent_fidelity_score/coverage_before_fill/
+        # coverage_after_fill NULL forever on any such deployment.
+        if hasattr(self.state, "events") and self.state.events:
+            await self.state.events.publish_nowait(
+                EventTypes.PLANNING_INTENT_FIDELITY,
+                "nlp_orchestrator",
+                {
+                    "project_name": project_name,
+                    "decomposer": decomposer,
+                    "intent_fidelity_score": intent_fidelity_score,
+                    "coverage_before_fill": coverage_before_fill,
+                    "coverage_after_fill": coverage_after_fill,
+                    "gap_filled_outcomes": gap_filled_outcomes,
+                },
+            )
 
         # The internal event carries coverage as MAPS
         # (outcome.id -> covering task ids); both the telemetry event
