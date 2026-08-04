@@ -2666,6 +2666,26 @@ class HumanGatedWorkflow:
         # Clear its liveness heartbeat so the board highlight drops at once.
         self._clear_progress_activity(ticket_id)
 
+        # Record when the AI agent finished — once, here, regardless of
+        # which gate the ticket goes through next (see
+        # CommentFormatter.ai_work_finished's docstring for why this is a
+        # comment rather than Kanboard's native "Completed" date field).
+        # Best-effort: a post failure must not block the completion signal
+        # itself.
+        try:
+            await self._post_comment(
+                ticket_id,
+                CommentFormatter.ai_work_finished(
+                    ticket_id, datetime.now(timezone.utc)
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not post work-finished comment for ticket %s: %s",
+                ticket_id,
+                exc,
+            )
+
         gate = await self._get_effective_gate(ticket_id)
 
         if gate == "ai":
@@ -4091,6 +4111,19 @@ class HumanGatedWorkflow:
             await self._kanban.move_task_to_column(ticket_id, "in progress")
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not update kanban column to in_progress: %s", exc)
+
+        # Record when the AI agent actually began work — mirrors Kanboard's
+        # native "Start now" link so a human never has to click it
+        # themselves. Only a KanboardKanban-specific capability (other
+        # providers don't have this concept); best-effort, never blocks
+        # starting the ticket.
+        if hasattr(self._kanban, "set_task_started_if_unset"):
+            try:
+                await self._kanban.set_task_started_if_unset(ticket_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Could not set start date for ticket %s: %s", ticket_id, exc
+                )
 
         # This ticket is not necessarily brand new: create_branch RESUMES an
         # existing remote branch rather than overwriting it (see its

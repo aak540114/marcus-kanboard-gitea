@@ -656,6 +656,54 @@ class KanboardKanban(KanbanInterface):
         # Fall back to recording the assignee as a comment
         return await self.add_comment(task_id, f"[Marcus] Assigned to: {assignee_id}")
 
+    async def set_task_started_if_unset(self, task_id: str) -> bool:
+        """Set a task's ``date_started`` to now, unless already set.
+
+        Mirrors Kanboard's own "Start now" link (``TaskModificationController
+        ::start``), which sets the same field to ``time()`` — this lets
+        Marcus record when an AI agent actually began work without a human
+        having to click that link themselves. Deliberately does NOT use
+        Kanboard's "close task" action for the symmetrical end-of-work
+        timestamp: that also sets ``is_active = 0``, which hides the card
+        from every column on the board (see the ``move_task_to_column``
+        docstring above for the prior regression this caused) — the AI
+        completion signal is recorded as a comment instead
+        (``CommentFormatter.ai_work_finished``).
+
+        Set-if-unset rather than unconditional: this is called every time
+        ``_start_ai_work`` successfully begins work, including RESUMES
+        after a pause (BLOCKED/WAITING_FOR_HUMAN/REOPENED → IN_PROGRESS,
+        not just a first-ever TODO/READY start) — an unconditional set
+        would overwrite the original start time on every resume, losing
+        when the AI first began.
+
+        Parameters
+        ----------
+        task_id : str
+            Kanboard task ID.
+
+        Returns
+        -------
+        bool
+            ``True`` if ``date_started`` is set (already was, or just got
+            set now); ``False`` only on an RPC failure.
+        """
+        if self._client is None:
+            raise RuntimeError("Call connect() before set_task_started_if_unset()")
+        try:
+            raw = await self._rpc("getTask", task_id=int(task_id))
+            if raw and int(raw.get("date_started") or 0) > 0:
+                return True
+            result = await self._rpc(
+                "updateTask",
+                id=int(task_id),
+                date_started=int(datetime.now(timezone.utc).timestamp()),
+            )
+            return bool(result)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("set_task_started_if_unset failed for task %s: %s", task_id, exc)
+            return False
+
     def _columns_for(self, project_id: int) -> Dict[str, int]:
         """Return the cached column-name→id map for a given project.
 

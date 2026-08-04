@@ -69,6 +69,7 @@ def mock_kanban():
     kb.move_task_to_column = AsyncMock(return_value=True)
     kb.add_comment = AsyncMock(return_value=1)
     kb.get_task_by_id = AsyncMock(return_value=None)
+    kb.set_task_started_if_unset = AsyncMock(return_value=True)
     return kb
 
 
@@ -3086,6 +3087,24 @@ class TestOrchestrateWork:
         assert lifecycle.get("5", "kanboard").assignee == "alice"
 
     @pytest.mark.asyncio
+    async def test_starting_work_sets_the_kanboard_start_date(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """Marcus sets Kanboard's native date_started when AI work
+        actually begins, mirroring the "Start now" link so a human never
+        has to click it."""
+        lifecycle.get_or_create("5c", "kanboard")
+        lifecycle.transition("5c", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("5c", "kanboard", "alice")
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            side_effect=lambda provider, tid: f"ticket/{provider}/{tid}",
+        ):
+            await workflow.orchestrate_work(agent_id="w1")
+
+        mock_kanban.set_task_started_if_unset.assert_awaited_once_with("5c")
+
+    @pytest.mark.asyncio
     async def test_ticket_assigned_to_anyone_is_handed_out(
         self, workflow, lifecycle, mock_kanban, mock_branch
     ):
@@ -3152,6 +3171,28 @@ class TestOrchestrateWork:
         )
         assert res["status"] == "done"
         assert lifecycle.get("8", "kanboard").state == TicketState.WAITING_FOR_HUMAN
+
+    @pytest.mark.asyncio
+    async def test_done_report_posts_a_work_finished_comment(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """Marcus records when the AI agent finished as a comment, not
+        Kanboard's native "Completed" date field (that field only sets
+        via Kanboard's "close task" action, which also archives the card
+        and hides it from every board column — see the docstring on
+        set_task_started_if_unset)."""
+        lifecycle.get_or_create("8b", "kanboard")
+        lifecycle.transition("8b", "kanboard", TicketState.READY)
+        lifecycle.claim_ticket("8b", "kanboard", "w4")
+        lifecycle.transition("8b", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.set_assignee("8b", "kanboard", "w4")
+
+        await workflow.orchestrate_work(
+            agent_id="w4", ticket_id="8b", report="DONE - shipped the feature"
+        )
+
+        posted = [c.args[-1] for c in mock_kanban.add_comment.call_args_list]
+        assert any("Work Finished" in body for body in posted)
 
     def test_classify_report_intent(self, workflow):
         """Report-prefix protocol maps to intents."""

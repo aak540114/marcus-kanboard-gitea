@@ -2,6 +2,7 @@
 Unit tests for src/core/comment_protocol.py
 """
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from src.core.comment_protocol import (
@@ -176,6 +177,15 @@ class TestCommentFormatter:
         )
         assert "http://localhost:9200" in body
         assert "9200" in body
+
+    def test_ai_work_finished_shows_timestamp(self):
+        """ai_work_finished renders the given completion time."""
+        body = CommentFormatter.ai_work_finished(
+            ticket_id="T-14",
+            finished_at=datetime(2026, 8, 4, 14, 32, tzinfo=timezone.utc),
+        )
+        assert "2026-08-04 14:32 UTC" in body
+        assert CommentParser.is_marcus_comment(body) is True
 
     def test_merged_shows_branch_and_main(self):
         """merged comment names both the ticket branch and main branch."""

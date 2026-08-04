@@ -1989,6 +1989,50 @@ class TestAssignTask:
 
 
 # ---------------------------------------------------------------------------
+# set_task_started_if_unset tests
+# ---------------------------------------------------------------------------
+
+
+class TestSetTaskStartedIfUnset:
+    """Test set_task_started_if_unset() — mirrors Kanboard's native
+    "Start now" link so Marcus can set it automatically when an AI agent
+    begins work, without a human having to click it."""
+
+    @pytest.mark.asyncio
+    async def test_sets_date_started_when_unset(self, kanban):
+        """date_started is 0 (never started) -> updateTask is called."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response({"id": 10, "date_started": "0"}),
+                _rpc_response(True),
+            ]
+        )
+        result = await kanban.set_task_started_if_unset("10")
+        assert result is True
+        assert kanban._client.post.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_noop_when_already_started(self, kanban):
+        """date_started already set -> updateTask is NOT called again,
+        so a resume never overwrites the original start time."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            return_value=_rpc_response({"id": 10, "date_started": "1700000000"})
+        )
+        result = await kanban.set_task_started_if_unset("10")
+        assert result is True
+        assert kanban._client.post.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_returns_false_on_rpc_failure(self, kanban):
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(side_effect=RuntimeError("API error"))
+        result = await kanban.set_task_started_if_unset("10")
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
 # get_project_metrics tests
 # ---------------------------------------------------------------------------
 

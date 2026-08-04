@@ -692,4 +692,34 @@ $agentsUrl = $marcusUrl . '/api/active-agents';
             if (branchEl) { branchEl.textContent = 'Could not reach Marcus.'; }
         });
 }());
+
+// Hide Kanboard's native "Start now" link (sets date_started via
+// TaskModificationController::start). Marcus now sets date_started
+// itself the moment an AI agent actually begins work (see
+// set_task_started_if_unset in kanboard_kanban.py) — so a human clicking
+// this link no longer does anything useful and just invites confusion
+// about who/what "started" the ticket.
+//
+// Matched by visible text rather than by copying Kanboard's whole
+// task/details.php template to remove the link there: this file's hook
+// point (template:task:sidebar:information) only lets Marcus ADD content
+// next to the native task view, not edit it directly, and shadowing that
+// entire core template (title, description, assignee, tags, ...) would
+// silently stop receiving any of Kanboard's own fixes/changes to it on
+// future version bumps — a much larger risk than this one link is worth.
+// Text-matching the exact label Kanboard renders (t('Start now'), see
+// TaskModificationController::start's usage in task/details.php) is more
+// robust than guessing the generated href, which depends on Kanboard's
+// internal routing and isn't guaranteed stable across versions either.
+(function () {
+    function hideStartNowLink() {
+        document.querySelectorAll('a').forEach(function (a) {
+            if (a.textContent.trim() === 'Start now') {
+                var container = a.closest('span, li, td, div') || a;
+                container.style.display = 'none';
+            }
+        });
+    }
+    document.addEventListener('DOMContentLoaded', hideStartNowLink);
+}());
 </script>

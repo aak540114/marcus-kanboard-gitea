@@ -37,6 +37,7 @@ CommentParser
 
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -128,6 +129,9 @@ class CommentType(Enum):
         One multi-round verification pass completed without issues.
     VERIFICATION_ROUND_FAILED : str
         One multi-round verification pass found issues.
+    AI_WORK_FINISHED : str
+        AI agent signalled implementation complete — posted once,
+        regardless of which gate (human/AI) the ticket then goes through.
     """
 
     AC_GENERATED = "ac_generated"
@@ -142,6 +146,7 @@ class CommentType(Enum):
     VERIFICATION_FAILED = "verification_failed"
     VERIFICATION_ROUND_PASSED = "verification_round_passed"
     VERIFICATION_ROUND_FAILED = "verification_round_failed"
+    AI_WORK_FINISHED = "ai_work_finished"
 
 
 @dataclass
@@ -445,6 +450,45 @@ class CommentFormatter:
             f"The branch will be merged to main automatically.\n\n"
             f"**To request changes:** leave a comment describing what needs "
             f"to be different — Marcus will acknowledge and rework."
+            f"{_FOOTER}"
+        )
+        return body
+
+    @classmethod
+    def ai_work_finished(cls, ticket_id: str, finished_at: datetime) -> str:
+        """Comment recording when the AI agent finished its work.
+
+        Posted once, from :meth:`HumanGatedWorkflow.signal_ready_for_review
+        <src.workflows.human_gated_workflow.HumanGatedWorkflow.signal_ready_for_review>`,
+        before branching into human-gate (→ WAITING_FOR_HUMAN) or AI-gate
+        (→ merged/DONE) behavior — this is the moment the AI agent itself
+        signalled "implementation complete", regardless of which column
+        the ticket then lands in.
+
+        Deliberately a comment rather than Kanboard's native "Completed"
+        date field: that field is only ever set by Kanboard's "close task"
+        action, which also archives the card (``is_active = 0``) and hides
+        it from every board column — see ``set_task_started_if_unset``'s
+        docstring in ``kanboard_kanban.py`` for the prior regression that
+        caused.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Ticket identifier.
+        finished_at : datetime
+            When the AI agent signalled completion (timezone-aware, UTC).
+
+        Returns
+        -------
+        str
+            Full comment body.
+        """
+        timestamp = finished_at.strftime("%Y-%m-%d %H:%M UTC")
+        body = (
+            f"{cls._header(CommentType.AI_WORK_FINISHED, ticket_id)}\n"
+            f"### Marcus Agent — Work Finished\n\n"
+            f"AI implementation finished at **{timestamp}**."
             f"{_FOOTER}"
         )
         return body
