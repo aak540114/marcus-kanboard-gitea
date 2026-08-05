@@ -100,6 +100,25 @@ class BranchManager:
     def __init__(self, config: Optional[BranchManagerConfig] = None) -> None:
         """Initialise with optional config."""
         self.config = config or BranchManagerConfig()
+        # One instance is shared by every ticket of a project (see
+        # HumanGatedWorkflow._branch_for_ticket's docstring) — they all
+        # operate on the SAME local clone/working directory. Without this,
+        # two tickets' git operations running concurrently (a common case:
+        # multiple agents, or a webhook and a poll cycle, touching
+        # different tickets of the same project around the same time) can
+        # interleave checkouts/merges against that one shared working
+        # tree, corrupting it for both. Symptom seen in production: ticket
+        # A's merge conflict leaves the clone mid-merge (MERGE_HEAD set)
+        # just as ticket B's create_branch tries to checkout its own
+        # branch — checkout unconditionally refuses ("you have not
+        # concluded your merge") no matter which branch it targets, so B
+        # fails with a misleading "check repository permissions" error
+        # even though B's branch is completely fine on the remote.
+        # Held only around the three entry points that mutate the working
+        # tree/index (create_branch, merge_to_main, rebase_on_main) — see
+        # each method's *_unlocked twin, used for internal calls between
+        # them so a lock holder never re-acquires its own lock.
+        self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Branch naming
@@ -151,6 +170,62 @@ class BranchManager:
         rc, _, _ = await self._git("show-ref", "--verify", "--quiet", ref)
         return rc == 0
 
+    async def _checkout_with_conflict_recovery(
+        self, *checkout_args: str
+    ) -> Tuple[int, str, str]:
+        """Run ``git checkout <checkout_args>``, self-healing a leftover
+        in-progress merge/rebase from a PREVIOUS ticket's failure in this
+        SHARED clone (see the ``_lock`` comment in ``__init__``) instead
+        of failing outright on a stuck ``MERGE_HEAD``/rebase state that
+        has nothing to do with the current ticket.
+
+        ``git checkout`` unconditionally refuses — regardless of which
+        branch it's switching to, even with ``-B`` — while a merge or
+        rebase is left unresolved (``"you have not concluded your
+        merge"``). ``merge_to_main``'s own ``git merge --abort`` on a
+        genuine conflict is not always guaranteed to leave the clone
+        spotless (and a rarer failure path — a successful local merge
+        whose subsequent push then fails — leaves no abort at all). One
+        retry after cleaning that up recovers the CURRENT ticket's
+        operation without needing to fully diagnose the prior one's
+        failure.
+
+        Parameters
+        ----------
+        *checkout_args : str
+            Arguments passed to ``git checkout`` (e.g. ``"-B",
+            branch_name, "FETCH_HEAD"``).
+
+        Returns
+        -------
+        Tuple[int, str, str]
+            ``(returncode, stdout, stderr)`` of the (possibly retried)
+            checkout.
+        """
+        rc, out, err = await self._git("checkout", *checkout_args)
+        if rc == 0:
+            return rc, out, err
+
+        lower = err.lower()
+        if "you have not concluded your merge" in lower or "merge_head" in lower:
+            logger.warning(
+                "git checkout blocked by a leftover in-progress merge in "
+                "the shared clone (likely from a previous ticket's "
+                "failure) — aborting it and retrying: %s",
+                err.strip(),
+            )
+            await self._git("merge", "--abort")
+            return await self._git("checkout", *checkout_args)
+        if "rebase" in lower and "in progress" in lower:
+            logger.warning(
+                "git checkout blocked by a leftover in-progress rebase in "
+                "the shared clone — aborting it and retrying: %s",
+                err.strip(),
+            )
+            await self._git("rebase", "--abort")
+            return await self._git("checkout", *checkout_args)
+        return rc, out, err
+
     async def create_branch(
         self,
         branch_name: str,
@@ -159,6 +234,11 @@ class BranchManager:
         force: bool = False,
     ) -> bool:
         """Create a ticket's branch, resuming it if it already exists.
+
+        Acquires this manager's shared-clone lock — see the ``_lock``
+        comment in ``__init__``. Internal callers already holding it
+        (:meth:`rebase_on_main`) must call :meth:`_create_branch_unlocked`
+        directly instead, to avoid deadlocking on re-acquisition.
 
         A ticket is not necessarily "brand new" just because Marcus's OWN
         local git clone doesn't have its branch: an agent's prior commits
@@ -197,6 +277,24 @@ class BranchManager:
         bool
             ``True`` if the branch was created, resumed, or already existed.
         """
+        async with self._lock:
+            return await self._create_branch_unlocked(
+                branch_name, from_branch=from_branch, force=force
+            )
+
+    async def _create_branch_unlocked(
+        self,
+        branch_name: str,
+        *,
+        from_branch: Optional[str] = None,
+        force: bool = False,
+    ) -> bool:
+        """Body of :meth:`create_branch`, without acquiring the lock.
+
+        Only call directly when the caller already holds ``self._lock``
+        (:meth:`rebase_on_main`'s unlocked body) — every other caller must
+        go through the public, lock-acquiring :meth:`create_branch`.
+        """
         base = from_branch or self.config.main_branch
 
         if not force:
@@ -226,8 +324,8 @@ class BranchManager:
                         fetch_stderr.strip(),
                     )
             if fetch_rc == 0:
-                rc, _, stderr = await self._git(
-                    "checkout", "-B", branch_name, "FETCH_HEAD"
+                rc, _, stderr = await self._checkout_with_conflict_recovery(
+                    "-B", branch_name, "FETCH_HEAD"
                 )
                 if rc != 0:
                     logger.error(
@@ -251,8 +349,8 @@ class BranchManager:
             # No prior work anywhere (or force=True): cut the branch fresh.
             await self._git("fetch", self.config.remote, base)
             checkout = "-B" if force else "-b"
-            rc, _, stderr = await self._git(
-                "checkout", checkout, branch_name, f"{self.config.remote}/{base}"
+            rc, _, stderr = await self._checkout_with_conflict_recovery(
+                checkout, branch_name, f"{self.config.remote}/{base}"
             )
             if rc != 0:
                 logger.error("Failed to create branch %s: %s", branch_name, stderr)
@@ -382,9 +480,12 @@ class BranchManager:
         branch_name: str,
         *,
         commit_message: Optional[str] = None,
-        delete_after: bool = True,
+        delete_after: bool = False,
     ) -> bool:
         """Merge *branch_name* into the main branch.
+
+        Acquires this manager's shared-clone lock — see the ``_lock``
+        comment in ``__init__``.
 
         Steps:
         1. Checkout main.
@@ -401,23 +502,43 @@ class BranchManager:
             Merge commit message.  Defaults to a templated message.
         delete_after : bool
             Delete the LOCAL copy of the branch after a successful merge.
-            Default ``True`` — this clone's local branch is Marcus's own
-            throwaway working copy, safe to clean up. The REMOTE branch is
-            never deleted by this method at all (regardless of this flag):
-            the agent's actual commit history lives there, and Marcus's
-            job is to merge it into main, not manage the user's repo
-            housekeeping for them.
+            Default ``False`` — even though this clone's local branch is
+            Marcus's own throwaway working copy (never the agent's actual
+            history, which only ever lives on the REMOTE, untouched by
+            this flag either way), a ticket's branch is kept around
+            locally too unless a caller explicitly opts into cleaning it
+            up, so nothing about a completed ticket disappears from
+            Marcus's own clone by default.
 
         Returns
         -------
         bool
             ``True`` on success.
         """
+        async with self._lock:
+            return await self._merge_to_main_unlocked(
+                branch_name, commit_message=commit_message, delete_after=delete_after
+            )
+
+    async def _merge_to_main_unlocked(
+        self,
+        branch_name: str,
+        *,
+        commit_message: Optional[str] = None,
+        delete_after: bool = False,
+    ) -> bool:
+        """Body of :meth:`merge_to_main`, without acquiring the lock.
+
+        Only call directly when the caller already holds ``self._lock``.
+        Every current caller goes through the public :meth:`merge_to_main`
+        instead — kept symmetric with :meth:`_create_branch_unlocked` for
+        any future internal caller.
+        """
         main = self.config.main_branch
         msg = commit_message or f"merge: {branch_name} (ticket accepted)"
 
         # Checkout main.
-        rc, _, err = await self._git("checkout", main)
+        rc, _, err = await self._checkout_with_conflict_recovery(main)
         if rc != 0:
             logger.error("Cannot checkout %s: %s", main, err)
             return False
@@ -484,6 +605,9 @@ class BranchManager:
     async def rebase_on_main(self, branch_name: str) -> bool:
         """Rebase *branch_name* on the latest main branch.
 
+        Acquires this manager's shared-clone lock — see the ``_lock``
+        comment in ``__init__``.
+
         Used when a ticket is reopened after its branch was already
         merged — a new set of commits are expected on the rebased branch.
 
@@ -498,6 +622,11 @@ class BranchManager:
             ``True`` on success.  ``False`` if there are conflicts that
             need manual resolution.
         """
+        async with self._lock:
+            return await self._rebase_on_main_unlocked(branch_name)
+
+    async def _rebase_on_main_unlocked(self, branch_name: str) -> bool:
+        """Body of :meth:`rebase_on_main`, without acquiring the lock."""
         main = self.config.main_branch
         remote = self.config.remote
 
@@ -505,16 +634,18 @@ class BranchManager:
         await self._git("fetch", remote, main)
 
         # Checkout the ticket branch.
-        rc, _, err = await self._git("checkout", branch_name)
+        rc, _, err = await self._checkout_with_conflict_recovery(branch_name)
         if rc != 0:
-            # Branch may have been deleted after merge — recreate it.
+            # Branch may have been deleted after merge — recreate it. Calls
+            # the UNLOCKED body directly: this method already holds
+            # self._lock, and it is not re-entrant.
             logger.info(
                 "Branch %s not found locally, recreating from %s/%s",
                 branch_name,
                 remote,
                 main,
             )
-            ok = await self.create_branch(branch_name, force=True)
+            ok = await self._create_branch_unlocked(branch_name, force=True)
             if not ok:
                 return False
             await self._git("checkout", branch_name)

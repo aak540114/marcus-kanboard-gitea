@@ -125,16 +125,16 @@ class TestMergeToMainAbortsOnFailure:
         assert ("merge", "--abort") not in _calls(mgr._git)
 
     @pytest.mark.asyncio
-    async def test_successful_merge_deletes_local_branch_but_keeps_remote(self):
-        """By default, a completed ticket's LOCAL branch is cleaned up —
-        it's just Marcus's own throwaway working copy — but the REMOTE
-        branch must survive: it holds the agent's actual commit history,
-        and Marcus's job is to merge a ticket into main, not manage the
+    async def test_delete_after_true_deletes_local_branch_but_keeps_remote(self):
+        """An explicit opt-in cleans up the LOCAL branch — Marcus's own
+        throwaway working copy — but the REMOTE branch must survive
+        either way: it holds the agent's actual commit history, and
+        Marcus's job is to merge a ticket into main, not manage the
         user's remote repo housekeeping for them."""
         mgr = _mgr()
         mgr._git = AsyncMock(return_value=(0, "", ""))
 
-        ok = await mgr.merge_to_main("ticket/kanboard/7")
+        ok = await mgr.merge_to_main("ticket/kanboard/7", delete_after=True)
 
         assert ok is True
         calls = _calls(mgr._git)
@@ -144,8 +144,25 @@ class TestMergeToMainAbortsOnFailure:
         )
 
     @pytest.mark.asyncio
+    async def test_delete_after_defaults_to_false(self):
+        """Regression: a ticket's branch must not vanish from Marcus's own
+        clone just because its merge succeeded (or, previously, even when
+        it failed with a conflict — the old True default combined with a
+        caller passing it unconditionally was the reported symptom).
+        delete_after now defaults to False; nothing is deleted unless a
+        caller explicitly opts in."""
+        mgr = _mgr()
+        mgr._git = AsyncMock(return_value=(0, "", ""))
+
+        ok = await mgr.merge_to_main("ticket/kanboard/7")
+
+        assert ok is True
+        assert ("branch", "-d", "ticket/kanboard/7") not in _calls(mgr._git)
+
+    @pytest.mark.asyncio
     async def test_delete_after_false_keeps_the_local_branch_too(self):
-        """delete_after=False opts out of the local cleanup as well."""
+        """delete_after=False (now also the default) opts out of the
+        local cleanup."""
         mgr = _mgr()
         mgr._git = AsyncMock(return_value=(0, "", ""))
 
@@ -570,3 +587,131 @@ class TestSyncBranch:
         assert ok is True
         calls = _calls(mgr._git)
         assert ("update-ref", "refs/heads/ticket/kanboard/7", "FETCH_HEAD") in calls
+
+
+class TestCheckoutConflictRecovery:
+    """Regression: create_branch/merge_to_main/rebase_on_main all call
+    `git checkout`, which unconditionally refuses ("you have not
+    concluded your merge") while a merge/rebase from a PREVIOUS ticket
+    is left unresolved in this SHARED clone — even when checking out a
+    totally unrelated branch. Reported symptom: create_branch failed
+    with a misleading "check repository permissions" error for a branch
+    that demonstrably existed on the remote, right after another
+    ticket's merge hit a conflict."""
+
+    @pytest.mark.asyncio
+    async def test_create_branch_recovers_from_leftover_merge_state(self):
+        """create_branch's resume-path checkout, blocked by a leftover
+        MERGE_HEAD, aborts it and retries instead of failing outright."""
+        mgr = _mgr()
+        checkout_attempts = []
+
+        async def fake_git(*args):
+            if args[0] == "checkout":
+                checkout_attempts.append(args)
+                if len(checkout_attempts) == 1:
+                    return (
+                        1,
+                        "",
+                        "error: you have not concluded your merge "
+                        "(MERGE_HEAD exists).",
+                    )
+                return (0, "", "")
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+
+        ok = await mgr.create_branch("ticket/kanboard/51")
+
+        assert ok is True
+        assert len(checkout_attempts) == 2  # blocked, then recovered
+        assert ("merge", "--abort") in _calls(mgr._git)
+
+    @pytest.mark.asyncio
+    async def test_merge_to_main_recovers_from_leftover_merge_state(self):
+        """merge_to_main's initial `checkout main`, blocked by a leftover
+        MERGE_HEAD from a DIFFERENT ticket's failed merge sharing this
+        clone, aborts it and retries instead of failing outright."""
+        mgr = _mgr()
+        checkout_attempts = []
+
+        async def fake_git(*args):
+            if args[0] == "checkout" and args[1] == "main":
+                checkout_attempts.append(args)
+                if len(checkout_attempts) == 1:
+                    return (1, "", "you have not concluded your merge")
+                return (0, "", "")
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+
+        ok = await mgr.merge_to_main("ticket/kanboard/7")
+
+        assert ok is True
+        assert len(checkout_attempts) == 2
+
+    @pytest.mark.asyncio
+    async def test_unrelated_checkout_failure_is_not_retried(self):
+        """A checkout failure with no merge/rebase signature (e.g. a
+        genuinely missing branch) is returned as-is, not endlessly
+        retried or misdiagnosed as leftover conflict state."""
+        mgr = _mgr()
+        mgr._git = AsyncMock(
+            return_value=(1, "", "pathspec 'nope' did not match any file(s)")
+        )
+
+        rc, _, err = await mgr._checkout_with_conflict_recovery("nope")
+
+        assert rc == 1
+        assert ("merge", "--abort") not in _calls(mgr._git)
+        assert ("rebase", "--abort") not in _calls(mgr._git)
+
+
+class TestSharedCloneLock:
+    """Regression: BranchManager instances are shared across every ticket
+    of a project (HumanGatedWorkflow._branch_for_ticket caches one per
+    repo path) — without serializing access, two tickets' git operations
+    running concurrently could interleave checkouts/merges against the
+    same working tree and corrupt it for both."""
+
+    @pytest.mark.asyncio
+    async def test_create_branch_and_merge_to_main_do_not_interleave(self):
+        """Two concurrent calls against the same manager never have their
+        underlying git commands interleaved — one fully completes (all
+        its _git calls contiguous) before the other's first call."""
+        import asyncio
+
+        mgr = _mgr()
+        order = []
+
+        async def fake_git(*args):
+            order.append(("start", args))
+            await asyncio.sleep(0)  # yield, so a race WOULD interleave here
+            order.append(("end", args))
+            if args[0] == "fetch":
+                return (1, "", "couldn't find remote ref")
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+
+        await asyncio.gather(
+            mgr.create_branch("ticket/kanboard/1"),
+            mgr.merge_to_main("ticket/kanboard/2"),
+        )
+
+        # For every ("start", X) there must be a matching ("end", X)
+        # immediately reachable before a DIFFERENT call's "start" — i.e.
+        # no call starts while another is still mid-flight. Verify by
+        # checking every "start" is immediately followed (ignoring other
+        # complete start/end pairs) by its own "end" before any other
+        # call's "start" appears while it's outstanding.
+        outstanding = 0
+        for phase, _ in order:
+            if phase == "start":
+                assert outstanding == 0, (
+                    "a git call started while another was still in "
+                    "flight — the shared-clone lock did not serialize them"
+                )
+                outstanding += 1
+            else:
+                outstanding -= 1
