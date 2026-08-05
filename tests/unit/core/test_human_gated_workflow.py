@@ -71,6 +71,7 @@ def mock_kanban():
     kb.get_task_by_id = AsyncMock(return_value=None)
     kb.set_task_started_if_unset = AsyncMock(return_value=True)
     kb.set_merge_conflict_flag = AsyncMock(return_value=True)
+    kb.get_task_color = AsyncMock(return_value=None)
     return kb
 
 
@@ -3774,6 +3775,86 @@ class TestDecomposition:
         # status from parent" behaviour on the board itself.
         mock_kanban.move_task_to_column.assert_any_await("201", "ready")
         mock_kanban.move_task_to_column.assert_any_await("202", "ready")
+
+    @pytest.mark.asyncio
+    async def test_decompose_children_inherit_parent_color(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Children get the parent's card color — the most visible way to
+        show "these belong together" on the board itself, since the "is
+        a child of" link is only visible once a card is opened."""
+        self._big_ticket(lifecycle)
+
+        async def fake_llm(prompt):
+            return (
+                '{"subtasks": [{"title": "Backend", "description": "api", '
+                '"acceptance_criteria": "- [ ] api"}, {"title": "Frontend", '
+                '"description": "ui", "acceptance_criteria": "- [ ] ui"}]}'
+            )
+
+        workflow._llm_generate = fake_llm
+
+        created = {"n": 300}
+
+        async def fake_create(data):
+            created["n"] += 1
+            t = MagicMock()
+            t.id = str(created["n"])
+            t.name = data["name"]
+            return t
+
+        mock_kanban.create_task = AsyncMock(side_effect=fake_create)
+        mock_kanban.create_task_link = AsyncMock(return_value=True)
+        mock_kanban.get_task_color = AsyncMock(return_value="yellow")
+        parent = MagicMock(description="do a lot")
+        parent.name = "Big"
+        parent.source_context = {"kanboard_task": {"project_id": 3}}
+        mock_kanban.get_task_by_id = AsyncMock(return_value=parent)
+
+        await workflow.decompose_ticket("100")
+
+        mock_kanban.get_task_color.assert_awaited_once_with("100")
+        call = mock_kanban.create_task.await_args_list[0]
+        assert call.args[0]["color_id"] == "yellow"
+
+    @pytest.mark.asyncio
+    async def test_decompose_children_omit_color_when_parent_has_none(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """No parent color resolvable -> children are created without a
+        color_id override rather than an incorrect hardcoded one."""
+        self._big_ticket(lifecycle)
+
+        async def fake_llm(prompt):
+            return (
+                '{"subtasks": [{"title": "Backend", "description": "api", '
+                '"acceptance_criteria": "- [ ] api"}, {"title": "Frontend", '
+                '"description": "ui", "acceptance_criteria": "- [ ] ui"}]}'
+            )
+
+        workflow._llm_generate = fake_llm
+
+        created = {"n": 300}
+
+        async def fake_create(data):
+            created["n"] += 1
+            t = MagicMock()
+            t.id = str(created["n"])
+            t.name = data["name"]
+            return t
+
+        mock_kanban.create_task = AsyncMock(side_effect=fake_create)
+        mock_kanban.create_task_link = AsyncMock(return_value=True)
+        mock_kanban.get_task_color = AsyncMock(return_value=None)
+        parent = MagicMock(description="do a lot")
+        parent.name = "Big"
+        parent.source_context = {"kanboard_task": {"project_id": 3}}
+        mock_kanban.get_task_by_id = AsyncMock(return_value=parent)
+
+        await workflow.decompose_ticket("100")
+
+        call = mock_kanban.create_task.await_args_list[0]
+        assert "color_id" not in call.args[0]
 
     @pytest.mark.asyncio
     async def test_decompose_creates_a_subtask_entry_per_child(

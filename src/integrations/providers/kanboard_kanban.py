@@ -460,10 +460,13 @@ class KanboardKanban(KanbanInterface):
         task_data : Dict[str, Any]
             Expected keys: ``name`` (required), ``description``,
             ``priority``, ``estimated_hours`` (in hours — Kanboard's
-            native ``time_estimated`` unit), and optionally ``project_id``
-            to create the task in a specific project (defaults to the
+            native ``time_estimated`` unit), optionally ``project_id`` to
+            create the task in a specific project (defaults to the
             configured project — sub-tickets must land in their PARENT's
-            project, which may differ).
+            project, which may differ), and optionally ``color_id`` (a
+            Kanboard color name, e.g. ``"yellow"``) — see
+            :meth:`get_task_color`, used to make a decomposed ticket's
+            children visually match their parent.
 
         Returns
         -------
@@ -479,19 +482,54 @@ class KanboardKanban(KanbanInterface):
         # the value with an "hours" suffix) — do NOT convert to seconds.
         estimated_hours = float(task_data.get("estimated_hours", 0))
 
-        task_id = await self._rpc(
-            "createTask",
+        kwargs: Dict[str, Any] = dict(
             project_id=int(task_data.get("project_id") or self._project_id),
             title=task_data.get("name", ""),
             description=task_data.get("description", ""),
             priority=kb_priority,
             time_estimated=estimated_hours,
         )
+        if task_data.get("color_id"):
+            kwargs["color_id"] = task_data["color_id"]
+
+        task_id = await self._rpc("createTask", **kwargs)
         if not task_id:
             raise RuntimeError("Kanboard createTask returned no task ID")
 
         raw = await self._rpc("getTask", task_id=int(task_id))
         return self._to_task(raw)
+
+    async def get_task_color(self, task_id: str) -> Optional[str]:
+        """Return a task's Kanboard color name (e.g. ``"yellow"``).
+
+        Used to make a decomposed ticket's children inherit the parent's
+        card color — Kanboard tints the whole card background with this,
+        so it's the most visible way to show "these belong together" on
+        the board without relying on the "is a child of" link, which is
+        only visible once a card is opened.
+
+        Parameters
+        ----------
+        task_id : str
+            Kanboard task ID.
+
+        Returns
+        -------
+        Optional[str]
+            The color name, or ``None`` if the task can't be found or the
+            lookup fails.
+        """
+        if self._client is None:
+            raise RuntimeError("Call connect() before get_task_color()")
+        try:
+            raw = await self._rpc("getTask", task_id=int(task_id))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("get_task_color failed for task %s: %s", task_id, exc)
+            return None
+        if not raw:
+            return None
+        color = raw.get("color_id")
+        return str(color) if color else None
 
     async def create_task_link(
         self,

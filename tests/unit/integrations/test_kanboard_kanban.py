@@ -2132,6 +2132,73 @@ class TestSetMergeConflictFlag:
 
 
 # ---------------------------------------------------------------------------
+# get_task_color / create_task color_id tests
+# ---------------------------------------------------------------------------
+
+
+class TestGetTaskColor:
+    """Test get_task_color() — lets a decomposed ticket's children
+    inherit their parent's card color."""
+
+    @pytest.mark.asyncio
+    async def test_returns_the_color(self, kanban):
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            return_value=_rpc_response({"id": 10, "color_id": "yellow"})
+        )
+        result = await kanban.get_task_color("10")
+        assert result == "yellow"
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_task_not_found(self, kanban):
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(return_value=_rpc_response(None))
+        result = await kanban.get_task_color("10")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_rpc_failure(self, kanban):
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(side_effect=RuntimeError("API error"))
+        result = await kanban.get_task_color("10")
+        assert result is None
+
+
+class TestCreateTaskColor:
+    """create_task() forwards an optional color_id to Kanboard's
+    createTask, so a caller can make a new task visually match another."""
+
+    @pytest.mark.asyncio
+    async def test_forwards_color_id_when_given(self, kanban):
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response(42),
+                _rpc_response({"id": 42, "title": "Child"}),
+            ]
+        )
+        await kanban.create_task({"name": "Child", "color_id": "yellow"})
+        first_call = kanban._client.post.await_args_list[0]
+        assert first_call.kwargs["json"]["params"]["color_id"] == "yellow"
+
+    @pytest.mark.asyncio
+    async def test_omits_color_id_when_not_given(self, kanban):
+        """No color_id in task_data -> the param is left out entirely
+        rather than sent as None/empty, so Kanboard applies its own
+        default rather than an explicit "no color"."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response(42),
+                _rpc_response({"id": 42, "title": "Child"}),
+            ]
+        )
+        await kanban.create_task({"name": "Child"})
+        first_call = kanban._client.post.await_args_list[0]
+        assert "color_id" not in first_call.kwargs["json"]["params"]
+
+
+# ---------------------------------------------------------------------------
 # get_project_metrics tests
 # ---------------------------------------------------------------------------
 

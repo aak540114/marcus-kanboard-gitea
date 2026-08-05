@@ -1544,6 +1544,21 @@ class HumanGatedWorkflow:
         except Exception as exc:  # noqa: BLE001
             logger.debug("Decompose: could not fetch %s: %s", ticket_id, exc)
 
+        # Children inherit the parent's card color — the most visible way
+        # to show "these belong together" on the board itself, since the
+        # "is a child of" link is only visible once a card is opened.
+        # Best-effort: only a KanboardKanban-specific capability, and a
+        # lookup failure must never block decomposing the ticket.
+        parent_color: Optional[str] = None
+        get_color = getattr(self._kanban, "get_task_color", None)
+        if get_color is not None:
+            try:
+                parent_color = await get_color(ticket_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "Decompose: could not fetch color for %s: %s", ticket_id, exc
+                )
+
         # Gate BEFORE the LLM call, not after. That call takes seconds, not
         # microseconds, and is the actual reason a caller's own gate check
         # can go stale before this method's writes happen — checking here,
@@ -1612,6 +1627,8 @@ class HumanGatedWorkflow:
                 # Children must land on the PARENT's board — the provider
                 # defaults to the configured project, which may differ.
                 payload["project_id"] = parent_project_id
+            if parent_color is not None:
+                payload["color_id"] = parent_color
             try:
                 child = await create(payload)
             except Exception as exc:  # noqa: BLE001
