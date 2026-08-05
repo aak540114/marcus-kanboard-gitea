@@ -70,6 +70,7 @@ def mock_kanban():
     kb.add_comment = AsyncMock(return_value=1)
     kb.get_task_by_id = AsyncMock(return_value=None)
     kb.set_task_started_if_unset = AsyncMock(return_value=True)
+    kb.set_merge_conflict_flag = AsyncMock(return_value=True)
     return kb
 
 
@@ -2841,6 +2842,48 @@ class TestReviewFixes:
         # The comment tells the AI agent what to do, not a human.
         posted_bodies = [c.args[-1] for c in mock_kanban.add_comment.call_args_list]
         assert any("rebase" in body.lower() for body in posted_bodies)
+
+    @pytest.mark.asyncio
+    async def test_merge_failure_flags_the_card_visibly(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """Regression: a card bouncing back to Ready after a failed merge
+        was previously only explained in a comment INSIDE the ticket —
+        invisible from the board view, so it looked identical to a fresh,
+        never-started ticket. The card must be visibly flagged too."""
+        mock_branch.merge_to_main = AsyncMock(return_value=False)
+        lifecycle.get_or_create("61", "kanboard")
+        lifecycle.transition("61", "kanboard", TicketState.READY)
+        lifecycle.claim_ticket("61", "kanboard", workflow._agent_id)
+        lifecycle.transition("61", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.set_assignee("61", "kanboard", "alice")
+
+        event = _make_event({"ticket_id": "61", "provider": "kanboard"})
+        await workflow._on_ticket_closed(event)
+
+        mock_kanban.set_merge_conflict_flag.assert_awaited_once_with(
+            "61", present=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_successful_merge_clears_the_flag(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """A ticket that merges successfully must have any leftover
+        merge-conflict flag (from a prior failed attempt) cleared."""
+        mock_branch.merge_to_main = AsyncMock(return_value=True)
+        lifecycle.get_or_create("62", "kanboard")
+        lifecycle.transition("62", "kanboard", TicketState.READY)
+        lifecycle.claim_ticket("62", "kanboard", workflow._agent_id)
+        lifecycle.transition("62", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.set_assignee("62", "kanboard", "alice")
+
+        event = _make_event({"ticket_id": "62", "provider": "kanboard"})
+        await workflow._on_ticket_closed(event)
+
+        mock_kanban.set_merge_conflict_flag.assert_awaited_once_with(
+            "62", present=False
+        )
 
     @pytest.mark.asyncio
     async def test_duplicate_signal_ready_does_not_repost_comment(

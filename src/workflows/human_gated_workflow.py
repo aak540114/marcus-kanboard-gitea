@@ -1003,6 +1003,21 @@ class HumanGatedWorkflow:
             # Stop dev env if running.
             await self._dev_env.stop(ticket_id, self._provider)
 
+            # Clear any merge-conflict flag from a previous failed attempt
+            # on this same ticket — it's resolved now. Best-effort: only a
+            # KanboardKanban-specific capability, never blocks completion.
+            if hasattr(self._kanban, "set_merge_conflict_flag"):
+                try:
+                    await self._kanban.set_merge_conflict_flag(
+                        ticket_id, present=False
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Could not clear merge-conflict flag for %s: %s",
+                        ticket_id,
+                        exc,
+                    )
+
             comment = CommentFormatter.merged(
                 ticket_id=ticket_id,
                 branch_name=branch_name,
@@ -1026,6 +1041,22 @@ class HumanGatedWorkflow:
                 main_branch=main_branch,
             )
             await self._post_comment(ticket_id, comment)
+            # Flag the card itself — visible on the board without opening
+            # the ticket — so a card bouncing back to Ready/In Progress
+            # isn't mistaken for a fresh, never-started ticket. Best-effort:
+            # only a KanboardKanban-specific capability, never blocks the
+            # rest of the recovery flow.
+            if hasattr(self._kanban, "set_merge_conflict_flag"):
+                try:
+                    await self._kanban.set_merge_conflict_flag(
+                        ticket_id, present=True
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Could not set merge-conflict flag for %s: %s",
+                        ticket_id,
+                        exc,
+                    )
             # Send the ticket back to an AI agent to rebase and resolve the
             # conflict itself, rather than parking it for a human — this is
             # an implementation detail like any other (Invariant #2). The

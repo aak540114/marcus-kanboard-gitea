@@ -53,6 +53,7 @@ def workflow(tmp_path):
     kanban.get_task_by_id = AsyncMock(return_value=task_mock)
     kanban.add_comment = AsyncMock(return_value=True)
     kanban.move_task_to_column = AsyncMock(return_value=True)
+    kanban.set_merge_conflict_flag = AsyncMock(return_value=True)
 
     events = MagicMock()
     events.subscribe = MagicMock()

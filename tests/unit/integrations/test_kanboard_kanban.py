@@ -2033,6 +2033,105 @@ class TestSetTaskStartedIfUnset:
 
 
 # ---------------------------------------------------------------------------
+# set_merge_conflict_flag tests
+# ---------------------------------------------------------------------------
+
+
+class TestSetMergeConflictFlag:
+    """Test set_merge_conflict_flag() — a visible board-card tag so a
+    ticket bouncing back to Ready/In Progress after a failed merge isn't
+    mistaken for a fresh, never-started ticket."""
+
+    @pytest.mark.asyncio
+    async def test_adds_tag_when_absent(self, kanban):
+        """present=True with no existing tags -> setTaskTags called with
+        just the merge-conflict tag."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response({"id": 10, "project_id": 1, "tags": []}),
+                _rpc_response(True),
+            ]
+        )
+        result = await kanban.set_merge_conflict_flag("10", present=True)
+        assert result is True
+        second_call = kanban._client.post.await_args_list[1]
+        assert second_call.kwargs["json"]["params"]["tags"] == ["merge-conflict"]
+
+    @pytest.mark.asyncio
+    async def test_preserves_existing_tags_when_adding(self, kanban):
+        """Regression: setTaskTags REPLACES all tags — a human's own tag
+        on the ticket must survive being merged in, not get wiped out."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response(
+                    {"id": 10, "project_id": 1, "tags": [{"name": "urgent"}]}
+                ),
+                _rpc_response(True),
+            ]
+        )
+        result = await kanban.set_merge_conflict_flag("10", present=True)
+        assert result is True
+        second_call = kanban._client.post.await_args_list[1]
+        sent_tags = second_call.kwargs["json"]["params"]["tags"]
+        assert set(sent_tags) == {"urgent", "merge-conflict"}
+
+    @pytest.mark.asyncio
+    async def test_noop_when_tag_already_present(self, kanban):
+        """present=True and the tag is already there -> no RPC needed."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            return_value=_rpc_response(
+                {"id": 10, "project_id": 1, "tags": [{"name": "merge-conflict"}]}
+            )
+        )
+        result = await kanban.set_merge_conflict_flag("10", present=True)
+        assert result is True
+        assert kanban._client.post.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_removes_tag_when_present(self, kanban):
+        """present=False removes only the merge-conflict tag, keeping
+        every other tag on the ticket."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response(
+                    {
+                        "id": 10,
+                        "project_id": 1,
+                        "tags": [{"name": "urgent"}, {"name": "merge-conflict"}],
+                    }
+                ),
+                _rpc_response(True),
+            ]
+        )
+        result = await kanban.set_merge_conflict_flag("10", present=False)
+        assert result is True
+        second_call = kanban._client.post.await_args_list[1]
+        assert second_call.kwargs["json"]["params"]["tags"] == ["urgent"]
+
+    @pytest.mark.asyncio
+    async def test_noop_when_tag_already_absent(self, kanban):
+        """present=False and the tag isn't there -> no RPC needed."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            return_value=_rpc_response({"id": 10, "project_id": 1, "tags": []})
+        )
+        result = await kanban.set_merge_conflict_flag("10", present=False)
+        assert result is True
+        assert kanban._client.post.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_returns_false_on_rpc_failure(self, kanban):
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(side_effect=RuntimeError("API error"))
+        result = await kanban.set_merge_conflict_flag("10", present=True)
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
 # get_project_metrics tests
 # ---------------------------------------------------------------------------
 

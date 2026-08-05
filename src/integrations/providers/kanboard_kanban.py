@@ -117,6 +117,12 @@ _RPC_MAX_ATTEMPTS = 4
 #: Base delay before the first retry; doubles each subsequent attempt.
 _RPC_RETRY_BASE_DELAY = 0.3
 
+#: Tag applied to a card's face (see set_merge_conflict_flag) when merging
+#: its branch to main fails and it's parked back in Ready for an AI agent
+#: to rebase — makes that visible from the board itself, not just a
+#: comment buried inside the ticket.
+_MERGE_CONFLICT_TAG = "merge-conflict"
+
 # Kanboard seeds a fresh project with these columns
 # (app/Model/BoardModel.php::getDefaultColumns). Rename the two that have a
 # Marcus equivalent — rather than delete+recreate — so their position and
@@ -702,6 +708,76 @@ class KanboardKanban(KanbanInterface):
             return bool(result)
         except Exception as exc:  # noqa: BLE001
             logger.warning("set_task_started_if_unset failed for task %s: %s", task_id, exc)
+            return False
+
+    async def set_merge_conflict_flag(self, task_id: str, present: bool) -> bool:
+        """Add or remove a visible ``merge-conflict`` tag on a task's card.
+
+        When a ticket bounces from Waiting-for-Human back to Ready because
+        merging its branch to main failed, that was previously only
+        recorded as a comment INSIDE the ticket (``CommentFormatter.
+        merge_conflict``) — invisible from the board view itself, so a
+        card silently reappearing in Ready/In Progress looked identical to
+        a fresh, never-started ticket. Kanboard renders tags as colored
+        pills directly on the card face in every view (board, list,
+        calendar), so this is visible without opening the ticket.
+
+        Fetches the task's CURRENT tags first and only adds/removes this
+        one — Kanboard's ``setTaskTags`` REPLACES the full tag list
+        (``TaskTagModel::save``'s ``$remove_other_tags`` defaults to
+        ``True``), so calling it with anything less than the full desired
+        set would silently wipe out any tags a human already put on the
+        ticket for their own reasons. The tag itself needs no advance
+        provisioning — Kanboard auto-creates a project's tag on first use
+        (``TagModel::findOrCreateTag``).
+
+        Parameters
+        ----------
+        task_id : str
+            Kanboard task ID.
+        present : bool
+            ``True`` to add the tag (if not already present), ``False``
+            to remove it (if present).
+
+        Returns
+        -------
+        bool
+            ``True`` on success (including a no-op when the tag was
+            already in the desired state); ``False`` only on an RPC
+            failure.
+        """
+        if self._client is None:
+            raise RuntimeError("Call connect() before set_merge_conflict_flag()")
+        try:
+            raw = await self._rpc("getTask", task_id=int(task_id))
+            if not raw:
+                return False
+            project_id = int(raw.get("project_id") or self._project_id)
+            current = [
+                t.get("name", "") for t in (raw.get("tags") or []) if t.get("name")
+            ]
+            has_tag = _MERGE_CONFLICT_TAG in current
+            if present == has_tag:
+                return True  # already in the desired state, no RPC needed
+            updated = (
+                current + [_MERGE_CONFLICT_TAG]
+                if present
+                else [t for t in current if t != _MERGE_CONFLICT_TAG]
+            )
+            result = await self._rpc(
+                "setTaskTags",
+                project_id=project_id,
+                task_id=int(task_id),
+                tags=updated,
+            )
+            return bool(result)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "set_merge_conflict_flag(%s) failed for task %s: %s",
+                present,
+                task_id,
+                exc,
+            )
             return False
 
     def _columns_for(self, project_id: int) -> Dict[str, int]:
