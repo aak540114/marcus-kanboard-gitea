@@ -3225,6 +3225,66 @@ class HumanGatedWorkflow:
 
         await self._check_parent_completion(parent_id)
 
+    async def _children_done_via_links(self, parent_id: str) -> bool:
+        """Cross-check via Kanboard's native internal links whether every
+        ticket *parent_id* "is blocked by" currently sits in a Done-like
+        column, independent of Marcus's own AC-marker bookkeeping.
+
+        decompose_ticket links each child unconditionally
+        (``create_task_link(parent, child, 3)`` — "parent is blocked by
+        child"), regardless of whether that child's separate
+        "Sub-ticket of #N" AC marker (what :meth:`_children_of` actually
+        matches on) landed correctly. That marker write lost a race once
+        in production (a concurrent board poll's own bare
+        ``get_or_create()`` won and silently dropped it — fixed at the
+        source in :meth:`decompose_ticket`), which made
+        :meth:`_children_of` return nothing for an affected parent even
+        though its children were genuinely done and the board's own link
+        data still showed the relationship correctly. This is the
+        self-healing fallback :meth:`_check_parent_completion` uses when
+        the marker-based check finds no children at all.
+
+        Parameters
+        ----------
+        parent_id : str
+            Ticket identifier.
+
+        Returns
+        -------
+        bool
+            ``True`` only if there is at least one "is blocked by" link
+            AND every linked ticket's current column normalizes to
+            ``TaskStatus.DONE``. ``False`` on no links, an RPC failure,
+            or when the provider doesn't support link queries.
+        """
+        get_links = getattr(self._kanban, "get_task_links", None)
+        normalize = getattr(self._kanban, "normalize_status", None)
+        if get_links is None or normalize is None:
+            return False
+        try:
+            links = await get_links(parent_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "Could not fetch task links for %s: %s", parent_id, exc
+            )
+            return False
+        depends_on = links.get("depends_on") or []
+        if not depends_on:
+            return False
+        all_done = all(
+            normalize(entry.get("column")) == TaskStatus.DONE
+            for entry in depends_on
+        )
+        if all_done:
+            logger.info(
+                "Parent %s: no children recognized via AC marker, but "
+                "Kanboard's own internal links show all %d linked "
+                "ticket(s) Done — completing via link fallback",
+                parent_id,
+                len(depends_on),
+            )
+        return all_done
+
     async def _check_parent_completion(self, parent_id: str) -> None:
         """Complete *parent_id* if it's BLOCKED and ALL its children are DONE.
 
@@ -3243,10 +3303,25 @@ class HumanGatedWorkflow:
         ):
             return
         children = self._children_of(parent_id)
-        if not children or not all(
+        children_done = bool(children) and all(
             c.state == TicketState.DONE for c in children
-        ):
-            return
+        )
+        if not children_done:
+            # Fallback: cross-check Kanboard's own "is blocked by" internal
+            # links (created unconditionally by decompose_ticket via
+            # create_task_link, independent of the AC-marker Marcus's OWN
+            # _children_of() relies on). Only worth the extra RPC when the
+            # marker-based check found NOTHING — a parent with at least one
+            # recognized child is trusted as-is (partial marker loss is
+            # closed at the source in decompose_ticket now), and a BLOCKED
+            # ticket with a recorded blocker (parent.blocked_by) is an
+            # ordinary dependency block, not a decompose parent at all —
+            # _resume_tickets_blocked_by already owns that case correctly.
+            if children or parent.blocked_by:
+                return
+            children_done = await self._children_done_via_links(parent_id)
+            if not children_done:
+                return
 
         gate = await self._get_effective_gate(parent_id)
         if gate == "ai":
@@ -3307,13 +3382,23 @@ class HumanGatedWorkflow:
         every child is done. Called once at startup and then on a fixed
         interval (see :data:`_PARENT_RECONCILE_INTERVAL_SECONDS`) so
         such a ticket is caught within one sweep regardless of cause.
+
+        Also covers a parent whose children are entirely unrecognized by
+        the AC-marker matching :meth:`_children_of` uses (see
+        :meth:`_children_done_via_links`'s docstring) — :meth:`_check_
+        parent_completion` falls back to Kanboard's own internal links
+        for those. A BLOCKED ticket that has a recorded blocker
+        (``record.blocked_by``) and no recognized children is an
+        ordinary dependency block (:meth:`_resume_tickets_blocked_by`
+        already owns that case), not a decompose parent — skipped here
+        to avoid an RPC per sweep for every such ticket.
         """
         for record in list(self._lifecycle.all_records()):
             if record.provider != self._provider:
                 continue
             if record.state != TicketState.BLOCKED:
                 continue
-            if not self._children_of(record.ticket_id):
+            if not self._children_of(record.ticket_id) and record.blocked_by:
                 continue
             try:
                 await self._check_parent_completion(record.ticket_id)

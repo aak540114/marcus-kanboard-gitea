@@ -26,6 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from src.core.events import Events
+from src.core.models import TaskStatus
 from src.core.ticket_lifecycle import (
     TicketLifecycleManager,
     TicketState,
@@ -72,6 +73,21 @@ def mock_kanban():
     kb.set_task_started_if_unset = AsyncMock(return_value=True)
     kb.set_merge_conflict_flag = AsyncMock(return_value=True)
     kb.get_task_color = AsyncMock(return_value=None)
+    kb.get_task_links = AsyncMock(
+        return_value={"depends_on": [], "blocks": [], "relates_to": []}
+    )
+    _STATUS_BY_COLUMN = {
+        "done": TaskStatus.DONE,
+        "waiting for human": TaskStatus.WAITING_FOR_HUMAN,
+        "in progress": TaskStatus.IN_PROGRESS,
+        "ready": TaskStatus.READY,
+        "blocked": TaskStatus.BLOCKED,
+    }
+    kb.normalize_status = MagicMock(
+        side_effect=lambda col: _STATUS_BY_COLUMN.get(
+            (col or "").strip().lower(), TaskStatus.TODO
+        )
+    )
     return kb
 
 
@@ -4566,6 +4582,97 @@ class TestReconcileBlockedParents:
             await workflow.stop()
 
         assert lifecycle.get("239", "kanboard").state == TicketState.WAITING_FOR_HUMAN
+
+    @pytest.mark.asyncio
+    async def test_sweep_falls_back_to_kanboard_links_when_no_children_recognized(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Regression: decompose_ticket links every child unconditionally
+        via create_task_link, independent of the separate AC-marker
+        write _children_of relies on — a write that has, in production,
+        lost a race and silently dropped the marker for EVERY child of a
+        parent (now fixed at the source, but historical tickets can
+        still be affected). When _children_of finds nothing at all, the
+        sweep must fall back to Kanboard's own "is blocked by" links and
+        their live column state."""
+        lifecycle.get_or_create("250", "kanboard")  # parent, no recognized children
+        lifecycle.human_transition("250", "kanboard", TicketState.BLOCKED)
+        mock_kanban.get_task_links = AsyncMock(
+            return_value={
+                "depends_on": [
+                    {"task_id": "251", "title": "Backend", "column": "Done"},
+                    {"task_id": "252", "title": "Frontend", "column": "done"},
+                ],
+                "blocks": [],
+                "relates_to": [],
+            }
+        )
+
+        await workflow._reconcile_blocked_parents()
+
+        rec = lifecycle.get("250", "kanboard")
+        assert rec.state == TicketState.WAITING_FOR_HUMAN
+        mock_kanban.get_task_links.assert_awaited_once_with("250")
+
+    @pytest.mark.asyncio
+    async def test_link_fallback_requires_every_linked_ticket_done(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """The link fallback must not complete a parent early — ALL
+        linked tickets must show a Done-like column, not just some."""
+        lifecycle.get_or_create("253", "kanboard")
+        lifecycle.human_transition("253", "kanboard", TicketState.BLOCKED)
+        mock_kanban.get_task_links = AsyncMock(
+            return_value={
+                "depends_on": [
+                    {"task_id": "254", "title": "Backend", "column": "Done"},
+                    {"task_id": "255", "title": "Frontend", "column": "In Progress"},
+                ],
+                "blocks": [],
+                "relates_to": [],
+            }
+        )
+
+        await workflow._reconcile_blocked_parents()
+
+        assert lifecycle.get("253", "kanboard").state == TicketState.BLOCKED
+
+    @pytest.mark.asyncio
+    async def test_sweep_skips_link_fallback_for_ordinary_dependency_blocks(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """A ticket BLOCKED with a recorded blocker (record.blocked_by)
+        is an ordinary dependency block (_resume_tickets_blocked_by
+        already owns that), not a decompose parent — must never trigger
+        the extra get_task_links RPC."""
+        lifecycle.get_or_create("256", "kanboard")
+        lifecycle.human_transition("256", "kanboard", TicketState.BLOCKED)
+        lifecycle.set_blocked_by("256", "kanboard", "257")
+
+        await workflow._reconcile_blocked_parents()
+
+        mock_kanban.get_task_links.assert_not_awaited()
+        assert lifecycle.get("256", "kanboard").state == TicketState.BLOCKED
+
+    @pytest.mark.asyncio
+    async def test_sweep_trusts_recognized_children_over_links(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """A parent WITH at least one AC-marker-recognized child must
+        never fall back to the links check at all, even if that child
+        isn't done yet — the marker-based path is authoritative when it
+        finds something."""
+        lifecycle.get_or_create("258", "kanboard")
+        lifecycle.human_transition("258", "kanboard", TicketState.BLOCKED)
+        self._child(lifecycle, "259", "258")
+        lifecycle.transition("259", "kanboard", TicketState.READY)
+        lifecycle.transition("259", "kanboard", TicketState.IN_PROGRESS)
+        # #259 not done yet.
+
+        await workflow._reconcile_blocked_parents()
+
+        mock_kanban.get_task_links.assert_not_awaited()
+        assert lifecycle.get("258", "kanboard").state == TicketState.BLOCKED
 
 
 class TestParentAutoCompleteEndToEnd:
