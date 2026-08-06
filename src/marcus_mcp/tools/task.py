@@ -4553,6 +4553,41 @@ async def report_task_progress(
                             )
 
         elif status == "in_progress":
+            # Guard: reject progress reports from agents who no longer
+            # hold the lease — mirrors the "blocked" branch's Guard 2
+            # below. Without this, a stale/delayed report from an agent
+            # whose lease already expired and was reassigned to a
+            # different agent is accepted unconditionally: kanban's
+            # assigned_to flips back to the stale agent, and
+            # lease_manager.renew_lease (which looks up by task_id
+            # only, not agent_id) overwrites the new holder's real
+            # progress/message and recomputes lease_expires off the
+            # stale report.
+            #
+            # When no lease is held at all for this task (assignment
+            # was cleared with no replacement yet), fall through and
+            # allow the update — matches
+            # test_allows_progress_update_even_when_assignment_cleared;
+            # the "No active lease" fallback later recreates the lease
+            # so the agent can keep working.
+            if hasattr(state, "lease_manager") and state.lease_manager:
+                _lease = state.lease_manager.active_leases.get(task_id)
+                if _lease is not None and _lease.agent_id != agent_id:
+                    logger.warning(
+                        f"report_task_progress(in_progress) rejected: agent "
+                        f"{agent_id} does not hold lease for {task_id} "
+                        f"(holder: {_lease.agent_id})."
+                    )
+                    return {
+                        "success": False,
+                        "status": "not_task_holder",
+                        "message": (
+                            f"Task {task_id} is held by {_lease.agent_id}, "
+                            f"not {agent_id}. Your lease expired — request "
+                            "your next task."
+                        ),
+                    }
+
             update_data["status"] = TaskStatus.IN_PROGRESS
             # Include assigned_to for Planka provider compatibility
             if agent_id:

@@ -343,6 +343,102 @@ class TestStaleCompletionGuard:
         assert result["status"] == "stale_completion"
 
 
+class TestInProgressLeaseHolderGuard:
+    """status='in_progress' must reject reports from agents who no
+    longer hold the lease.
+
+    Scenario: agent A holds task T, its lease expires, Marcus recovers
+    it and reassigns T to agent B with a fresh lease. Agent A —
+    unaware of the recovery (e.g. a delayed/retried call) — sends a
+    stale in_progress report. Without a guard, this is accepted:
+    kanban's assigned_to flips back to A, and renew_lease (which
+    looks up by task_id only, not agent_id) overwrites B's real
+    progress with A's stale values and recomputes lease_expires off
+    them. Mirrors the existing Guard 2 on status='blocked'.
+    """
+
+    @pytest.mark.asyncio
+    async def test_rejects_in_progress_from_non_lease_holder(self) -> None:
+        state = _make_state_with_assignment("agent-A", task_id="task-343")
+
+        fake_lease = Mock()
+        fake_lease.agent_id = "agent-B"  # different agent holds the lease
+        state.lease_manager = Mock()
+        state.lease_manager.active_leases = {"task-343": fake_lease}
+
+        result = await report_task_progress(
+            agent_id="agent-A",
+            task_id="task-343",
+            status="in_progress",
+            progress=15,
+            message="stale report from recovered agent",
+            state=state,
+        )
+
+        assert result["success"] is False
+        assert result["status"] == "not_task_holder"
+        # Kanban must NOT be touched — B's real progress stays intact.
+        state.kanban_client.update_task.assert_not_called()
+        state.kanban_client.update_task_progress.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_allows_in_progress_from_actual_lease_holder(self) -> None:
+        """The legitimate lease holder's progress report still succeeds."""
+        state = _make_state_with_assignment("agent-B", task_id="task-343")
+
+        fake_lease = Mock()
+        fake_lease.agent_id = "agent-B"
+        state.lease_manager = Mock()
+        state.lease_manager.active_leases = {"task-343": fake_lease}
+        renewed = Mock()
+        renewed.lease_expires = datetime.now(timezone.utc)
+        state.lease_manager.renew_lease = AsyncMock(return_value=renewed)
+
+        result = await report_task_progress(
+            agent_id="agent-B",
+            task_id="task-343",
+            status="in_progress",
+            progress=40,
+            message="real progress",
+            state=state,
+        )
+
+        assert result["success"] is True
+        state.kanban_client.update_task.assert_called_once()
+        state.lease_manager.renew_lease.assert_awaited_once_with(
+            "task-343", 40, "real progress"
+        )
+
+    @pytest.mark.asyncio
+    async def test_allows_in_progress_when_no_lease_held(self) -> None:
+        """No lease at all for this task → fall through and allow.
+
+        Matches test_allows_progress_update_even_when_assignment_cleared:
+        the "No active lease" fallback recreates the lease so the
+        agent can keep working, rather than being permanently locked
+        out because nothing is currently tracked for this task.
+        """
+        state = _make_state_with_assignment("agent-A", task_id=None)
+        state.lease_manager = Mock()
+        state.lease_manager.active_leases = {}
+        state.lease_manager.renew_lease = AsyncMock(return_value=None)
+        recreated = Mock()
+        recreated.lease_expires = datetime.now(timezone.utc)
+        state.lease_manager.create_lease = AsyncMock(return_value=recreated)
+
+        result = await report_task_progress(
+            agent_id="agent-A",
+            task_id="task-343",
+            status="in_progress",
+            progress=10,
+            message="starting fresh",
+            state=state,
+        )
+
+        assert result["success"] is True
+        state.kanban_client.update_task.assert_called_once()
+
+
 class TestValidationWindowFiresBeforeSmokeGate:
     """Regression guard for Codex P1 on PR #668.
 
