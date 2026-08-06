@@ -4866,6 +4866,73 @@ function save() {{
             r.headers["Access-Control-Allow-Origin"] = "*"
             return r
 
+        async def decompose_setting_api(request: Request) -> JSONResponse:
+            """GET/PUT whether Marcus may auto-decompose tickets for a project.
+
+            Project-scoped, no per-ticket layer — see src/core/
+            gate_settings.py's ``decompose_enabled`` docs. Uses the SAME
+            shared ``GateSettingManager`` instance as ``/api/gate-setting``
+            (see :func:`_get_gate_settings_mgr` for why sharing it matters —
+            two separate instances would silently diverge).
+
+            GET  /api/decompose-setting?project_id=<id>
+                Returns: {"project_id": int, "decompose_enabled": bool}
+
+            PUT  /api/decompose-setting
+                Body (JSON): {"project_id": int, "decompose_enabled": bool}
+            """
+            gate_mgr = _get_gate_settings_mgr(server)
+
+            if request.method == "PUT":
+                try:
+                    body = await request.json()
+                except Exception:
+                    r = JSONResponse({"error": "invalid JSON"}, status_code=400)
+                    r.headers["Access-Control-Allow-Origin"] = "*"
+                    return r
+
+                pid = body.get("project_id")
+                enabled = body.get("decompose_enabled")
+                if not isinstance(pid, int) or not isinstance(enabled, bool):
+                    r = JSONResponse(
+                        {
+                            "error": (
+                                "project_id (int) and decompose_enabled "
+                                "(bool) required"
+                            )
+                        },
+                        status_code=400,
+                    )
+                    r.headers["Access-Control-Allow-Origin"] = "*"
+                    return r
+
+                gate_mgr.set_project_decompose_enabled(pid, enabled)
+                r = JSONResponse(
+                    {"saved": True, "project_id": pid, "decompose_enabled": enabled}
+                )
+                r.headers["Access-Control-Allow-Origin"] = "*"
+                return r
+
+            pid_str = request.query_params.get("project_id", "")
+            try:
+                pid = int(pid_str)
+            except ValueError:
+                r = JSONResponse(
+                    {"error": "project_id (int) query param required"},
+                    status_code=400,
+                )
+                r.headers["Access-Control-Allow-Origin"] = "*"
+                return r
+
+            r = JSONResponse(
+                {
+                    "project_id": pid,
+                    "decompose_enabled": gate_mgr.get_effective_decompose_enabled(pid),
+                }
+            )
+            r.headers["Access-Control-Allow-Origin"] = "*"
+            return r
+
         async def dev_env_stop(request: Request) -> JSONResponse:
             """Stop a running dev environment and tear down its Docker container.
 
@@ -5823,6 +5890,11 @@ function save() {{
                 Route("/api/gate-setting", gate_setting_api, methods=["GET"]),
                 Route("/api/gate-setting/project", gate_setting_api, methods=["PUT"]),
                 Route("/api/gate-setting/ticket", gate_setting_api, methods=["PUT"]),
+                Route(
+                    "/api/decompose-setting",
+                    decompose_setting_api,
+                    methods=["GET", "PUT"],
+                ),
                 Route("/api/dev-env-setting", dev_env_setting_api, methods=["GET", "PUT"]),
                 Mount("/", app=mcp_app),
             ],

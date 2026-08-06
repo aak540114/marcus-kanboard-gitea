@@ -10,10 +10,22 @@ sequential LLM review rounds run before the branch is allowed to merge.
 When set to N, the workflow runs N verification rounds with agent fix
 cycles between them.  A count of 0 disables verification entirely.
 
-Precedence for both settings (highest to lowest):
+Decompose-enabled (project-level only — see :meth:`GateSettingManager.
+get_effective_decompose_enabled`) controls whether Marcus is allowed to
+automatically split a large ticket into linked sub-tickets
+(:meth:`~src.workflows.human_gated_workflow.HumanGatedWorkflow.
+decompose_ticket`) at all, for every ticket in that project. Defaults to
+``True`` (enabled) — matching decomposition's existing behavior before
+this setting existed.
+
+Precedence for gate and verify_count (highest to lowest):
 1. Per-ticket setting
 2. Per-project setting
 3. Hard default (``"human"`` for gate; ``0`` for verify_count)
+
+decompose_enabled has no per-ticket layer — it is a project-wide switch
+("stop splitting tickets in this project at all"), not a per-ticket
+override.
 
 Settings are persisted as a JSON file at::
 
@@ -22,7 +34,10 @@ Settings are persisted as a JSON file at::
 Schema::
 
     {
-      "projects": {"1": {"gate": "human"}, "2": {"gate": "ai", "verify_count": 2}},
+      "projects": {
+        "1": {"gate": "human"},
+        "2": {"gate": "ai", "verify_count": 2, "decompose_enabled": false}
+      },
       "tickets":  {"42": {"gate": "ai"}, "99": {"gate": null, "verify_count": 0}}
     }
 
@@ -42,6 +57,7 @@ logger = logging.getLogger(__name__)
 GateMode = Literal["human", "ai"]
 _DEFAULT_GATE: GateMode = "human"
 _DEFAULT_VERIFY_COUNT: int = 0
+_DEFAULT_DECOMPOSE_ENABLED: bool = True
 _DEFAULT_DATA_DIR = Path(os.getcwd()) / "data"
 
 
@@ -190,6 +206,50 @@ class GateSettingManager:
         return _DEFAULT_VERIFY_COUNT
 
     # ------------------------------------------------------------------
+    # Decompose-enabled — read
+    # ------------------------------------------------------------------
+
+    def get_project_decompose_enabled(self, project_id: int) -> Optional[bool]:
+        """Return whether decomposition is enabled for a project, or
+        ``None`` if not explicitly set.
+
+        Parameters
+        ----------
+        project_id : int
+            Kanboard project ID.
+
+        Returns
+        -------
+        Optional[bool]
+            ``True``/``False``, or ``None`` when no project setting has
+            been stored (resolves to the default via
+            :meth:`get_effective_decompose_enabled`).
+        """
+        val = self._project_entry(project_id).get("decompose_enabled")
+        return val if isinstance(val, bool) else None
+
+    def get_effective_decompose_enabled(self, project_id: int) -> bool:
+        """Return whether Marcus may auto-decompose tickets in this project.
+
+        No per-ticket layer — this is a project-wide switch. Resolution:
+        project setting → ``True`` (decomposition is enabled by default,
+        matching behavior before this setting existed).
+
+        Parameters
+        ----------
+        project_id : int
+            Kanboard project ID.
+
+        Returns
+        -------
+        bool
+            ``True`` unless a human has explicitly disabled decomposition
+            for this project.
+        """
+        val = self.get_project_decompose_enabled(project_id)
+        return _DEFAULT_DECOMPOSE_ENABLED if val is None else val
+
+    # ------------------------------------------------------------------
     # Gate mode — write
     # ------------------------------------------------------------------
 
@@ -280,6 +340,29 @@ class GateSettingManager:
             entry["verify_count"] = count
         self._save()
         logger.info("Set ticket %s verify_count to %r", ticket_id, count)
+
+    # ------------------------------------------------------------------
+    # Decompose-enabled — write
+    # ------------------------------------------------------------------
+
+    def set_project_decompose_enabled(self, project_id: int, enabled: bool) -> None:
+        """Persist whether Marcus may auto-decompose tickets in a project.
+
+        Parameters
+        ----------
+        project_id : int
+            Kanboard project ID.
+        enabled : bool
+            ``False`` stops Marcus from splitting any ticket in this
+            project into sub-tickets, whether triggered automatically
+            (a large ready ticket) or via the ``@marcus decompose``
+            comment command — both go through
+            :meth:`~src.workflows.human_gated_workflow.HumanGatedWorkflow.
+            decompose_ticket`, which checks this setting.
+        """
+        self._project_entry(project_id, create=True)["decompose_enabled"] = enabled
+        self._save()
+        logger.info("Set project %d decompose_enabled to %r", project_id, enabled)
 
     # ------------------------------------------------------------------
     # Internal helpers

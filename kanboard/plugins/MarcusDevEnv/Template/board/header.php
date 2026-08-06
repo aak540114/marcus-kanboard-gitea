@@ -44,6 +44,7 @@ $descUrl          = $marcusUrl . '/project-description?project_id=' . urlencode(
                   . ($marcusToken !== '' ? '&token=' . urlencode($marcusToken) : '');
 $gateApiBase      = $marcusUrl . '/api/gate-setting';
 $projectEnabledUrl = $marcusUrl . '/api/project-enabled';
+$decomposeSettingUrl = $marcusUrl . '/api/decompose-setting';
 $devEnvSettingUrl = $marcusUrl . '/api/dev-env-setting';
 $projectRepoUrl   = $marcusUrl . '/api/project-repo?project_id=' . urlencode((string) $projectId);
 // Carry the token in the query string (not a header) so the instant
@@ -398,6 +399,13 @@ $devEnvMainStatusUrl = $marcusUrl . '/api/dev-env/main/status'
         <span class="marcus-gate-saving" id="marcus-gate-saving">saving&hellip;</span>
     </div>
 
+    <!-- Project-level auto-decompose toggle -->
+    <button id="marcus-decompose-toggle" class="marcus-access-toggle off"
+            onclick="toggleProjectDecompose()" disabled
+            title="Whether Marcus may automatically split a large ticket in this project into linked sub-tickets">
+        &#129517; Decompose: checking&hellip;
+    </button>
+
     <!-- AI Verify counter (only shown when AI Gate is active) -->
     <div id="marcus-verify-wrap">
         <span class="marcus-gate-label">AI Verify:</span>
@@ -437,6 +445,7 @@ $devEnvMainStatusUrl = $marcusUrl . '/api/dev-env/main/status'
     var AGENTS_URL       = <?= json_encode($apiUrl) ?>;
     var GATE_URL         = <?= json_encode($gateApiBase) ?>;
     var PROJECT_ENABLED_URL = <?= json_encode($projectEnabledUrl) ?>;
+    var DECOMPOSE_SETTING_URL = <?= json_encode($decomposeSettingUrl) ?>;
     var DEV_ENV_SETTING_URL = <?= json_encode($devEnvSettingUrl) ?>;
     var PROJECT_REPO_URL = <?= json_encode($projectRepoUrl) ?>;
     var PROJECT_SEEN_URL = <?= json_encode($projectSeenUrl) ?>;
@@ -537,6 +546,56 @@ $devEnvMainStatusUrl = $marcusUrl . '/api/dev-env/main/status'
                 method: 'PUT',
                 headers: marcusHeaders({ 'Content-Type': 'application/json' }),
                 body: JSON.stringify({ project_id: PROJECT_ID, enabled: next }),
+            })
+                .then(function (r) { return r.json(); })
+                .then(function () { render(next); })
+                .catch(function () { /* keep current visual state */ })
+                .finally(function () { btn.disabled = false; });
+        };
+    })();
+
+    /* ── Auto-decompose toggle ──────────────────────────────────────────
+       Whether Marcus may automatically split a large ticket in THIS
+       project into linked sub-tickets — whether triggered automatically
+       (a large ready ticket) or via the "@marcus decompose" comment
+       command; both respect this switch. Defaults ON (matching
+       decomposition's behavior before this setting existed), unlike the
+       Project access toggle above, which defaults OFF. */
+    (function () {
+        var btn = document.getElementById('marcus-decompose-toggle');
+        if (!btn || !PROJECT_ID) { return; }
+
+        function render(enabled) {
+            btn.classList.toggle('on', enabled);
+            btn.classList.toggle('off', !enabled);
+            btn.innerHTML = enabled
+                ? '&#129517; Decompose: ON'
+                : '&#129517; Decompose: OFF';
+            btn.title = enabled
+                ? 'Marcus may split large tickets in this project into sub-tickets. Click to disable.'
+                : 'Marcus will never split any ticket in this project into sub-tickets. Click to enable.';
+        }
+
+        fetch(DECOMPOSE_SETTING_URL + '?project_id=' + PROJECT_ID, {
+            cache: 'no-store', headers: marcusHeaders(),
+        })
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                render(data.decompose_enabled !== false);
+                btn.disabled = false;
+            })
+            .catch(function () {
+                render(true);
+                btn.disabled = false;
+            });
+
+        window.toggleProjectDecompose = function () {
+            var next = !btn.classList.contains('on');
+            btn.disabled = true;
+            fetch(DECOMPOSE_SETTING_URL, {
+                method: 'PUT',
+                headers: marcusHeaders({ 'Content-Type': 'application/json' }),
+                body: JSON.stringify({ project_id: PROJECT_ID, decompose_enabled: next }),
             })
                 .then(function (r) { return r.json(); })
                 .then(function () { render(next); })

@@ -205,6 +205,57 @@ class TestGateSettingManager:
         assert mgr.get_effective_verify_count("8", 1) == 1
         assert mgr.get_effective_verify_count("9", 99) == 0
 
+    # ── Decompose-enabled defaults ────────────────────────────────────────
+
+    def test_get_project_decompose_enabled_returns_none_when_not_set(self, mgr):
+        """No project setting → get_project_decompose_enabled returns None."""
+        assert mgr.get_project_decompose_enabled(1) is None
+
+    def test_get_effective_decompose_enabled_defaults_to_true(self, mgr):
+        """When nothing is set, decomposition is enabled by default —
+        matching behavior before this setting existed."""
+        assert mgr.get_effective_decompose_enabled(1) is True
+
+    # ── Decompose-enabled — project settings ──────────────────────────────
+
+    def test_set_and_get_project_decompose_enabled_false(self, mgr):
+        """set_project_decompose_enabled(False) then get returns False."""
+        mgr.set_project_decompose_enabled(1, False)
+        assert mgr.get_project_decompose_enabled(1) is False
+        assert mgr.get_effective_decompose_enabled(1) is False
+
+    def test_set_and_get_project_decompose_enabled_true(self, mgr):
+        """Explicitly re-enabling after disabling round-trips True."""
+        mgr.set_project_decompose_enabled(1, False)
+        mgr.set_project_decompose_enabled(1, True)
+        assert mgr.get_project_decompose_enabled(1) is True
+        assert mgr.get_effective_decompose_enabled(1) is True
+
+    def test_project_decompose_enabled_persisted_to_disk(self, tmp_path):
+        """set_project_decompose_enabled writes data that survives a new
+        manager instance."""
+        mgr1 = GateSettingManager(data_dir=tmp_path)
+        mgr1.set_project_decompose_enabled(5, False)
+
+        mgr2 = GateSettingManager(data_dir=tmp_path)
+        assert mgr2.get_project_decompose_enabled(5) is False
+
+    def test_decompose_enabled_has_no_per_ticket_layer(self, mgr):
+        """This is a project-wide switch only — a different project is
+        unaffected by another project's setting."""
+        mgr.set_project_decompose_enabled(1, False)
+        assert mgr.get_effective_decompose_enabled(2) is True
+
+    def test_decompose_enabled_independent_of_gate_and_verify_count(self, mgr):
+        """Setting decompose_enabled does not disturb gate or verify_count
+        stored on the same project, and vice versa."""
+        mgr.set_project_gate(1, "ai")
+        mgr.set_project_verify_count(1, 2)
+        mgr.set_project_decompose_enabled(1, False)
+        assert mgr.get_project_gate(1) == "ai"
+        assert mgr.get_project_verify_count(1) == 2
+        assert mgr.get_project_decompose_enabled(1) is False
+
     # ── Gate and verify count coexist ────────────────────────────────────
 
     def test_gate_and_verify_count_stored_together(self, tmp_path):

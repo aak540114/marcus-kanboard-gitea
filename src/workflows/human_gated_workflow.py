@@ -1617,6 +1617,23 @@ class HumanGatedWorkflow:
             )
             return []
 
+        # Same reasoning, separate switch: a human can disable decomposition
+        # for a project (the "no ticket splitting" button) independently of
+        # disabling the project entirely — checked whether this call came
+        # from the automatic large-ticket path or the explicit
+        # "@marcus decompose" comment command; both go through this method.
+        if (
+            parent_project_id is not None
+            and not self._gate.get_effective_decompose_enabled(parent_project_id)
+        ):
+            logger.debug(
+                "Refusing to decompose ticket %s: decomposition is disabled "
+                "for Kanboard project %d",
+                ticket_id,
+                parent_project_id,
+            )
+            return []
+
         # Sub-tickets ALWAYS start in Ready, whatever column the parent sat
         # in. A column reflects who is working a card, not where it belongs
         # in the plan: a freshly created child has not been claimed by any
@@ -1646,6 +1663,17 @@ class HumanGatedWorkflow:
             logger.debug(
                 "Refusing to write sub-tickets for %s: Kanboard project %d "
                 "was disabled during decomposition",
+                ticket_id,
+                parent_project_id,
+            )
+            return []
+        if (
+            parent_project_id is not None
+            and not self._gate.get_effective_decompose_enabled(parent_project_id)
+        ):
+            logger.debug(
+                "Refusing to write sub-tickets for %s: decomposition was "
+                "disabled for Kanboard project %d during decomposition",
                 ticket_id,
                 parent_project_id,
             )

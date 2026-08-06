@@ -3706,6 +3706,77 @@ class TestDecomposition:
         mock_kanban.create_task.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_refuses_to_decompose_when_disabled_for_the_project(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """A human can turn off decomposition for a project entirely — the
+        "no ticket splitting" switch — independent of disabling the
+        project itself. decompose_ticket must not call the LLM or write
+        to the board at all when it's off, whether triggered
+        automatically (a large ready ticket) or via the explicit
+        "@marcus decompose" comment command — both go through this same
+        method."""
+        self._big_ticket(lifecycle)
+        workflow._gate.get_effective_decompose_enabled = MagicMock(
+            return_value=False
+        )
+        llm_called = {"yes": False}
+
+        async def fake_llm(prompt):
+            llm_called["yes"] = True
+            return '{"subtasks": []}'
+
+        workflow._llm_generate = fake_llm
+        parent = MagicMock(description="do a lot")
+        parent.name = "Big"
+        parent.source_context = {"kanboard_task": {"project_id": 3}}
+        mock_kanban.get_task_by_id = AsyncMock(return_value=parent)
+        mock_kanban.create_task = AsyncMock()
+
+        children = await workflow.decompose_ticket("100")
+
+        assert children == []
+        assert llm_called["yes"] is False
+        mock_kanban.create_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_refuses_to_write_children_when_disabled_during_the_llm_call(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Even when the LLM DOES return subtasks, nothing gets written if
+        decomposition was disabled for the project while that call was
+        in flight — mirrors the equivalent project-access re-check."""
+        self._big_ticket(lifecycle)
+        calls = {"n": 0}
+
+        def effective_decompose_enabled(pid):
+            calls["n"] += 1
+            return calls["n"] == 1  # enabled for the pre-call check only
+
+        workflow._gate.get_effective_decompose_enabled = MagicMock(
+            side_effect=effective_decompose_enabled
+        )
+
+        async def fake_llm(prompt):
+            return (
+                '{"subtasks": [{"title": "Backend", "description": "api", '
+                '"acceptance_criteria": "- [ ] api"}, {"title": "Frontend", '
+                '"description": "ui", "acceptance_criteria": "- [ ] ui"}]}'
+            )
+
+        workflow._llm_generate = fake_llm
+        parent = MagicMock(description="do a lot")
+        parent.name = "Big"
+        parent.source_context = {"kanboard_task": {"project_id": 3}}
+        mock_kanban.get_task_by_id = AsyncMock(return_value=parent)
+        mock_kanban.create_task = AsyncMock()
+
+        children = await workflow.decompose_ticket("100")
+
+        assert children == []
+        mock_kanban.create_task.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_children_are_assigned_on_the_board_not_just_internally(
         self, workflow, lifecycle, mock_kanban
     ):
