@@ -57,14 +57,21 @@ services:
       KANBOARD_WEBHOOK_TOKEN: "${KANBOARD_WEBHOOK_TOKEN:-}"
       # SQLite lock-contention hardening — see the matching block in the
       # root docker-compose.yml for the full explanation. Short version:
-      # Kanboard stores PHP sessions in the same SQLite file as tasks, its
-      # own PicoDb driver has no retry-on-lock, and this is a long-standing
-      # upstream issue (kanboard/kanboard#3845, #4362, #5248). These pin
-      # WAL mode explicitly (already Kanboard's own default, belt-and-
-      # suspenders) and raise the busy-lock wait from PicoDb's 30s default
-      # to give concurrent writes more headroom before it throws.
+      # Kanboard's own PicoDb driver has no retry-on-lock, and this is a
+      # long-standing upstream issue (kanboard/kanboard#3845, #4362,
+      # #5248). SESSION_HANDLER=file moves the single highest-frequency
+      # writer (a session row on every page load) off this SQLite file
+      # entirely — the actual fix for the observed SessionHandler->write()
+      # crash. DB_WAL_MODE pins WAL explicitly (already Kanboard's own
+      # default, belt-and-suspenders). DB_TIMEOUT is SQLite's own
+      # busy_timeout — a genuine internal retry-with-backoff loop, raised
+      # well past PicoDb's 30s default (but deliberately bounded, not
+      # unbounded — PHP-FPM has a finite worker pool, so an unbounded wait
+      # under sustained contention would freeze the whole UI instead of
+      # surfacing an occasional error).
+      SESSION_HANDLER: "file"
       DB_WAL_MODE: "true"
-      DB_TIMEOUT: "60"
+      DB_TIMEOUT: "300"
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost/healthcheck"]
       interval: 15s

@@ -97,20 +97,29 @@ services:
       # Docker service name) counts as private. Required for the
       # auto-seeded webhook (see scripts/setup.sh) to actually fire.
       WEBHOOK_ALLOW_PRIVATE_NETWORKS: "true"
-      # SQLite lock-contention hardening. Kanboard stores PHP sessions IN
-      # the same SQLite file it stores tasks in (PicoDb\SessionHandler),
-      # so every human page load/AJAX call writes to it — concurrently
-      # with Marcus's own polling/RPC writes from potentially several AI
-      # agents. Kanboard's PicoDb driver (libs/picodb/lib/PicoDb/
-      # StatementHandler.php) has NO retry-on-lock logic of its own: a
-      # single busy-timeout expiry throws an uncaught PicoDb\SQLException
-      # ("General error: 5 database is locked") that crashes the whole
-      # PHP request. This is a long-standing, never-fully-fixed upstream
-      # limitation (kanboard/kanboard#3845, #4362, #5248 going back to
-      # 2018) rooted in SQLite's single-writer model. These two settings
-      # don't eliminate the possibility, only shrink the contention
-      # window — see README/docker-compose for the fuller mitigation
-      # discussion if it recurs under real load.
+      # SQLite lock-contention hardening. Kanboard's PicoDb driver
+      # (libs/picodb/lib/PicoDb/StatementHandler.php) has NO retry-on-lock
+      # logic of its own: a busy-timeout expiry throws an uncaught
+      # PicoDb\SQLException ("General error: 5 database is locked") that
+      # crashes the whole PHP request. This is a long-standing,
+      # never-fully-fixed upstream limitation (kanboard/kanboard#3845,
+      # #4362, #5248 going back to 2018) rooted in SQLite's single-writer
+      # model.
+      #   SESSION_HANDLER: Kanboard's app/Core/Session/SessionManager.php
+      #   only wires up its DB-backed session handler (PicoDb\Table
+      #   "sessions", written on EVERY human page load/AJAX call via
+      #   session_write_close()) when this equals the literal string
+      #   "db" (app/constants.php default). Any other value skips that
+      #   registration entirely and falls through to PHP's native
+      #   file-based session handler instead — removing the single
+      #   highest-frequency writer to the same SQLite file Marcus's own
+      #   ticket/task writes land in. This is the fix for the exact
+      #   crash observed in production: SessionHandler->write() ->
+      #   session_write_close() throwing "database is locked". A
+      #   restart naturally logging users out is an acceptable trade,
+      #   never a problem in practice (Kanboard sessions are short-lived
+      #   anyway). Not a volume-mounted path: container-local /tmp is
+      #   fine, sessions don't need to survive a container restart.
       #   DB_WAL_MODE: Kanboard's own app/constants.php already defaults
       #   this to true (getenv('DB_WAL_MODE') ?: true), so this is
       #   belt-and-suspenders — pinned explicitly rather than trusting a
@@ -120,12 +129,23 @@ services:
       #   WAL lets human UI reads proceed without blocking on Marcus's
       #   writes (and vice versa) instead of every access fighting over
       #   one exclusive file lock.
-      #   DB_TIMEOUT: PDO::ATTR_TIMEOUT, i.e. how long a write waits on a
-      #   busy lock before PicoDb gives up and throws. Kanboard's PicoDb
-      #   Sqlite driver defaults this to 30s; raised to 60s here for more
-      #   headroom under concurrent multi-agent polling.
+      #   DB_TIMEOUT: PDO::ATTR_TIMEOUT — literally SQLite's own
+      #   busy_timeout mechanism, which internally RETRIES (sleeping
+      #   with backoff) for up to this many seconds before giving up and
+      #   throwing — i.e. this is the actual "keep trying until
+      #   successfully written" knob. Kanboard's PicoDb Sqlite driver
+      #   defaults it to 30s; raised well past that so any realistic
+      #   remaining contention (now much rarer with sessions moved off
+      #   this file) resolves inside the window instead of surfacing as
+      #   a crash. Deliberately NOT unbounded: Kanboard runs under
+      #   PHP-FPM with a finite worker pool, so many requests piling up
+      #   waiting on a truly stuck lock for an unbounded time would
+      #   exhaust it and freeze the whole UI — worse than an occasional
+      #   visible error. 300s is generous enough that this should never
+      #   be hit in practice while still bounding the worst case.
+      SESSION_HANDLER: "file"
       DB_WAL_MODE: "true"
-      DB_TIMEOUT: "60"
+      DB_TIMEOUT: "300"
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost/healthcheck"]
       interval: 15s
