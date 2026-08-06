@@ -1682,14 +1682,38 @@ class HumanGatedWorkflow:
                 continue
             # Lifecycle record inheriting the parent's status: Ready + owner,
             # and a "Sub-ticket of #" marker so it's never re-decomposed.
-            self._lifecycle.get_or_create(
-                child_id,
-                self._provider,
-                acceptance_criteria=(
-                    (s.get("acceptance_criteria", "") or "")
-                    + f"\n<!-- Sub-ticket of #{ticket_id} -->"
-                ),
+            child_ac = (
+                (s.get("acceptance_criteria", "") or "")
+                + f"\n<!-- Sub-ticket of #{ticket_id} -->"
             )
+            child_record = self._lifecycle.get_or_create(
+                child_id, self._provider, acceptance_criteria=child_ac
+            )
+            # get_or_create() only applies acceptance_criteria on FIRST
+            # creation — a no-op if the record already exists. That race
+            # is real: create(payload) above already made this ticket
+            # visible on the board via at least one RPC round trip before
+            # this line runs, so a CONCURRENT BoardWatcher poll (its own
+            # background loop, or another agent's on-demand marcus_work
+            # triggering one) can see the new ticket and fire ticket.new
+            # first — _on_ticket_new's own get_or_create (no AC) then
+            # wins the race, silently dropping this marker. Without it,
+            # _parent_of/_children_of can never recognize this child, so
+            # the parent stays BLOCKED forever even once every child is
+            # actually Done. Patch it in explicitly if that happened.
+            if "Sub-ticket of #" not in (child_record.acceptance_criteria or ""):
+                logger.warning(
+                    "Sub-ticket %s's lifecycle record already existed "
+                    "(lost the race with a concurrent board poll) — "
+                    "patching in its parent marker now",
+                    child_id,
+                )
+                self._lifecycle.update_acceptance_criteria(
+                    child_id,
+                    self._provider,
+                    child_ac,
+                    ACChangeDetector.hash_ac(child_ac),
+                )
             # Check the result: move_task_to_column returns False (no
             # exception) when the board has no matching column or the task
             # actually lives in a different Kanboard project than expected

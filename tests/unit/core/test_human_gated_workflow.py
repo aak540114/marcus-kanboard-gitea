@@ -3804,6 +3804,63 @@ class TestDecomposition:
         mock_kanban.move_task_to_column.assert_any_await("202", "ready")
 
     @pytest.mark.asyncio
+    async def test_decompose_patches_marker_if_child_record_won_a_race(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Regression: get_or_create() only applies acceptance_criteria on
+        FIRST creation of a record. create(payload) makes a child ticket
+        visible on the board via an RPC round trip BEFORE decompose_ticket
+        gets to register its own lifecycle record with the "Sub-ticket
+        of #N" parent marker — a concurrent BoardWatcher poll (its own
+        background loop, or another agent's on-demand marcus_work
+        triggering one) can observe the new ticket and fire ticket.new
+        first. _on_ticket_new's own bare get_or_create (no AC) then wins
+        the race, silently dropping the marker forever — after which
+        _parent_of/_children_of can never recognize this child, and the
+        parent stays BLOCKED even once every child is actually Done
+        (exactly the reported symptom: children show Done in Kanboard's
+        Internal Links, but the parent never auto-advances).
+
+        Simulated here by pre-creating child "201"'s lifecycle record
+        with no AC, mirroring what _on_ticket_new would have done had it
+        won the race."""
+        self._big_ticket(lifecycle)
+        lifecycle.get_or_create("201", "kanboard")  # simulates the race
+
+        async def fake_llm(prompt):
+            return (
+                '{"subtasks": [{"title": "Backend", "description": "api", '
+                '"acceptance_criteria": "- [ ] api"}, {"title": "Frontend", '
+                '"description": "ui", "acceptance_criteria": "- [ ] ui"}]}'
+            )
+
+        workflow._llm_generate = fake_llm
+        created = {"n": 200}
+
+        async def fake_create(data):
+            created["n"] += 1
+            t = MagicMock()
+            t.id = str(created["n"])
+            t.name = data["name"]
+            return t
+
+        mock_kanban.create_task = AsyncMock(side_effect=fake_create)
+        mock_kanban.create_task_link = AsyncMock(return_value=True)
+        parent = MagicMock(description="do a lot")
+        parent.name = "Big"
+        parent.source_context = {"kanboard_task": {"project_id": 3}}
+        mock_kanban.get_task_by_id = AsyncMock(return_value=parent)
+
+        children = await workflow.decompose_ticket("100")
+
+        assert children == ["201", "202"]
+        # Both children — including the one that lost the race — must
+        # carry the marker, so the parent can recognize them.
+        assert workflow._children_of("100")
+        child_ids = {c.ticket_id for c in workflow._children_of("100")}
+        assert child_ids == {"201", "202"}
+
+    @pytest.mark.asyncio
     async def test_decompose_children_inherit_parent_color(
         self, workflow, lifecycle, mock_kanban
     ):
