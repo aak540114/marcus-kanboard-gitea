@@ -90,6 +90,10 @@ class TestUnassignTask:
         mock_lease_manager.active_leases = {"task-1": Mock()}
         state.lease_manager = mock_lease_manager
 
+        # Mock file lock registry
+        state.file_lock_registry = Mock()
+        state.file_lock_registry.release = AsyncMock()
+
         # Mock kanban client
         state.kanban_client = Mock()
         state.kanban_client.update_task = AsyncMock()
@@ -142,6 +146,9 @@ class TestUnassignTask:
 
         # 6. lease removed
         assert "task-1" not in mock_state.lease_manager.active_leases
+
+        # 6.5. file locks released
+        mock_state.file_lock_registry.release.assert_called_once_with("task-1")
 
         # 7. kanban updated to TODO
         mock_state.kanban_client.update_task.assert_called_once_with(
@@ -413,6 +420,57 @@ class TestUnassignTask:
         # task-1 should be removed, task-2 should remain
         assert "task-1" not in mock_state.tasks_being_assigned
         assert "task-2" in mock_state.tasks_being_assigned
+
+    @pytest.mark.asyncio
+    async def test_unassign_task_releases_file_locks(self, mock_state):
+        """Regression: unassign_task must release file locks it held.
+
+        unassign_task is the recovery tool for stuck/crashed agents.
+        Without releasing declared_files locks here, any other task
+        declaring an overlapping file path is permanently skipped by
+        the file-lock pre-filter in task selection until Marcus
+        restarts — a silent, hard-to-diagnose deadlock on those files.
+        """
+        result = await unassign_task(
+            task_id="task-1", agent_id="agent-1", state=mock_state
+        )
+
+        assert result["success"] is True
+        mock_state.file_lock_registry.release.assert_awaited_once_with("task-1")
+
+    @pytest.mark.asyncio
+    async def test_unassign_task_without_file_lock_registry(self, mock_state):
+        """Test unassignment when file_lock_registry is not available."""
+        del mock_state.file_lock_registry
+
+        result = await unassign_task(
+            task_id="task-1", agent_id="agent-1", state=mock_state
+        )
+
+        # file_lock_registry is optional — should still succeed
+        assert result["success"] is True
+        assert "agent-1" not in mock_state.agent_tasks
+
+    @pytest.mark.asyncio
+    async def test_unassign_task_succeeds_when_lock_release_fails(
+        self, mock_state
+    ):
+        """A file-lock release failure must not break unassignment.
+
+        Mirrors report_task_progress's #206 finally-block release,
+        which is wrapped in try/except for the same reason: a lock
+        leak until restart is acceptable, breaking recovery itself
+        is not.
+        """
+        mock_state.file_lock_registry.release.side_effect = Exception(
+            "registry unavailable"
+        )
+
+        result = await unassign_task(
+            task_id="task-1", agent_id="agent-1", state=mock_state
+        )
+
+        assert result["success"] is True
 
     @pytest.mark.asyncio
     async def test_unassign_task_exception_handling(self, mock_state):

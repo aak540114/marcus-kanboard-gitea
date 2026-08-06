@@ -5909,6 +5909,26 @@ async def unassign_task(
                 del state.lease_manager.active_leases[task_id]
                 logger.info(f"Removed lease for task {task_id}")
 
+        # 6.5. Release any file locks this task held. Without this, a
+        # task with declared_files that gets stuck-agent-recovered via
+        # this tool (the exact scenario this tool exists for) leaves
+        # its FileLockRegistry entries in place forever — in-memory,
+        # cleared only by release(task_id) or a server restart — so
+        # any other task declaring an overlapping file path is
+        # permanently skipped by the any_held pre-filter in task
+        # selection until Marcus restarts. Mirrors the release call in
+        # report_task_progress's completion/blocked finally block.
+        if hasattr(state, "file_lock_registry"):
+            try:
+                await state.file_lock_registry.release(task_id)
+                logger.debug(f"Released file locks for task {task_id}")
+            except Exception as _release_err:  # noqa: BLE001
+                logger.warning(
+                    "Failed to release file locks for task %s: %s",
+                    task_id,
+                    _release_err,
+                )
+
         # 7. Update Kanban: Set status back to TODO, clear assigned_to
         await state.kanban_client.update_task(
             task_id,
