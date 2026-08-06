@@ -4531,6 +4531,28 @@ class HumanGatedWorkflow:
         import hashlib
 
         new_hash = hashlib.sha256(ac_markdown.encode()).hexdigest()
+
+        # Re-check immediately before writing: a concurrent decompose_ticket
+        # call can apply its "Sub-ticket of #N" parent-marker patch (see
+        # the race-recovery comment in decompose_ticket's child-creation
+        # loop) at any point during the awaits above (LLM generation,
+        # comment post, description update). _on_ticket_new decides
+        # is_subticket from a record captured before those awaits ran, so
+        # without this recheck an unconditional write here would silently
+        # re-clobber a patch that just landed, stranding the parent BLOCKED
+        # forever despite that fix. If the marker is present now, a
+        # concurrent caller's AC (with the marker) wins — skip this write.
+        current = self._lifecycle.get(ticket_id, self._provider)
+        if current is not None and "Sub-ticket of #" in (
+            current.acceptance_criteria or ""
+        ):
+            logger.info(
+                "Skipping AC overwrite for %s — a concurrent decompose_ticket "
+                "call already applied the parent marker",
+                ticket_id,
+            )
+            return
+
         self._lifecycle.update_acceptance_criteria(
             ticket_id, self._provider, ac_markdown, new_hash
         )

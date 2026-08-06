@@ -3948,6 +3948,54 @@ class TestDecomposition:
         assert child_ids == {"201", "202"}
 
     @pytest.mark.asyncio
+    async def test_generate_and_post_ac_does_not_clobber_concurrent_marker_patch(
+        self, workflow, lifecycle, mock_ac_gen, mock_kanban
+    ):
+        """Regression: the sibling race to test_decompose_patches_marker_
+        if_child_record_won_a_race, in the OPPOSITE order.
+
+        _on_ticket_new decides is_subticket from a record captured before
+        any awaits run. If decompose_ticket's own post-creation marker
+        patch (see decompose_ticket's "That race is real..." comment)
+        lands WHILE _on_ticket_new is still in flight — plausible via the
+        near-instant ticket.new webhook path, independent of poll
+        interval — _on_ticket_new proceeds down the "no AC yet" branch
+        and calls _generate_and_post_ac with freshly-generated text
+        carrying no marker. Without the fix, its unconditional
+        update_acceptance_criteria call at the end silently re-clobbers
+        the patch that just landed, stranding the parent BLOCKED forever
+        despite that fix.
+
+        Simulated by pre-seeding the child's lifecycle record with the
+        parent marker BEFORE calling _generate_and_post_ac — as if
+        decompose_ticket's patch had just landed during one of the
+        method's earlier awaits (LLM generation, comment post,
+        description update).
+        """
+        patched_ac = "- [ ] api\n<!-- Sub-ticket of #100 -->"
+        lifecycle.get_or_create(
+            "201", "kanboard", acceptance_criteria=patched_ac
+        )
+
+        stale_record = lifecycle.get("201", "kanboard")
+
+        await workflow._generate_and_post_ac(
+            ticket_id="201",
+            title="Backend",
+            description="api",
+            was_human_created=True,
+            record=stale_record,
+        )
+
+        rec = lifecycle.get("201", "kanboard")
+        # The concurrently-applied marker must survive untouched.
+        assert "Sub-ticket of #100" in (rec.acceptance_criteria or "")
+        assert rec.acceptance_criteria == patched_ac
+        # The freshly-generated (marker-less) text from mock_ac_gen must
+        # NOT have overwritten it.
+        assert "Acceptance criterion 1" not in (rec.acceptance_criteria or "")
+
+    @pytest.mark.asyncio
     async def test_decompose_children_inherit_parent_color(
         self, workflow, lifecycle, mock_kanban
     ):
