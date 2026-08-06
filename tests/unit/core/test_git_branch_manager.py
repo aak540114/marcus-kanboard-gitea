@@ -651,10 +651,112 @@ class TestCheckoutConflictRecovery:
         assert len(checkout_attempts) == 2
 
     @pytest.mark.asyncio
+    async def test_checkout_recovers_from_dirty_tracked_files(self):
+        """Production symptom: a leftover dirty `index.html` blocks every
+        subsequent ticket's checkout with 'local changes ... would be
+        overwritten by checkout'. Discard via reset --hard + clean -fd
+        and retry once."""
+        mgr = _mgr()
+        checkout_attempts = []
+
+        async def fake_git(*args):
+            if args[0] == "checkout":
+                checkout_attempts.append(args)
+                if len(checkout_attempts) == 1:
+                    return (
+                        1,
+                        "",
+                        "error: Your local changes to the following files "
+                        "would be overwritten by checkout:\n\tindex.html\n"
+                        "Please commit your changes or stash them before "
+                        "you switch branches.\nAborting",
+                    )
+                return (0, "", "")
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+
+        rc, _, _ = await mgr._checkout_with_conflict_recovery(
+            "-B", "ticket/kanboard/49", "FETCH_HEAD"
+        )
+
+        assert rc == 0
+        assert len(checkout_attempts) == 2
+        calls = _calls(mgr._git)
+        assert ("reset", "--hard", "HEAD") in calls
+        assert ("clean", "-fd") in calls
+
+    @pytest.mark.asyncio
+    async def test_checkout_recovers_from_dirty_untracked_files(self):
+        """Sibling git message for untracked (not just tracked) files
+        must also be recognized and recovered the same way."""
+        mgr = _mgr()
+        checkout_attempts = []
+
+        async def fake_git(*args):
+            if args[0] == "checkout":
+                checkout_attempts.append(args)
+                if len(checkout_attempts) == 1:
+                    return (
+                        1,
+                        "",
+                        "error: The following untracked working tree "
+                        "files would be overwritten by checkout:\n"
+                        "\tscratch.tmp\nPlease move or remove them before "
+                        "you switch branches.\nAborting",
+                    )
+                return (0, "", "")
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+
+        rc, _, _ = await mgr._checkout_with_conflict_recovery("main")
+
+        assert rc == 0
+        assert len(checkout_attempts) == 2
+        assert ("clean", "-fd") in _calls(mgr._git)
+
+    @pytest.mark.asyncio
+    async def test_create_branch_recovers_from_dirty_working_tree(self):
+        """End-to-end regression for the reported incident: create_branch's
+        resume-path checkout (-B branch FETCH_HEAD), blocked by a dirty
+        index.html, discards it and retries instead of failing every
+        subsequent ticket."""
+        mgr = _mgr()
+        checkout_attempts = []
+
+        async def fake_git(*args):
+            if args[0] == "fetch" and args[-1] == "ticket/kanboard/49":
+                return (0, "", "")  # branch exists on remote
+            if args[0] == "checkout":
+                checkout_attempts.append(args)
+                if len(checkout_attempts) == 1:
+                    return (
+                        1,
+                        "",
+                        "error: Your local changes to the following files "
+                        "would be overwritten by checkout:\n\tindex.html\n"
+                        "Please commit your changes or stash them before "
+                        "you switch branches.\nAborting",
+                    )
+                return (0, "", "")
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+
+        ok = await mgr.create_branch("ticket/kanboard/49")
+
+        assert ok is True
+        assert len(checkout_attempts) == 2
+        calls = _calls(mgr._git)
+        assert ("reset", "--hard", "HEAD") in calls
+        assert ("clean", "-fd") in calls
+
+    @pytest.mark.asyncio
     async def test_unrelated_checkout_failure_is_not_retried(self):
-        """A checkout failure with no merge/rebase signature (e.g. a
-        genuinely missing branch) is returned as-is, not endlessly
-        retried or misdiagnosed as leftover conflict state."""
+        """A checkout failure with no merge/rebase/dirty-tree signature
+        (e.g. a genuinely missing branch) is returned as-is, not
+        endlessly retried or misdiagnosed as leftover conflict state."""
         mgr = _mgr()
         mgr._git = AsyncMock(
             return_value=(1, "", "pathspec 'nope' did not match any file(s)")
@@ -665,6 +767,45 @@ class TestCheckoutConflictRecovery:
         assert rc == 1
         assert ("merge", "--abort") not in _calls(mgr._git)
         assert ("rebase", "--abort") not in _calls(mgr._git)
+        assert ("reset", "--hard", "HEAD") not in _calls(mgr._git)
+        assert ("clean", "-fd") not in _calls(mgr._git)
+
+
+class TestMergeToMainDefensiveReset:
+    """merge_to_main's `checkout main` is a same-branch NO-OP (and so
+    cannot fail / cannot trigger _checkout_with_conflict_recovery) when
+    the shared clone is already sitting on main between tickets — the
+    common steady state. Mirrors task.py's _merge_agent_branch_to_main
+    (Bug #651) defensive-reset precedent, placed unconditionally before
+    `git pull` to close that gap."""
+
+    @pytest.mark.asyncio
+    async def test_reset_and_clean_run_after_checkout_before_pull(self):
+        mgr = _mgr()
+        mgr._git = AsyncMock(return_value=(0, "", ""))
+
+        ok = await mgr.merge_to_main("ticket/kanboard/7")
+
+        assert ok is True
+        calls = _calls(mgr._git)
+        checkout_idx = calls.index(("checkout", "main"))
+        reset_idx = calls.index(("reset", "--hard", "HEAD"))
+        clean_idx = calls.index(("clean", "-fd"))
+        pull_idx = next(i for i, c in enumerate(calls) if c[0] == "pull")
+        assert checkout_idx < reset_idx < clean_idx < pull_idx
+
+    @pytest.mark.asyncio
+    async def test_reset_and_clean_are_unconditional_not_error_triggered(self):
+        """Issued every time, not only after a detected checkout/pull
+        failure — a plain happy-path merge must still show them."""
+        mgr = _mgr()
+        mgr._git = AsyncMock(return_value=(0, "", ""))
+
+        await mgr.merge_to_main("ticket/kanboard/7")
+
+        calls = _calls(mgr._git)
+        assert ("reset", "--hard", "HEAD") in calls
+        assert ("clean", "-fd") in calls
 
 
 class TestSharedCloneLock:

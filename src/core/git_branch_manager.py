@@ -173,22 +173,34 @@ class BranchManager:
     async def _checkout_with_conflict_recovery(
         self, *checkout_args: str
     ) -> Tuple[int, str, str]:
-        """Run ``git checkout <checkout_args>``, self-healing a leftover
-        in-progress merge/rebase from a PREVIOUS ticket's failure in this
-        SHARED clone (see the ``_lock`` comment in ``__init__``) instead
-        of failing outright on a stuck ``MERGE_HEAD``/rebase state that
-        has nothing to do with the current ticket.
+        """Run ``git checkout <checkout_args>``, self-healing leftover
+        state from a PREVIOUS ticket's failure in this SHARED clone (see
+        the ``_lock`` comment in ``__init__``) instead of failing outright
+        on a mess that has nothing to do with the current ticket.
 
         ``git checkout`` unconditionally refuses — regardless of which
-        branch it's switching to, even with ``-B`` — while a merge or
-        rebase is left unresolved (``"you have not concluded your
-        merge"``). ``merge_to_main``'s own ``git merge --abort`` on a
-        genuine conflict is not always guaranteed to leave the clone
-        spotless (and a rarer failure path — a successful local merge
-        whose subsequent push then fails — leaves no abort at all). One
-        retry after cleaning that up recovers the CURRENT ticket's
-        operation without needing to fully diagnose the prior one's
-        failure.
+        branch it's switching to, even with ``-B`` — in two situations:
+
+        1. A merge or rebase is left unresolved (``"you have not
+           concluded your merge"``). ``merge_to_main``'s own ``git merge
+           --abort`` on a genuine conflict is not always guaranteed to
+           leave the clone spotless (and a rarer failure path — a
+           successful local merge whose subsequent push then fails —
+           leaves no abort at all).
+        2. The working tree has uncommitted local changes that would be
+           overwritten (``"would be overwritten by checkout"`` — git
+           emits this for both tracked-file and untracked-file variants).
+           This clone is fully disposable: no legitimate uncommitted work
+           should ever live here (an agent's real work lives in commits
+           pushed to the remote from its OWN separate clone — see
+           ``get_work_context``), so whatever dirtied it is discarded
+           unconditionally. Mirrors the identical, already-proven-safe
+           precedent in ``src/marcus_mcp/tools/task.py``'s
+           ``_merge_agent_branch_to_main`` (Bug #651).
+
+        One retry after cleaning either of these up recovers the CURRENT
+        ticket's operation without needing to fully diagnose the prior
+        one's failure.
 
         Parameters
         ----------
@@ -223,6 +235,17 @@ class BranchManager:
                 err.strip(),
             )
             await self._git("rebase", "--abort")
+            return await self._git("checkout", *checkout_args)
+        if "would be overwritten by checkout" in lower:
+            logger.warning(
+                "git checkout blocked by uncommitted local changes left in "
+                "the shared clone (this clone is disposable — no "
+                "legitimate uncommitted work should ever live here) — "
+                "discarding them and retrying: %s",
+                err.strip(),
+            )
+            await self._git("reset", "--hard", "HEAD")
+            await self._git("clean", "-fd")
             return await self._git("checkout", *checkout_args)
         return rc, out, err
 
@@ -542,6 +565,22 @@ class BranchManager:
         if rc != 0:
             logger.error("Cannot checkout %s: %s", main, err)
             return False
+
+        # Defensive reset — mirrors src/marcus_mcp/tools/task.py's
+        # _merge_agent_branch_to_main precedent (Bug #651). `checkout
+        # main` above is a same-branch NO-OP whenever this shared clone
+        # is already sitting on main between tickets (the common steady
+        # state, and a fresh clone's default state right after a Marcus
+        # restart), so it cannot fail and cannot trigger
+        # _checkout_with_conflict_recovery's dirty-tree healing even when
+        # the tree IS dirty — that would otherwise only surface later as
+        # a `git pull` failure ("would be overwritten by merge"),
+        # reproducing the same cascade one ticket downstream. This clone
+        # is fully disposable; discarding unconditionally here, before
+        # `pull` ever runs, is safe by design (mirrors task.py's
+        # identical reasoning: merging only cares about committed state).
+        await self._git("reset", "--hard", "HEAD")
+        await self._git("clean", "-fd")
 
         # Pull latest. A conflicted pull plants MERGE_HEAD exactly like a
         # conflicted merge does — abort and fail rather than attempting the
