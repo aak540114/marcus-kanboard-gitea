@@ -48,6 +48,7 @@ HumanGatedWorkflow
     receive board events, then call :meth:`handle_event` to route them.
 """
 
+import asyncio
 import logging
 import math
 import os
@@ -111,6 +112,18 @@ _STUCK_AGENT_TIMEOUT_SECONDS = 600.0
 #: time, straight into Kanboard's SQLite backend. A short window lets
 #: near-simultaneous polls share one read without adding noticeable delay.
 _BOARD_RESCAN_MAX_AGE = 3.0
+
+#: How often the background sweep re-checks every BLOCKED (decomposed
+#: parent) ticket for whether all its children have reached DONE. This is
+#: a SAFETY NET alongside the event-driven path (_maybe_complete_parent,
+#: triggered when a child ticket closes) — that path can be missed
+#: entirely (a dropped webhook, a restart landing between the last
+#: child's completion and the parent check running, or any other gap),
+#: silently leaving a parent stuck in Blocked forever even though every
+#: child is done. The sweep only does cheap in-memory lifecycle-record
+#: iteration (no RPC calls unless it actually finds something to
+#: complete), so a short interval costs nothing.
+_PARENT_RECONCILE_INTERVAL_SECONDS = 60.0
 
 #: Hard caps applied to the agent-supplied ``usage`` payload — it is fully
 #: untrusted (any connected agent can send anything) and flows into stored
@@ -278,6 +291,10 @@ class HumanGatedWorkflow:
         # Lost on Marcus restart, which is acceptable since verify cycles are
         # short-lived (minutes) and the round counter resets naturally.
         self._ticket_verify_rounds: Dict[str, int] = {}
+        # Background sweep task for _reconcile_blocked_parents — see
+        # _PARENT_RECONCILE_INTERVAL_SECONDS.
+        self._parent_reconcile_task: Optional[asyncio.Task[None]] = None
+        self._parent_reconcile_running = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -319,14 +336,51 @@ class HumanGatedWorkflow:
                 await reconcile()
             except Exception as exc:  # noqa: BLE001 - never block startup
                 logger.warning("Dev-env orphan reconciliation failed: %s", exc)
+        # A parent stuck in Blocked with all children already Done from
+        # BEFORE this restart must not wait a full sweep interval to be
+        # caught — check once immediately (the background loop below
+        # handles every LATER occurrence on its own cadence).
+        try:
+            await self._reconcile_blocked_parents()
+        except Exception as exc:  # noqa: BLE001 - never block startup
+            logger.warning("Startup parent reconcile failed: %s", exc)
         await self._watcher.start()
+        if not self._parent_reconcile_running:
+            self._parent_reconcile_running = True
+            self._parent_reconcile_task = asyncio.create_task(
+                self._parent_reconcile_loop(), name="parent-reconcile"
+            )
         logger.info("HumanGatedWorkflow started for provider=%s", self._provider)
 
     async def stop(self) -> None:
         """Stop polling and shut down all dev environments."""
         await self._watcher.stop()
+        self._parent_reconcile_running = False
+        if self._parent_reconcile_task and not self._parent_reconcile_task.done():
+            self._parent_reconcile_task.cancel()
+            try:
+                await self._parent_reconcile_task
+            except asyncio.CancelledError:
+                pass
         await self._dev_env.stop_all()
         logger.info("HumanGatedWorkflow stopped for provider=%s", self._provider)
+
+    async def _parent_reconcile_loop(self) -> None:
+        """Background loop calling :meth:`_reconcile_blocked_parents` on a
+        fixed interval until :meth:`stop` cancels it."""
+        while self._parent_reconcile_running:
+            remaining = _PARENT_RECONCILE_INTERVAL_SECONDS
+            while remaining > 0 and self._parent_reconcile_running:
+                await asyncio.sleep(min(remaining, 5.0))
+                remaining -= 5.0
+            try:
+                await self._reconcile_blocked_parents()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Parent-reconcile sweep failed: %s", exc, exc_info=True
+                )
 
     # ------------------------------------------------------------------
     # Event subscriptions
@@ -3145,6 +3199,19 @@ class HumanGatedWorkflow:
                         "Could not sync subtask status for %s: %s", child_id, exc
                     )
 
+        await self._check_parent_completion(parent_id)
+
+    async def _check_parent_completion(self, parent_id: str) -> None:
+        """Complete *parent_id* if it's BLOCKED and ALL its children are DONE.
+
+        Shared by two callers: :meth:`_maybe_complete_parent` (the
+        event-driven path, triggered when a specific child ticket
+        closes) and :meth:`_reconcile_blocked_parents` (the periodic
+        safety-net sweep — see :data:`_PARENT_RECONCILE_INTERVAL_SECONDS`
+        for why the event-driven path alone isn't sufficient). No-op if
+        the parent doesn't exist, is already DONE/WAITING_FOR_HUMAN, has
+        no children, or any child isn't DONE yet.
+        """
         parent = self._lifecycle.get(parent_id, self._provider)
         if parent is None or parent.state in (
             TicketState.DONE,
@@ -3202,6 +3269,36 @@ class HumanGatedWorkflow:
             "Move this ticket to Done once you're satisfied.",
         )
         logger.info("Parent %s ready for human review (all children done)", parent_id)
+
+    async def _reconcile_blocked_parents(self) -> None:
+        """Safety-net sweep: complete any BLOCKED parent whose children
+        are ALL already DONE, regardless of whether the event-driven
+        trigger (:meth:`_maybe_complete_parent`, called when a child
+        closes) ever fired for it.
+
+        That event-driven path can be missed entirely — a dropped
+        webhook, a Marcus restart landing between the last child's
+        completion and the parent check running, or any other gap —
+        silently leaving a parent stuck in Blocked forever even though
+        every child is done. Called once at startup and then on a fixed
+        interval (see :data:`_PARENT_RECONCILE_INTERVAL_SECONDS`) so
+        such a ticket is caught within one sweep regardless of cause.
+        """
+        for record in list(self._lifecycle.all_records()):
+            if record.provider != self._provider:
+                continue
+            if record.state != TicketState.BLOCKED:
+                continue
+            if not self._children_of(record.ticket_id):
+                continue
+            try:
+                await self._check_parent_completion(record.ticket_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Reconcile: could not check parent %s: %s",
+                    record.ticket_id,
+                    exc,
+                )
 
     async def _complete_parent_ticket(
         self, parent_id: str, record: TicketRecord

@@ -4390,6 +4390,127 @@ class TestParentAutoComplete:
         assert workflow._parent_of(rec) == "310"
 
 
+class TestReconcileBlockedParents:
+    """Safety-net sweep: a BLOCKED parent whose children are ALL Done
+    must be caught even when the event-driven _maybe_complete_parent
+    trigger (fired when a child ticket closes) was missed entirely —
+    a dropped webhook, a restart landing at the wrong moment, or any
+    other gap."""
+
+    def _child(self, lifecycle, tid, parent):
+        lifecycle.get_or_create(
+            tid, "kanboard",
+            acceptance_criteria=f"- [ ] x\n<!-- Sub-ticket of #{parent} -->",
+        )
+
+    @pytest.mark.asyncio
+    async def test_sweep_catches_a_missed_completion(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Children reach DONE WITHOUT _maybe_complete_parent ever being
+        called for them (simulating a missed trigger) — the sweep alone
+        must still move the parent to Waiting for Human."""
+        lifecycle.get_or_create("230", "kanboard")  # parent
+        lifecycle.human_transition("230", "kanboard", TicketState.BLOCKED)
+        self._child(lifecycle, "231", "230")
+        self._child(lifecycle, "232", "230")
+        for c in ("231", "232"):
+            lifecycle.transition(c, "kanboard", TicketState.READY)
+            lifecycle.transition(c, "kanboard", TicketState.IN_PROGRESS)
+            lifecycle.transition(c, "kanboard", TicketState.DONE)
+
+        await workflow._reconcile_blocked_parents()
+
+        rec = lifecycle.get("230", "kanboard")
+        assert rec.state == TicketState.WAITING_FOR_HUMAN
+        mock_kanban.move_task_to_column.assert_any_call("230", "waiting for human")
+
+    @pytest.mark.asyncio
+    async def test_sweep_respects_ai_gate(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """The sweep goes through the same gate-aware completion path as
+        the event-driven trigger — AI gate completes straight to Done."""
+        workflow._get_effective_gate = AsyncMock(return_value="ai")
+        lifecycle.get_or_create("233", "kanboard")  # parent
+        lifecycle.human_transition("233", "kanboard", TicketState.BLOCKED)
+        self._child(lifecycle, "234", "233")
+        lifecycle.transition("234", "kanboard", TicketState.READY)
+        lifecycle.transition("234", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("234", "kanboard", TicketState.DONE)
+
+        await workflow._reconcile_blocked_parents()
+
+        rec = lifecycle.get("233", "kanboard")
+        assert rec.state == TicketState.DONE
+        mock_kanban.move_task_to_column.assert_any_call("233", "done")
+
+    @pytest.mark.asyncio
+    async def test_sweep_ignores_parents_with_a_pending_child(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        lifecycle.get_or_create("235", "kanboard")
+        lifecycle.human_transition("235", "kanboard", TicketState.BLOCKED)
+        self._child(lifecycle, "236", "235")
+        lifecycle.transition("236", "kanboard", TicketState.READY)
+        lifecycle.transition("236", "kanboard", TicketState.IN_PROGRESS)
+        # #236 not done yet.
+
+        await workflow._reconcile_blocked_parents()
+
+        assert lifecycle.get("235", "kanboard").state == TicketState.BLOCKED
+
+    @pytest.mark.asyncio
+    async def test_sweep_ignores_non_blocked_tickets(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """A plain in-progress ticket (no children, not Blocked) is
+        untouched — the sweep must not raise or misfire on it."""
+        lifecycle.get_or_create("237", "kanboard")
+        lifecycle.transition("237", "kanboard", TicketState.READY)
+        lifecycle.transition("237", "kanboard", TicketState.IN_PROGRESS)
+
+        await workflow._reconcile_blocked_parents()
+
+        assert lifecycle.get("237", "kanboard").state == TicketState.IN_PROGRESS
+
+    @pytest.mark.asyncio
+    async def test_sweep_ignores_a_blocked_ticket_with_no_children(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """A ticket BLOCKED for an unrelated reason (e.g. a dependency,
+        not decomposition) has no children and must be left alone."""
+        lifecycle.get_or_create("238", "kanboard")
+        lifecycle.human_transition("238", "kanboard", TicketState.BLOCKED)
+
+        await workflow._reconcile_blocked_parents()
+
+        assert lifecycle.get("238", "kanboard").state == TicketState.BLOCKED
+
+    @pytest.mark.asyncio
+    async def test_start_immediately_catches_a_stuck_parent(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """A parent stuck in Blocked with all children already Done from
+        BEFORE a restart is caught immediately by start() itself — not
+        only after waiting a full sweep interval."""
+        lifecycle.get_or_create("239", "kanboard")
+        lifecycle.human_transition("239", "kanboard", TicketState.BLOCKED)
+        self._child(lifecycle, "241", "239")
+        lifecycle.transition("241", "kanboard", TicketState.READY)
+        lifecycle.transition("241", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("241", "kanboard", TicketState.DONE)
+        mock_kanban.get_task_by_id = AsyncMock(return_value=MagicMock())
+
+        workflow._watcher.start = AsyncMock()
+        try:
+            await workflow.start()
+        finally:
+            await workflow.stop()
+
+        assert lifecycle.get("239", "kanboard").state == TicketState.WAITING_FOR_HUMAN
+
+
 class TestParentAutoCompleteEndToEnd:
     """Same guarantee as TestParentAutoComplete (all children Done -> parent
     to Waiting for Human), but driven through the REAL event handlers
