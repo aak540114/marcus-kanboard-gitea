@@ -341,7 +341,20 @@ def get_tool_definitions(role: str = "agent") -> List[types.Tool]:
                             "Message to echo or command: " "'health'|'cleanup'|'reset'"
                         ),
                         "default": "",
-                    }
+                    },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": (
+                            "Required (must be true) to actually perform "
+                            "echo='reset'. Without it, 'reset' returns a "
+                            "dry-run of what would be cleared and makes "
+                            "no changes. 'cleanup'/'reset' also require "
+                            "an authenticated developer/agent/admin "
+                            "client — observer and unregistered clients "
+                            "are read-only."
+                        ),
+                        "default": False,
+                    },
                 },
                 "required": [],
             },
@@ -1533,7 +1546,11 @@ async def handle_tool_call(
 
         # System health tools
         elif name == "ping":
-            result = await ping(echo=arguments.get("echo", ""), state=state)
+            result = await ping(
+                echo=arguments.get("echo", ""),
+                state=state,
+                confirm=arguments.get("confirm", False),
+            )
 
         elif name == "check_assignment_health":
             result = await check_assignment_health(state=state)

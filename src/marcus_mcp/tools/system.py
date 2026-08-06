@@ -14,7 +14,32 @@ from src.logging.conversation_logger import conversation_logger, log_thinking
 from src.monitoring.assignment_monitor import AssignmentHealthChecker
 
 
-async def ping(echo: str, state: Any) -> Dict[str, Any]:
+#: client_type values (see auth.ROLE_TOOLS) allowed to invoke ping's
+#: destructive "cleanup"/"reset" commands. "ping" itself is deliberately
+#: in every role's tool list — including DEFAULT_TOOLS for unregistered
+#: clients and the "observer" role, which authenticate()'s own docstring
+#: defines as read-only — so the tool-name-only access-control gate in
+#: handlers.handle_tool_call cannot distinguish ping(echo="pong") from
+#: ping(echo="reset"). This module-level check closes that gap.
+_PING_MUTATION_ALLOWED_CLIENT_TYPES = {"agent", "developer", "admin"}
+
+
+def _ping_client_may_mutate(state: Any) -> bool:
+    """Whether the currently-calling client may run ping's mutating commands.
+
+    Unregistered clients (using DEFAULT_TOOLS) and clients registered as
+    "observer" are read-only by design and must be rejected; only
+    "agent"/"developer"/"admin" client types may proceed.
+    """
+    client_id = getattr(state, "_current_client_id", None)
+    registered = getattr(state, "_registered_clients", None)
+    if not client_id or not registered:
+        return False
+    client_info = registered.get(client_id) or {}
+    return client_info.get("client_type") in _PING_MUTATION_ALLOWED_CLIENT_TYPES
+
+
+async def ping(echo: str, state: Any, confirm: bool = False) -> Dict[str, Any]:
     """
     Check Marcus status and connectivity with enhanced health diagnostics.
 
@@ -24,8 +49,10 @@ async def ping(echo: str, state: Any) -> Dict[str, Any]:
 
     Special echo commands:
     - "health": Return detailed health information
-    - "cleanup": Force cleanup of stuck task assignments
-    - "reset": Clear all pending assignments (use with caution)
+    - "cleanup": Force cleanup of stuck task assignments (requires a
+      developer/agent/admin client)
+    - "reset": Clear all pending assignments (requires a
+      developer/agent/admin client AND confirm=True)
 
     Parameters
     ----------
@@ -33,6 +60,11 @@ async def ping(echo: str, state: Any) -> Dict[str, Any]:
         Optional message to echo back or special command
     state : Any
         Marcus server state instance
+    confirm : bool
+        Must be True to actually perform "reset" — mirrors
+        remove_project's confirm=True pattern. Without it, "reset"
+        returns a dry-run response describing what would be cleared
+        and makes no changes.
 
     Returns
     -------
@@ -135,6 +167,19 @@ async def ping(echo: str, state: Any) -> Dict[str, Any]:
             except Exception as e:
                 response["health"]["lease_statistics"] = {"error": str(e)}
 
+        elif echo_lower in ("cleanup", "reset") and not _ping_client_may_mutate(
+            state
+        ):
+            response[echo_lower] = {
+                "success": False,
+                "error": (
+                    f"ping(echo='{echo_lower}') requires an authenticated "
+                    "developer/agent/admin client — observer and "
+                    "unregistered clients have read-only access. Call "
+                    "authenticate(client_type=...) first."
+                ),
+            }
+
         elif echo_lower == "cleanup":
             # Force cleanup of stuck assignments
             cleanup_count = 0
@@ -167,27 +212,37 @@ async def ping(echo: str, state: Any) -> Dict[str, Any]:
                 "operations_cleared": len(getattr(state, "_active_operations", set())),
             }
 
-            # Clear all assignment state
-            state.tasks_being_assigned.clear()
-            state.agent_tasks.clear()
-            if hasattr(state, "_active_operations"):
-                state._active_operations.clear()
+            if not confirm:
+                # Mirrors remove_project's confirm=True requirement —
+                # a full assignment-state wipe has no undo. Report what
+                # WOULD be cleared without touching anything.
+                response["reset"] = {
+                    "success": False,
+                    "error": "Set confirm=true to perform a full assignment state reset.",
+                    "would_clear": reset_info,
+                }
+            else:
+                # Clear all assignment state
+                state.tasks_being_assigned.clear()
+                state.agent_tasks.clear()
+                if hasattr(state, "_active_operations"):
+                    state._active_operations.clear()
 
-            # Reset assignment monitor tracking
-            if state.assignment_monitor:
-                # Clear reversion tracking
-                if hasattr(state.assignment_monitor, "_reversion_count"):
-                    state.assignment_monitor._reversion_count.clear()
-                if hasattr(state.assignment_monitor, "_last_known_states"):
-                    state.assignment_monitor._last_known_states.clear()
+                # Reset assignment monitor tracking
+                if state.assignment_monitor:
+                    # Clear reversion tracking
+                    if hasattr(state.assignment_monitor, "_reversion_count"):
+                        state.assignment_monitor._reversion_count.clear()
+                    if hasattr(state.assignment_monitor, "_last_known_states"):
+                        state.assignment_monitor._last_known_states.clear()
 
-            log_thinking("marcus", "Performed full assignment state reset")
+                log_thinking("marcus", "Performed full assignment state reset")
 
-            response["reset"] = {
-                "success": True,
-                "reset_info": reset_info,
-                "warning": "All assignment state has been cleared!",
-            }
+                response["reset"] = {
+                    "success": True,
+                    "reset_info": reset_info,
+                    "warning": "All assignment state has been cleared!",
+                }
 
     # Log the response immediately
     state.log_event("ping_response", response)

@@ -51,6 +51,15 @@ class TestPingLeaseStatistics:
         # Mock log_event
         state.log_event = Mock()
 
+        # Authenticated as a "developer" client — ping's cleanup/reset
+        # commands require an agent/developer/admin client type; these
+        # tests exercise health/lease-statistics behavior, not access
+        # control, so authenticate as a client type allowed to mutate.
+        state._current_client_id = "test-client"
+        state._registered_clients = {
+            "test-client": {"client_type": "developer"}
+        }
+
         return state
 
     @pytest.mark.asyncio

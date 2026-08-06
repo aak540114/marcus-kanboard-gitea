@@ -1319,11 +1319,11 @@ class MarcusServer:
 
         # Register core tools with proper signatures
         @self._fastmcp.tool()  # type: ignore[misc]
-        async def ping(echo: str = "") -> Dict[str, Any]:
+        async def ping(echo: str = "", confirm: bool = False) -> Dict[str, Any]:
             """Check Marcus status and connectivity."""
             from .tools.system import ping as ping_impl
 
-            return await ping_impl(echo=echo, state=server)
+            return await ping_impl(echo=echo, state=server, confirm=confirm)
 
         @self._fastmcp.tool()  # type: ignore[misc]
         async def register_agent(
@@ -1495,11 +1495,11 @@ class MarcusServer:
         if "ping" in allowed_tools:
 
             @app.tool()  # type: ignore[misc]
-            async def ping(echo: str = "") -> Dict[str, Any]:
+            async def ping(echo: str = "", confirm: bool = False) -> Dict[str, Any]:
                 """Check Marcus status and connectivity."""
                 from .tools.system import ping as ping_impl
 
-                return await ping_impl(echo=echo, state=server)
+                return await ping_impl(echo=echo, state=server, confirm=confirm)
 
         if "authenticate" in allowed_tools:
 
