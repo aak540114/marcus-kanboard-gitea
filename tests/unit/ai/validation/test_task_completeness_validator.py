@@ -102,6 +102,33 @@ class TestTaskCompletenessValidator:
             mock_call.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_extract_intents_call_ai_raises_falls_back_cleanly(
+        self, validator: TaskCompletenessValidator, mock_ai_client: AsyncMock
+    ) -> None:
+        """Regression: _call_ai raising before returning must not crash.
+
+        response_data was only ever bound inside the try block, so when
+        _call_ai itself raised KeyError/json.JSONDecodeError (as its
+        deprecated _call_claude fallback path can), the except handler's
+        own `str(response_data)` logging read raised a fresh, unrelated
+        UnboundLocalError instead of the intended truncated-description
+        fallback.
+        """
+        with patch.object(
+            validator,
+            "_call_ai",
+            side_effect=KeyError("intents"),
+        ):
+            result = await validator.extract_intents(
+                "Build an MCP server that wraps the Deck of Cards API",
+                "deck-mcp",
+            )
+
+        assert result == [
+            "Build an MCP server that wraps the Deck of Cards API"[:100]
+        ]
+
+    @pytest.mark.asyncio
     async def test_validate_coverage_complete(
         self,
         validator: TaskCompletenessValidator,
@@ -144,6 +171,26 @@ class TestTaskCompletenessValidator:
             # Assert
             assert result["complete"] is False
             assert "MCP server" in result["missing"]
+
+    @pytest.mark.asyncio
+    async def test_validate_coverage_call_ai_raises_falls_back_cleanly(
+        self,
+        validator: TaskCompletenessValidator,
+        mock_ai_client: AsyncMock,
+        sample_tasks: list[Task],
+    ) -> None:
+        """Regression: same UnboundLocalError class as extract_intents
+        (see test_extract_intents_call_ai_raises_falls_back_cleanly),
+        for validate_coverage's except handler."""
+        intents = ["MCP tools", "API client"]
+        with patch.object(
+            validator,
+            "_call_ai",
+            side_effect=KeyError("complete"),
+        ):
+            result = await validator.validate_coverage(intents, sample_tasks)
+
+        assert result == {"complete": False, "missing": intents}
 
     @pytest.mark.asyncio
     async def test_validate_with_retry_passes_first_attempt(

@@ -199,9 +199,13 @@ Intents: ["MCP server", "Deck of Cards API wrapper", "MCP tools for deck operati
 Focus on core deliverables - what must exist for this project to work.
 Be concise. Return only valid JSON."""
 
+        # Bound before the try so the except block's error-logging read
+        # of response_data can't raise its own UnboundLocalError when
+        # _call_ai itself throws before ever returning a value.
+        response_data: dict[str, Any] = {}
         try:
             # Use the provider's complete method for simple prompts
-            response_data: dict[str, Any] = await self._call_ai(prompt)
+            response_data = await self._call_ai(prompt)
             intents: list[str] = response_data["intents"]
             return intents
 
@@ -265,8 +269,12 @@ If ALL intents are covered (semantically, not word-for-word), return complete=tr
 If ANY intent is missing, return complete=false with the missing ones.
 Return only valid JSON."""
 
+        # Bound before the try so the except block's error-logging read
+        # of response_data can't raise its own UnboundLocalError when
+        # _call_ai itself throws before ever returning a value.
+        response_data: dict[str, Any] = {}
         try:
-            response_data: dict[str, Any] = await self._call_ai(prompt)
+            response_data = await self._call_ai(prompt)
 
             return {
                 "complete": response_data.get("complete", False),
