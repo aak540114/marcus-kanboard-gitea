@@ -761,10 +761,16 @@ class MarcusExperiment:
             metrics["throughput_tasks_per_hour"] = tasks_per_hour
 
         mlflow.log_metrics(metrics, step=step)
-        logger.info(
-            f"Logged throughput: {tasks_completed} tasks in {elapsed_hours:.2f}h "
-            f"({tasks_per_hour:.2f} tasks/hour)"
-        )
+        if tasks_per_hour is not None:
+            logger.info(
+                f"Logged throughput: {tasks_completed} tasks in "
+                f"{elapsed_hours:.2f}h ({tasks_per_hour:.2f} tasks/hour)"
+            )
+        else:
+            logger.info(
+                f"Logged throughput: {tasks_completed} tasks in "
+                f"{elapsed_hours:.2f}h (rate not calculated)"
+            )
 
     def log_parallel_efficiency(
         self,

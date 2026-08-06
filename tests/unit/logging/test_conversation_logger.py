@@ -7,6 +7,7 @@ status updates.
 """
 
 import json
+import logging
 import tempfile
 from pathlib import Path
 
@@ -261,3 +262,35 @@ class TestConversationLogger:
             log_entry = json.loads(line)
             assert log_entry["worker_id"] == f"worker_{i}"
             assert log_entry["metadata"]["index"] == i
+
+    def test_re_instantiation_does_not_accumulate_file_handlers(self):
+        """Regression: logging.getLogger("marcus"/"worker"/"kanban") returns
+        the SAME process-global singleton Logger every time — it is not
+        scoped to a ConversationLogger instance. _setup_file_handlers used
+        to unconditionally ADD two new FileHandlers on every instantiation
+        with no cleanup of a prior instance's handlers, so each new
+        ConversationLogger() permanently leaked two more open file handles
+        onto these loggers and caused every later log call to be duplicated
+        into every previously-opened (often already-deleted) log file."""
+        with tempfile.TemporaryDirectory() as tmpdir1, tempfile.TemporaryDirectory() as tmpdir2, tempfile.TemporaryDirectory() as tmpdir3:
+            ConversationLogger(log_dir=tmpdir1)
+            ConversationLogger(log_dir=tmpdir2)
+            ConversationLogger(log_dir=tmpdir3)
+
+            for logger_name in ("marcus", "worker", "kanban"):
+                # Filter to conversation/decision log handlers specifically
+                # (other test infrastructure may attach its own unrelated
+                # FileHandlers, e.g. a /dev/null capture handler — this
+                # test only cares about ConversationLogger's own).
+                handlers = [
+                    h
+                    for h in logging.getLogger(logger_name).handlers
+                    if isinstance(h, logging.FileHandler)
+                    and ("conversations_" in h.baseFilename or "decisions_" in h.baseFilename)
+                ]
+                assert len(handlers) == 2, (
+                    f"{logger_name!r} logger has {len(handlers)} "
+                    "conversation/decision FileHandlers after 3 "
+                    "ConversationLogger instantiations — expected exactly "
+                    "2 (only the most recent instance's)"
+                )

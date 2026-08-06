@@ -128,6 +128,16 @@ class ConversationType(Enum):
     ERROR = "error"
 
 
+#: Handlers the MOST RECENT ConversationLogger instance attached to the
+#: process-global "marcus"/"worker"/"kanban" loggers (logging.getLogger(name)
+#: returns the same singleton Logger for a given name across the whole
+#: process — it is not scoped to a ConversationLogger instance). Tracked
+#: here so _setup_file_handlers can remove+close a prior instance's
+#: handlers before attaching its own, instead of accumulating two more
+#: open file handles forever on every re-instantiation.
+_conversation_log_handlers: List[logging.Handler] = []
+
+
 class ConversationLogger:
     """
     Comprehensive structured logger for Marcus system conversations.
@@ -322,6 +332,25 @@ class ConversationLogger:
                 # Only allow logs from marcus, worker, and kanban loggers
                 return record.name in ("marcus", "worker", "kanban")
 
+        # Remove and close whatever a PREVIOUS ConversationLogger instance
+        # attached to these process-global loggers. logging.getLogger(name)
+        # returns the SAME singleton Logger for a given name across the
+        # whole process — it is not scoped to this instance — so without
+        # this, every re-instantiation (production builds exactly one, but
+        # e.g. a fresh instance per test does not) permanently accumulates
+        # two more open file handles on "marcus"/"worker"/"kanban" forever,
+        # and every later log call gets duplicated into every previously-
+        # opened (often already on-disk-deleted) log file.
+        global _conversation_log_handlers
+        for logger_name in ["marcus", "worker", "kanban"]:
+            logger = logging.getLogger(logger_name)
+            for old_handler in _conversation_log_handlers:
+                if old_handler in logger.handlers:
+                    logger.removeHandler(old_handler)
+        for old_handler in _conversation_log_handlers:
+            old_handler.close()
+        _conversation_log_handlers = []
+
         # Main conversation log
         conversation_handler = logging.FileHandler(
             self.log_dir
@@ -350,6 +379,7 @@ class ConversationLogger:
             logger.addHandler(decision_handler)
             # Prevent propagation to root logger to avoid duplicate logs
             logger.propagate = False
+        _conversation_log_handlers = [conversation_handler, decision_handler]
 
     def log_worker_message(
         self,

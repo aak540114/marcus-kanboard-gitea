@@ -248,6 +248,26 @@ class TestThroughput:
         metrics = mock_mlflow.log_metrics.call_args[0][0]
         assert metrics["throughput_tasks_per_hour"] == 5.5
 
+    @patch("src.experiments.mlflow_tracker.mlflow")
+    def test_log_throughput_zero_elapsed_hours_does_not_crash(
+        self, mock_mlflow, experiment
+    ):
+        """Regression: elapsed_hours=0 with no explicit tasks_per_hour left
+        tasks_per_hour as None, but the final log line unconditionally
+        formatted it with `:.2f` — raising `TypeError: unsupported format
+        string passed to NoneType.__format__` on every call. Mirrors the
+        None-guard log_parallel_efficiency already had."""
+        # Act — must not raise.
+        experiment.log_throughput(
+            tasks_completed=5,
+            elapsed_hours=0,
+        )
+
+        # Assert
+        metrics = mock_mlflow.log_metrics.call_args[0][0]
+        assert metrics["throughput_tasks_completed"] == 5.0
+        assert "throughput_tasks_per_hour" not in metrics
+
 
 class TestParallelEfficiency:
     """Test parallel efficiency metrics."""
