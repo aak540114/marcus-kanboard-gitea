@@ -4213,6 +4213,35 @@ class TestParentAutoComplete:
         mock_kanban.move_task_to_column.assert_any_call("200", "waiting for human")
 
     @pytest.mark.asyncio
+    async def test_ai_gate_parent_completes_directly_without_human_review(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Regression: under the AI gate, a parent whose children are ALL
+        done must go straight to Done — never parked in Waiting for
+        Human for a review step that gate mode doesn't want. Each child
+        already went through its own gate/verification individually
+        before being merged, so no separate AI-verify round runs here
+        either (the parent has no branch/diff of its own to verify)."""
+        workflow._get_effective_gate = AsyncMock(return_value="ai")
+        lifecycle.get_or_create("203", "kanboard")  # parent
+        lifecycle.human_transition("203", "kanboard", TicketState.BLOCKED)
+        self._child(lifecycle, "204", "203")
+        self._child(lifecycle, "205", "203")
+        for c in ("204", "205"):
+            lifecycle.transition(c, "kanboard", TicketState.READY)
+            lifecycle.transition(c, "kanboard", TicketState.IN_PROGRESS)
+            lifecycle.transition(c, "kanboard", TicketState.DONE)
+
+        await workflow._maybe_complete_parent("205")
+
+        rec = lifecycle.get("203", "kanboard")
+        assert rec.state == TicketState.DONE
+        mock_kanban.move_task_to_column.assert_any_call("203", "done")
+        # Never routed through the human-review parking step.
+        moved_to = [c.args for c in mock_kanban.move_task_to_column.await_args_list]
+        assert ("203", "waiting for human") not in moved_to
+
+    @pytest.mark.asyncio
     async def test_parent_not_completed_while_a_child_pending(
         self, workflow, lifecycle, mock_kanban
     ):

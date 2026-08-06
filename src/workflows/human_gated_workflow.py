@@ -3107,12 +3107,23 @@ class HumanGatedWorkflow:
         logger.info("Ticket %s blocked on dependencies: %s", ticket_id, blockers)
 
     async def _maybe_complete_parent(self, child_id: str) -> None:
-        """Move a parent ticket to WAITING_FOR_HUMAN once ALL its
-        sub-tickets are DONE — the parent has no branch of its own to
-        merge or verify, so a human reviews the completed children and
-        marks the parent Done themselves (see :meth:`_complete_parent_ticket`,
-        wired into :meth:`_on_ticket_closed`), the same as any other
-        ticket a human closes.
+        """Complete a parent ticket once ALL its sub-tickets are DONE.
+
+        **Human gate (default)**: moves the parent to WAITING_FOR_HUMAN —
+        the parent has no branch of its own to merge or verify, so a
+        human reviews the completed children and marks the parent Done
+        themselves (see :meth:`_complete_parent_ticket`, wired into
+        :meth:`_on_ticket_closed`), the same as any other ticket a human
+        closes.
+
+        **AI gate**: skips the human review step and marks the parent
+        Done directly via :meth:`_complete_parent_ticket`. No AI-verify
+        step runs here even if the project has one configured — each
+        child already went through its OWN gate/verification
+        individually before being merged, so the parent's completion is
+        just aggregating already-verified work, not new code to review
+        (the parent has no branch/diff of its own for a verifier to look
+        at in the first place).
         """
         child = self._lifecycle.get(child_id, self._provider)
         if child is None:
@@ -3144,6 +3155,11 @@ class HumanGatedWorkflow:
         if not children or not all(
             c.state == TicketState.DONE for c in children
         ):
+            return
+
+        gate = await self._get_effective_gate(parent_id)
+        if gate == "ai":
+            await self._complete_parent_ticket(parent_id, parent)
             return
 
         self._park_in_waiting_for_human(
@@ -3193,14 +3209,16 @@ class HumanGatedWorkflow:
         """Mark a decomposed parent ticket DONE directly.
 
         A parent is a tracking shell with no branch of its own — its
-        children did the real work — so closing it (a human approving it
-        after :meth:`_maybe_complete_parent` parked it in Waiting for
-        Human, or dragging it straight to Done) must never attempt a git
-        merge: there is nothing to merge, and a failed merge on an empty
-        branch would incorrectly trigger the rebase-recovery flow meant
-        for tickets that actually have conflicting commits. Called from
-        :meth:`_on_ticket_closed` instead of :meth:`_merge_ticket_to_main`
-        whenever the closed ticket has sub-tickets.
+        children did the real work — so closing it must never attempt a
+        git merge: there is nothing to merge, and a failed merge on an
+        empty branch would incorrectly trigger the rebase-recovery flow
+        meant for tickets that actually have conflicting commits. Called
+        from two places: :meth:`_on_ticket_closed` (instead of
+        :meth:`_merge_ticket_to_main`) when a human approves a parent
+        already parked in Waiting for Human, or drags it straight to
+        Done; and directly from :meth:`_maybe_complete_parent` when the
+        parent's effective gate is ``"ai"``, skipping the human-review
+        parking step entirely once all children are done.
 
         Parameters
         ----------
