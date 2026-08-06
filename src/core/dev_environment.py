@@ -693,13 +693,17 @@ class DevEnvironmentManager:
         """Pull the latest branch commit into a running dev-environment container.
 
         Runs ``git fetch origin && git reset --hard origin/<branch>`` inside
-        the container via ``docker exec``. The container's ``/app`` is
-        bind-mounted from the same host path Marcus/GiteaManager use to
-        manage the repo, and the container's own inotify-restart-loop / HMR
-        watcher (see :meth:`_build_entrypoint`) picks up the file change
-        automatically — this method only needs to trigger the pull, not
-        implement any new reload logic. Intended to be called from the
-        Gitea push-webhook handler for instant refresh.
+        the container via ``docker exec``. The container's ``/app`` is its
+        OWN isolated clone (see the "ISOLATED CHECKOUT" comment in
+        :meth:`_build_entrypoint`) — the host repo Marcus/GiteaManager use
+        to manage the repo is bind-mounted read-only at ``/src`` and is
+        never written to; ``/app``'s ``origin`` remote points at that
+        ``/src`` mount, which is how this fetch reaches it with no network
+        and no credentials. The container's own inotify-restart-loop / HMR
+        watcher (see :meth:`_build_entrypoint`) picks up the file change in
+        ``/app`` automatically — this method only needs to trigger the
+        pull, not implement any new reload logic. Intended to be called
+        from the Gitea push-webhook handler for instant refresh.
 
         Parameters
         ----------
