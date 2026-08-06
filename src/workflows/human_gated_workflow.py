@@ -1004,19 +1004,8 @@ class HumanGatedWorkflow:
             await self._dev_env.stop(ticket_id, self._provider)
 
             # Clear any merge-conflict flag from a previous failed attempt
-            # on this same ticket — it's resolved now. Best-effort: only a
-            # KanboardKanban-specific capability, never blocks completion.
-            if hasattr(self._kanban, "set_merge_conflict_flag"):
-                try:
-                    await self._kanban.set_merge_conflict_flag(
-                        ticket_id, present=False
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "Could not clear merge-conflict flag for %s: %s",
-                        ticket_id,
-                        exc,
-                    )
+            # on this same ticket — it's resolved now.
+            await self._clear_merge_conflict_flag(ticket_id)
 
             comment = CommentFormatter.merged(
                 ticket_id=ticket_id,
@@ -2789,6 +2778,13 @@ class HumanGatedWorkflow:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not update kanban column: %s", exc)
 
+        # Reaching WAITING_FOR_HUMAN means the agent just resubmitted its
+        # work for review — the actual merge attempt happens LATER, when
+        # a human accepts it (_on_ticket_closed), not here. Without this,
+        # a ticket that had a conflict, got fixed, and was resubmitted
+        # would sit in "waiting for human" still showing the stale tag.
+        await self._clear_merge_conflict_flag(ticket_id)
+
         try:
             self._lifecycle.release_ticket(ticket_id, self._provider)
         except KeyError:
@@ -2885,6 +2881,8 @@ class HumanGatedWorkflow:
             await self._kanban.move_task_to_column(ticket_id, "waiting for human")
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not update kanban column: %s", exc)
+
+        await self._clear_merge_conflict_flag(ticket_id)
 
         try:
             self._lifecycle.release_ticket(ticket_id, self._provider)
@@ -3930,6 +3928,30 @@ class HumanGatedWorkflow:
             self._lifecycle.release_ticket(ticket_id, self._provider)
         except KeyError:
             pass
+
+    async def _clear_merge_conflict_flag(self, ticket_id: str) -> None:
+        """Clear the visible ``merge-conflict`` card tag, if set.
+
+        Called from every place a ticket moves OUT of Ready/In Progress
+        into Waiting-for-Human (for whatever reason — resubmitted for
+        review, the AI got stuck, a missing project description) and
+        from a successful merge. A ticket sitting in Waiting-for-Human
+        still showing a merge-conflict tag from an earlier, now-resolved
+        attempt wrongly implies to the reviewing human that it's still
+        broken. If a LATER merge attempt fails again, :meth:`_merge_to_main`
+        (via :meth:`set_merge_conflict_flag`) sets it right back.
+
+        Best-effort: only a KanboardKanban-specific capability, and a
+        failure here must never block whatever workflow step called it.
+        """
+        if not hasattr(self._kanban, "set_merge_conflict_flag"):
+            return
+        try:
+            await self._kanban.set_merge_conflict_flag(ticket_id, present=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not clear merge-conflict flag for %s: %s", ticket_id, exc
+            )
 
     async def _start_ai_work(
         self,
@@ -5160,6 +5182,7 @@ class HumanGatedWorkflow:
                 await self._kanban.move_task_to_column(ticket_id, "waiting for human")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Could not move ticket to waiting for human: %s", exc)
+            await self._clear_merge_conflict_flag(ticket_id)
             logger.info(
                 "Ticket %s paused — project description missing tech-stack info",
                 ticket_id,

@@ -2887,6 +2887,33 @@ class TestReviewFixes:
         )
 
     @pytest.mark.asyncio
+    async def test_resubmitting_for_review_clears_the_flag(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """Regression: a ticket that had a merge conflict, got fixed, and
+        is resubmitted for human review (human-gate signal_ready_for_review)
+        must have the stale flag cleared THEN — not only on a later
+        successful merge. In human-gate mode the actual merge attempt
+        only happens when a human accepts the ticket
+        (_on_ticket_closed), which is LATER than when it lands in
+        Waiting-for-Human; without this, the card would sit in "waiting
+        for human" still showing "merge-conflict" even though the agent
+        already fixed and resubmitted it."""
+        lifecycle.get_or_create("63", "kanboard")
+        lifecycle.transition("63", "kanboard", TicketState.READY)
+        lifecycle.claim_ticket("63", "kanboard", "w-fix")
+        lifecycle.transition("63", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.set_assignee("63", "kanboard", "alice")
+
+        ok = await workflow.signal_ready_for_review("63")
+
+        assert ok is True
+        assert lifecycle.get("63", "kanboard").state == TicketState.WAITING_FOR_HUMAN
+        mock_kanban.set_merge_conflict_flag.assert_awaited_once_with(
+            "63", present=False
+        )
+
+    @pytest.mark.asyncio
     async def test_duplicate_signal_ready_does_not_repost_comment(
         self, workflow, lifecycle, mock_kanban, mock_branch
     ):
