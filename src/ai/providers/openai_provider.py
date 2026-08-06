@@ -32,6 +32,7 @@ import httpx
 
 from src.core.models import Task
 from src.cost_tracking.cost_recorder import get_recorder
+from src.utils.json_parser import parse_ai_json_response, parse_json_response
 
 from .base_provider import (
     BaseLLMProvider,
@@ -442,7 +443,7 @@ Provide JSON array of 3-5 specific solutions:
     def _parse_task_analysis_response(self, response: str) -> SemanticAnalysis:
         """Parse GPT task analysis response."""
         try:
-            data = json.loads(response)
+            data = parse_ai_json_response(response)
             return SemanticAnalysis(
                 task_intent=data.get("task_intent", "unknown"),
                 semantic_dependencies=data.get("semantic_dependencies", []),
@@ -469,11 +470,22 @@ Provide JSON array of 3-5 specific solutions:
     ) -> List[SemanticDependency]:
         """Parse dependency inference response."""
         try:
-            data = json.loads(response)
+            data = parse_json_response(response)
             dependencies = []
             task_ids = {task.id for task in tasks}
 
-            for dep in data:
+            # data may be a bare list, or a dict wrapping the list under
+            # a "dependencies" key — normalize to a list before
+            # iterating (mirrors AnthropicProvider's equivalent method;
+            # also keeps mypy from inferring dict-key iteration below).
+            if isinstance(data, list):
+                deps_list = data
+            elif isinstance(data, dict) and "dependencies" in data:
+                deps_list = data["dependencies"]
+            else:
+                deps_list = []
+
+            for dep in deps_list:
                 if (
                     dep.get("dependent_task_id") in task_ids
                     and dep.get("dependency_task_id") in task_ids
@@ -495,7 +507,7 @@ Provide JSON array of 3-5 specific solutions:
     def _parse_estimation_response(self, response: str) -> EffortEstimate:
         """Parse effort estimation response."""
         try:
-            data = json.loads(response)
+            data = parse_ai_json_response(response)
             return EffortEstimate(
                 estimated_hours=float(data.get("estimated_hours", 8.0)),
                 confidence=float(data.get("confidence", 0.5)),
@@ -515,7 +527,17 @@ Provide JSON array of 3-5 specific solutions:
     def _parse_blocker_response(self, response: str) -> List[str]:
         """Parse blocker analysis response."""
         try:
-            suggestions_raw: Any = json.loads(response)
+            # Try a direct parse first — this handles bare JSON scalars
+            # (e.g. a single quoted string) that extract_json_from_response
+            # doesn't recognize as a JSON structure (it only looks for
+            # {...}/[...]). Only fall back to the markdown-fence-aware
+            # extractor when the response isn't already valid JSON as-is
+            # (e.g. wrapped in ```json fences, which GPT models commonly
+            # do despite prompt instructions to respond with plain JSON).
+            try:
+                suggestions_raw: Any = json.loads(response)
+            except json.JSONDecodeError:
+                suggestions_raw = parse_json_response(response)
             if isinstance(suggestions_raw, list):
                 return [str(s) for s in suggestions_raw]
             else:

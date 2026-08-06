@@ -955,6 +955,31 @@ class TestOpenAIProviderResponseParsing:
         assert "response_parsing_failed" in result.risk_factors
         assert result.confidence == 0.1
 
+    def test_parse_task_analysis_response_markdown_fenced(self, provider):
+        """Regression: GPT often wraps JSON in ```json fences despite the
+        "respond only with valid JSON" prompt instruction. Unlike
+        AnthropicProvider/LocalLLMProvider (which route through
+        src.utils.json_parser.parse_ai_json_response), OpenAIProvider's
+        parse methods used bare json.loads and silently degraded to the
+        parse_error fallback on every fenced response."""
+        payload = json.dumps(
+            {
+                "task_intent": "implement feature",
+                "semantic_dependencies": ["dep1"],
+                "risk_factors": [],
+                "suggestions": [],
+                "confidence": 0.85,
+                "reasoning": "detailed analysis",
+                "risk_assessment": {},
+            }
+        )
+        response = f"```json\n{payload}\n```"
+
+        result = provider._parse_task_analysis_response(response)
+
+        assert result.task_intent == "implement feature"
+        assert result.confidence == 0.85
+
     def test_parse_dependency_response_success(self, provider):
         """Test successful dependency response parsing"""
         tasks = [Mock(id="task-1"), Mock(id="task-2"), Mock(id="task-3")]
@@ -987,6 +1012,28 @@ class TestOpenAIProviderResponseParsing:
 
         assert result == []
 
+    def test_parse_dependency_response_markdown_fenced(self, provider):
+        """Regression: a markdown-fenced dependency array must still parse
+        (see test_parse_task_analysis_response_markdown_fenced)."""
+        tasks = [Mock(id="task-1"), Mock(id="task-2")]
+        payload = json.dumps(
+            [
+                {
+                    "dependent_task_id": "task-2",
+                    "dependency_task_id": "task-1",
+                    "confidence": 0.9,
+                    "reasoning": "logical dependency",
+                    "dependency_type": "technical",
+                }
+            ]
+        )
+        response = f"```json\n{payload}\n```"
+
+        result = provider._parse_dependency_response(response, tasks)
+
+        assert len(result) == 1
+        assert result[0].dependent_task_id == "task-2"
+
     def test_parse_estimation_response_success(self, provider):
         """Test successful estimation response parsing"""
         response = json.dumps(
@@ -1016,6 +1063,25 @@ class TestOpenAIProviderResponseParsing:
         assert result.estimated_hours == 8.0
         assert result.confidence == 0.1
         assert "parsing_failed" in result.factors
+
+    def test_parse_estimation_response_markdown_fenced(self, provider):
+        """Regression: a markdown-fenced estimation object must still
+        parse (see test_parse_task_analysis_response_markdown_fenced)."""
+        payload = json.dumps(
+            {
+                "estimated_hours": 15.5,
+                "confidence": 0.75,
+                "factors": ["complexity"],
+                "similar_tasks": [],
+                "risk_multiplier": 1.2,
+            }
+        )
+        response = f"```json\n{payload}\n```"
+
+        result = provider._parse_estimation_response(response)
+
+        assert result.estimated_hours == 15.5
+        assert result.confidence == 0.75
 
     def test_parse_blocker_response_json_array(self, provider):
         """Test blocker response parsing with JSON array"""
@@ -1057,6 +1123,17 @@ class TestOpenAIProviderResponseParsing:
         result = provider._parse_blocker_response(response)
 
         assert result == ["Review task requirements"]
+
+    def test_parse_blocker_response_markdown_fenced(self, provider):
+        """Regression: a markdown-fenced blocker array must still parse
+        as JSON, not fall through to the text-line fallback (which would
+        wrongly treat the ```json fence markers as suggestion lines)."""
+        payload = json.dumps(["Solution 1", "Solution 2", "Solution 3"])
+        response = f"```json\n{payload}\n```"
+
+        result = provider._parse_blocker_response(response)
+
+        assert result == ["Solution 1", "Solution 2", "Solution 3"]
 
 
 class TestOpenAIProviderComplete:
