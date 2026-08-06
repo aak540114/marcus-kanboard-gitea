@@ -644,6 +644,15 @@ class MarcusConfig:
                     http_port=port,
                     http_path=http_config.get("path", "/mcp"),
                     log_level=http_config.get("log_level", "info"),
+                    # dual_mode/http_enabled are siblings of "http" at the
+                    # transport level in this nested format (see
+                    # docs/CONFIGURATION.md's flat-format example for the
+                    # same two fields) — without these, a config using the
+                    # nested "http" section silently lost any explicit
+                    # dual_mode=True or http_enabled=False setting, always
+                    # falling back to the dataclass defaults.
+                    dual_mode=transport_data.get("dual_mode", False),
+                    http_enabled=transport_data.get("http_enabled", True),
                 )
             else:
                 # Old flat format

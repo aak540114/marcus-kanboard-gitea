@@ -4369,6 +4369,12 @@ class HumanGatedWorkflow:
                 ticket_id,
                 reason="Paused: project description missing tech-stack info",
             )
+            # A ticket that previously failed to merge (tag set), got
+            # parked back in Ready, and is picked up again but fails
+            # this stack check would otherwise land in Waiting for
+            # Human still showing a stale "merge-conflict" tag.
+            # Mirrors every other path into Waiting for Human.
+            await self._clear_merge_conflict_flag(ticket_id)
             return
 
         # Advance the lifecycle state to IN_PROGRESS via READY if needed.

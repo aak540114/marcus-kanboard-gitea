@@ -145,6 +145,43 @@ class TestMarcusConfigBasic:
         assert config.transport.http_port == 9999
         assert config.transport.http_path == "/api"
 
+    def test_nested_transport_config_preserves_dual_mode_and_http_enabled(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression: the nested-http transport format must not silently
+        drop dual_mode/http_enabled back to their dataclass defaults.
+
+        dual_mode/http_enabled are siblings of "http" at the transport
+        level (docs/CONFIGURATION.md documents the same two fields in
+        the flat format). The nested-http branch in
+        MarcusConfig._from_dict only ever read type/http_host/http_port/
+        http_path/log_level when constructing TransportSettings, so an
+        explicit dual_mode=True or http_enabled=False was silently
+        reverted to the defaults (False/True) whenever a config used the
+        nested "http" section instead of the flat format.
+        """
+        config_file = tmp_path / "test_config.json"
+        config_data = {
+            "transport": {
+                "type": "http",
+                "dual_mode": True,
+                "http_enabled": False,
+                "http": {"host": "127.0.0.1", "port": 9999, "path": "/api"},
+            },
+            "ai": {"provider": "anthropic", "anthropic_api_key": "test-key"},
+            "kanban": {"provider": "sqlite"},
+        }
+
+        with open(config_file, "w") as f:
+            json.dump(config_data, f)
+
+        config = MarcusConfig.from_file(str(config_file))
+
+        assert config.transport.http_host == "127.0.0.1"
+        assert config.transport.http_port == 9999
+        assert config.transport.dual_mode is True
+        assert config.transport.http_enabled is False
+
     def test_default_project_name_loaded_from_config(self, tmp_path: Path) -> None:
         """Test that default_project_name is loaded from JSON config."""
         config_file = tmp_path / "test_config.json"

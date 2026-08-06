@@ -4893,7 +4893,15 @@ function save() {{
 
                 pid = body.get("project_id")
                 enabled = body.get("decompose_enabled")
-                if not isinstance(pid, int) or not isinstance(enabled, bool):
+                # bool is an int subclass — exclude it explicitly so a
+                # body like {"project_id": true, ...} isn't silently
+                # accepted as project_id=1 (mirrors the same bool/int
+                # guard in human_gated_workflow.py's _safe_usage_scalar).
+                if (
+                    isinstance(pid, bool)
+                    or not isinstance(pid, int)
+                    or not isinstance(enabled, bool)
+                ):
                     r = JSONResponse(
                         {
                             "error": (

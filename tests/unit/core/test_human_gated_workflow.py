@@ -3034,6 +3034,12 @@ class TestReviewFixes:
         assert parked.ai_agent_id is None
         # Not available → not re-selected on the next pickup (no comment spam).
         assert "80" not in {r.ticket_id for r in lifecycle.get_available_tickets()}
+        # Regression: this Waiting-for-Human landing site must also clear
+        # any stale "merge-conflict" tag, like every other path into WFH —
+        # a ticket that previously failed to merge, got parked in Ready,
+        # and now fails this stack check instead must not keep showing a
+        # merge-conflict tag from the earlier, unrelated failure.
+        mock_kanban.set_merge_conflict_flag.assert_any_await("80", present=False)
 
     @pytest.mark.asyncio
     async def test_drag_to_done_column_merges(
