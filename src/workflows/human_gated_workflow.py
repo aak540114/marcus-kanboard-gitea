@@ -911,6 +911,23 @@ class HumanGatedWorkflow:
                     TicketState.BLOCKED,
                     reason="Human marked ticket as blocked",
                 )
+                # Record a sentinel blocker so the decompose-parent
+                # heuristics in _check_parent_completion /
+                # _reconcile_blocked_parents (which treat "no recognized
+                # children AND no recorded blocked_by" as "must be a
+                # decompose parent whose AC marker was lost") don't
+                # mistake an ordinary, never-decomposed ticket a human
+                # blocked for an unrelated reason as a decompose parent.
+                # Without this, such a ticket that also happens to carry
+                # a normal Kanboard "is blocked by" link to an unrelated
+                # Done ticket would be wrongly auto-completed by the
+                # link-fallback sweep — in AI-gate mode, marked DONE
+                # outright with no branch ever merged and no acceptance
+                # criteria ever verified. "human" never matches a real
+                # ticket id, so get_records_blocked_by (which resumes a
+                # ticket when its recorded blocker completes) can never
+                # spuriously fire on it either.
+                self._lifecycle.set_blocked_by(ticket_id, self._provider, "human")
             except (InvalidTransitionError, KeyError):
                 pass
 

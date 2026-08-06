@@ -4632,6 +4632,85 @@ class TestReconcileBlockedParents:
         assert lifecycle.get("238", "kanboard").state == TicketState.BLOCKED
 
     @pytest.mark.asyncio
+    async def test_sweep_does_not_auto_complete_a_manually_blocked_ticket(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Regression: a human dragging an ORDINARY (never-decomposed)
+        ticket to Blocked for an unrelated reason must never be treated
+        as a decompose parent, even if that ticket also carries a normal
+        Kanboard "is blocked by" link to some other ticket that happens
+        to be Done.
+
+        _on_status_changed's human-initiated BLOCKED branch used to
+        never call set_blocked_by, so such a ticket had BOTH no
+        recognized children AND no recorded blocker — satisfying the
+        exact same "no children + no blocked_by ⇒ must be a decompose
+        parent whose AC marker was lost" heuristic the link-fallback
+        sweep uses to recover genuinely affected parents. That heuristic
+        then wrongly matched this unrelated ticket, and the sweep would
+        complete it via the link fallback (Waiting for Human, or DONE
+        outright under an AI gate) despite no branch ever merged and no
+        acceptance criteria ever verified.
+        """
+        lifecycle.get_or_create("260", "kanboard")
+        # Simulate the human dragging the card to Blocked in Kanboard —
+        # the real trigger for _on_status_changed's BLOCKED branch,
+        # not a direct lifecycle.human_transition() call.
+        event = _make_event(
+            {
+                "ticket_id": "260",
+                "new_status": "blocked",
+                "old_status": "in_progress",
+                "provider": "kanboard",
+            }
+        )
+        await workflow._on_status_changed(event)
+        assert lifecycle.get("260", "kanboard").state == TicketState.BLOCKED
+
+        # This ticket separately carries an ordinary Kanboard "is
+        # blocked by" link to an unrelated ticket that happens to
+        # already be Done — a normal, expected use of Kanboard's own
+        # linking feature, unrelated to decomposition.
+        mock_kanban.get_task_links = AsyncMock(
+            return_value={
+                "depends_on": [
+                    {"task_id": "261", "title": "Unrelated", "column": "Done"},
+                ],
+                "blocks": [],
+                "relates_to": [],
+            }
+        )
+
+        await workflow._reconcile_blocked_parents()
+
+        # Must stay BLOCKED — never auto-completed.
+        assert lifecycle.get("260", "kanboard").state == TicketState.BLOCKED
+        mock_kanban.get_task_links.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_human_blocked_ticket_records_a_blocker(
+        self, workflow, lifecycle
+    ):
+        """The human-initiated BLOCKED transition now records a sentinel
+        blocked_by so downstream heuristics can distinguish it from a
+        decompose parent whose AC marker was lost."""
+        lifecycle.get_or_create("262", "kanboard")
+        event = _make_event(
+            {
+                "ticket_id": "262",
+                "new_status": "blocked",
+                "old_status": "in_progress",
+                "provider": "kanboard",
+            }
+        )
+
+        await workflow._on_status_changed(event)
+
+        rec = lifecycle.get("262", "kanboard")
+        assert rec.state == TicketState.BLOCKED
+        assert rec.blocked_by == "human"
+
+    @pytest.mark.asyncio
     async def test_start_immediately_catches_a_stuck_parent(
         self, workflow, lifecycle, mock_kanban
     ):
