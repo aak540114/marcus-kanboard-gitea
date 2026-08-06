@@ -3003,6 +3003,7 @@ def _verify_agent_has_commits(
             cwd=repo,
             capture_output=True,
             text=True,
+            timeout=30,
         )
         if git_check.returncode != 0:
             return None
@@ -3013,6 +3014,7 @@ def _verify_agent_has_commits(
             cwd=repo,
             capture_output=True,
             text=True,
+            timeout=30,
         )
         if not branch_check.stdout.strip():
             return None  # no worktree branch — skip check
@@ -3023,11 +3025,15 @@ def _verify_agent_has_commits(
             cwd=repo,
             capture_output=True,
             text=True,
+            timeout=30,
         )
         has_commits = bool(log_result.stdout.strip())
         return has_commits
 
     except Exception:
+        # Includes subprocess.TimeoutExpired — a stalled git process
+        # (locked .git/index.lock, slow disk, a hook waiting on stdin)
+        # must not hang the caller indefinitely; skip the check instead.
         return None  # git unavailable or unexpected error — skip check
 
 
@@ -3440,6 +3446,7 @@ async def _merge_agent_branch_to_main(
             cwd=repo,
             capture_output=True,
             text=True,
+            timeout=30,
         )
         if check.returncode != 0:
             return None
@@ -3455,6 +3462,7 @@ async def _merge_agent_branch_to_main(
             cwd=repo,
             capture_output=True,
             text=True,
+            timeout=30,
         )
         if not result.stdout.strip():
             # No worktree branch — agent worked on main directly
@@ -3473,6 +3481,7 @@ async def _merge_agent_branch_to_main(
             cwd=repo,
             check=True,
             capture_output=True,
+            timeout=30,
         )
 
         # Bug #651 — defensive working-tree cleanup before merge.
@@ -3510,6 +3519,7 @@ async def _merge_agent_branch_to_main(
                 cwd=repo,
                 check=True,
                 capture_output=True,
+                timeout=30,
             )
         except _sp.CalledProcessError as reset_err:
             # Rare — git reset failed.  Log and proceed to merge
@@ -3536,6 +3546,7 @@ async def _merge_agent_branch_to_main(
             cwd=repo,
             capture_output=True,
             text=True,
+            timeout=60,
         )
 
         if merge.returncode == 0:
@@ -3547,6 +3558,7 @@ async def _merge_agent_branch_to_main(
                 ["git", "merge", "--abort"],
                 cwd=repo,
                 capture_output=True,
+                timeout=30,
             )
             logger.warning(
                 f"[worktree] Merge conflict for {branch}: " f"{merge.stderr}"

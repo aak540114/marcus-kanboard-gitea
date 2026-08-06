@@ -160,6 +160,48 @@ class TestVerifyAgentHasCommits:
         cmd = second_call[0][0]
         assert "marcus/agent_unicorn_3" in cmd
 
+    def test_all_subprocess_calls_pass_a_timeout(self, tmp_path: Any) -> None:
+        """Regression: every git subprocess.run call here must pass
+        timeout=. This function runs synchronously on the shared event
+        loop (called directly from the async report_task_progress, not
+        via run_in_executor/asyncio.to_thread) — a stalled git process
+        (locked .git/index.lock, slow disk, a hook waiting on stdin)
+        would otherwise hang the entire server for every connected
+        agent indefinitely."""
+        branch = "marcus/agent_unicorn_3"
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                Mock(returncode=0, stdout=".git"),
+                Mock(returncode=0, stdout=branch),
+                Mock(returncode=0, stdout="abc1234 some work"),
+            ]
+            _verify_agent_has_commits(
+                agent_id="agent_unicorn_3",
+                project_root=str(tmp_path),
+            )
+
+        assert mock_run.call_count == 3
+        for call in mock_run.call_args_list:
+            assert "timeout" in call.kwargs, (
+                f"subprocess.run call missing timeout=: {call}"
+            )
+
+    def test_timeout_expired_returns_none_not_a_crash(self, tmp_path: Any) -> None:
+        """A stalled git process must degrade to None, not hang/crash."""
+        import subprocess as _sp
+
+        with patch(
+            "subprocess.run",
+            side_effect=_sp.TimeoutExpired(cmd=["git", "rev-parse"], timeout=30),
+        ):
+            result = _verify_agent_has_commits(
+                agent_id="agent_unicorn_3",
+                project_root=str(tmp_path),
+            )
+
+        assert result is None
+
     def test_uses_main_double_dot_syntax(self, tmp_path: Any) -> None:
         """Commit check uses main..branch to count only new commits."""
         branch = "marcus/agent_unicorn_3"

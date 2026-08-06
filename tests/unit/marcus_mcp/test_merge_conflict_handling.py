@@ -545,3 +545,91 @@ class TestMergeDefensiveReset:
             # (working tree was clean, so even without the reset the
             # merge had nothing blocking it).
             assert result == {"success": True}
+
+
+# ---------------------------------------------------------------------------
+# _merge_agent_branch_to_main — every git subprocess call must pass timeout=
+# ---------------------------------------------------------------------------
+
+
+class TestMergeSubprocessCallsHaveTimeouts:
+    """``_merge_agent_branch_to_main`` runs synchronously on the shared
+    event loop (called directly from the async ``report_task_progress``,
+    not via ``run_in_executor``/``asyncio.to_thread``) on every task
+    completion. A stalled git process (locked ``.git/index.lock``, slow
+    disk, a hook waiting on stdin) with no timeout would hang the entire
+    server for every connected agent indefinitely — undermining the
+    lease-extension machinery Marcus relies on to keep other agents'
+    assignments alive during this call.
+    """
+
+    @pytest.mark.asyncio
+    async def test_all_subprocess_calls_pass_a_timeout(self, tmp_path) -> None:
+        from unittest.mock import Mock, patch
+
+        from src.marcus_mcp.tools.task import _merge_agent_branch_to_main
+
+        # _merge_agent_branch_to_main checks repo.exists() before ever
+        # calling subprocess.run — needs a real directory, not a
+        # fabricated path, or the function returns None on 0 calls.
+        state = MagicMock()
+        state.kanban_client = MagicMock()
+        state.kanban_client._load_workspace_state = MagicMock(
+            return_value={"project_root": str(tmp_path)}
+        )
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                Mock(returncode=0, stdout=".git"),  # git rev-parse --git-dir
+                Mock(returncode=0, stdout="marcus/agent_X"),  # branch --list
+                Mock(returncode=0),  # checkout main
+                Mock(returncode=0),  # reset --hard HEAD
+                Mock(returncode=0, stdout="", stderr=""),  # merge
+            ]
+            await _merge_agent_branch_to_main(
+                agent_id="agent_X",
+                task_id="task_Y",
+                state=state,
+            )
+
+        assert mock_run.call_count == 5
+        for call in mock_run.call_args_list:
+            assert "timeout" in call.kwargs, (
+                f"subprocess.run call missing timeout=: {call}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_merge_abort_call_passes_a_timeout(self, tmp_path) -> None:
+        """The ``git merge --abort`` cleanup call on conflict also needs
+        a timeout — an abort can itself stall on a locked index."""
+        from unittest.mock import Mock, patch
+
+        from src.marcus_mcp.tools.task import _merge_agent_branch_to_main
+
+        state = MagicMock()
+        state.kanban_client = MagicMock()
+        state.kanban_client._load_workspace_state = MagicMock(
+            return_value={"project_root": str(tmp_path)}
+        )
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                Mock(returncode=0, stdout=".git"),  # git rev-parse --git-dir
+                Mock(returncode=0, stdout="marcus/agent_X"),  # branch --list
+                Mock(returncode=0),  # checkout main
+                Mock(returncode=0),  # reset --hard HEAD
+                Mock(returncode=1, stdout="", stderr="CONFLICT"),  # merge fails
+                Mock(returncode=0),  # merge --abort
+            ]
+            await _merge_agent_branch_to_main(
+                agent_id="agent_X",
+                task_id="task_Y",
+                state=state,
+            )
+
+        assert mock_run.call_count == 6
+        abort_call = mock_run.call_args_list[5]
+        assert abort_call.args[0][:2] == ["git", "merge"]
+        assert "timeout" in abort_call.kwargs, (
+            f"git merge --abort call missing timeout=: {abort_call}"
+        )
