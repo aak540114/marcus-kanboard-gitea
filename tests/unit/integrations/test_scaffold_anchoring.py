@@ -253,6 +253,123 @@ class TestScaffoldReturnsAnchorMapping:
         assert task_to_path == {"Implement Game Core Engine": "src/core/gameEngine.js"}
 
 
+class TestScaffoldPathTraversalRejected:
+    """``_generate_project_scaffold`` must not write outside ``project_root``.
+
+    ``fpath`` comes directly from LLM-generated JSON with no other
+    validation. A hallucinated (or prompt-injected) ``..`` traversal or
+    absolute path must be rejected rather than written — pathlib's ``/``
+    operator silently discards the left operand when the right side is
+    absolute, so ``project_root_path / "/etc/cron.d/evil"`` resolves to
+    ``/etc/cron.d/evil`` itself unless explicitly guarded against.
+    """
+
+    @pytest.mark.asyncio
+    async def test_dotdot_traversal_path_is_rejected(self, tmp_path) -> None:
+        """A ``..``-traversal path must not escape ``project_root``."""
+        tasks = [_make_task("Implement Game Core Engine")]
+        design_content = {
+            "Design X": {
+                "artifacts": [{"artifact_type": "architecture", "content": "doc"}]
+            }
+        }
+        outside_target = tmp_path.parent / "escaped_evil.json"
+        # Remove if a prior run left it behind (defensive; tmp_path is
+        # normally unique per test, but this file lives one level up).
+        if outside_target.exists():
+            outside_target.unlink()
+
+        llm_response = json.dumps(
+            [
+                {
+                    "path": "../escaped_evil.json",
+                    "content": "{}",
+                },
+                {"path": "package.json", "content": "{}"},
+            ]
+        )
+
+        # Patch the LLMAbstraction *class* at its defining module (matches
+        # the convention in test_contract_first_fallback.py::_make_creator)
+        # so construction never touches real AI provider config — CI has
+        # no config_marcus.json / CLAUDE_API_KEY, and LLMAbstraction()
+        # validates provider config in __init__.
+        with patch(
+            "src.ai.providers.llm_abstraction.LLMAbstraction"
+        ) as mock_llm_class:
+            mock_llm_class.return_value.analyze = AsyncMock(
+                return_value=llm_response
+            )
+            success, _ = await _generate_project_scaffold(
+                tasks=tasks,
+                project_description="x",
+                project_name="x",
+                project_root=str(tmp_path),
+                design_content=design_content,
+            )
+
+        try:
+            assert not outside_target.exists(), (
+                "scaffold writer escaped project_root via a '..' path"
+            )
+            # The legitimate config file still got written.
+            assert success is True
+            assert (tmp_path / "package.json").exists()
+        finally:
+            if outside_target.exists():
+                outside_target.unlink()
+
+    @pytest.mark.asyncio
+    async def test_absolute_path_is_rejected(self, tmp_path) -> None:
+        """An absolute path must not bypass ``project_root`` entirely.
+
+        ``Path("/a") / "/b"`` evaluates to ``Path("/b")`` — pathlib
+        honors the absolute right-hand operand and drops the left one.
+        Without an explicit containment check, an LLM-hallucinated
+        absolute path would be written verbatim to that location.
+        """
+        tasks = [_make_task("Implement Game Core Engine")]
+        design_content = {
+            "Design X": {
+                "artifacts": [{"artifact_type": "architecture", "content": "doc"}]
+            }
+        }
+        outside_target = tmp_path.parent / "absolute_evil.json"
+        if outside_target.exists():
+            outside_target.unlink()
+
+        llm_response = json.dumps(
+            [
+                {"path": str(outside_target), "content": "{}"},
+                {"path": "package.json", "content": "{}"},
+            ]
+        )
+
+        with patch(
+            "src.ai.providers.llm_abstraction.LLMAbstraction"
+        ) as mock_llm_class:
+            mock_llm_class.return_value.analyze = AsyncMock(
+                return_value=llm_response
+            )
+            success, _ = await _generate_project_scaffold(
+                tasks=tasks,
+                project_description="x",
+                project_name="x",
+                project_root=str(tmp_path),
+                design_content=design_content,
+            )
+
+        try:
+            assert not outside_target.exists(), (
+                "scaffold writer honored an absolute LLM-supplied path"
+            )
+            assert success is True
+            assert (tmp_path / "package.json").exists()
+        finally:
+            if outside_target.exists():
+                outside_target.unlink()
+
+
 class TestAgentInstructionsSurfaceScaffoldPath:
     """``build_tiered_instructions`` surfaces ``scaffold_path`` to the agent."""
 

@@ -4202,6 +4202,27 @@ async def _generate_project_scaffold(
             if not fpath or fcontent is None:
                 continue
 
+            # Reject paths that resolve outside project_root. fpath comes
+            # directly from LLM-generated JSON with no other validation —
+            # a hallucinated ".." traversal or an absolute path (which
+            # pathlib's `/` operator would otherwise honor by silently
+            # discarding project_root_path entirely) must not be allowed
+            # to write outside the scaffold directory. Mirrors the
+            # containment guard in
+            # src/marcus_mcp/tools/attachment.py::log_artifact.
+            candidate_path = project_root_path / fpath
+            try:
+                resolved_root = project_root_path.resolve()
+                resolved_candidate = candidate_path.resolve()
+                resolved_candidate.relative_to(resolved_root)
+            except ValueError:
+                logger.warning(
+                    "[scaffold] Rejected %s — resolves outside project root",
+                    fpath,
+                )
+                rejected += 1
+                continue
+
             # Check if this is a config/tooling file
             fname = Path(fpath).name
             is_config = (
@@ -4223,7 +4244,7 @@ async def _generate_project_scaffold(
                     rejected += 1
                     continue
 
-            full_path = project_root_path / fpath
+            full_path = resolved_candidate
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(fcontent, encoding="utf-8")
             written += 1
