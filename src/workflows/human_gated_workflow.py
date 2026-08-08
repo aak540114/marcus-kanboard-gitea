@@ -1350,7 +1350,26 @@ class HumanGatedWorkflow:
             # transition WFH → WFH, so it returned False forever.)
             # WAITING_FOR_HUMAN resumes to IN_PROGRESS with the claim
             # re-acquired — the AC edit is the human's review feedback.
+            #
+            # EXCEPT for a decompose parent: it reached WAITING_FOR_HUMAN
+            # via _check_parent_completion once all its children finished,
+            # not via an agent's own signal_ready_for_review — it has no
+            # branch and nothing an agent could implement in response to
+            # an AC edit here (a human touching its description while
+            # reviewing — even just re-saving it in Kanboard's editor —
+            # is enough to trigger this). Resuming it to IN_PROGRESS would
+            # wrongly bounce it out of the human's review queue and
+            # re-claim an agent slot for work that doesn't exist, undoing
+            # _check_parent_completion's parking for no reason a human
+            # asked for.
             if record.state == TicketState.WAITING_FOR_HUMAN:
+                if self._children_of(ticket_id):
+                    logger.info(
+                        "AC change detected on decompose parent %s while "
+                        "awaiting review — leaving it in Waiting for Human",
+                        ticket_id,
+                    )
+                    return
                 try:
                     self._lifecycle.transition(
                         ticket_id,
@@ -3376,6 +3395,15 @@ class HumanGatedWorkflow:
         self._park_in_waiting_for_human(
             parent_id, reason="All sub-tickets complete; awaiting human review"
         )
+        # A parent never merges its own branch, so it can't get a
+        # merge-conflict tag from ITS OWN work — but it can still carry a
+        # STALE one: a ticket that already failed a merge (tag set, sent
+        # back to Ready for the agent to rebase — see
+        # _park_in_ready_for_rebase) can be decomposed from there via
+        # "@marcus decompose" instead of being resubmitted, becoming a
+        # parent that still shows the old tag. Every other path into
+        # Waiting-for-Human already clears it; this one must too.
+        await self._clear_merge_conflict_flag(parent_id)
         # Check the result: move_task_to_column returns False (no exception)
         # when the board has no matching column or the task actually lives
         # in a different Kanboard project than expected — exactly how the

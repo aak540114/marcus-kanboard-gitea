@@ -711,6 +711,95 @@ class TestAcChangedMidWork:
         assert rec.state == TicketState.WAITING_FOR_HUMAN
 
 
+class TestAcChangedOnDecomposeParent:
+    """Regression: an AC/description edit on a decompose PARENT while it
+    sits in Waiting for Human (parked there by _check_parent_completion
+    once all its children finished) must NOT bounce it back to
+    IN_PROGRESS.
+
+    A decompose parent has no branch of its own — nothing an AI agent
+    could implement in response to an AC edit. The general
+    WAITING_FOR_HUMAN -> IN_PROGRESS resume-and-reclaim behavior exists
+    for a NORMAL ticket an agent is actively reviewing; applied to a
+    parent, it wrongly bounces it out of the human's review queue and
+    claims an agent slot for work that doesn't exist — exactly the
+    "should be in Waiting for Human but shows In Progress" symptom a
+    human sees on the board. A human merely opening/re-saving the
+    parent's description while reviewing (even without a substantive
+    edit) is enough to trigger this via the normal ticket.ac_changed
+    poll/webhook path.
+    """
+
+    def _child(self, lifecycle, tid, parent):
+        lifecycle.get_or_create(
+            tid, "kanboard",
+            acceptance_criteria=f"- [ ] x\n<!-- Sub-ticket of #{parent} -->",
+        )
+
+    @pytest.mark.asyncio
+    async def test_parent_stays_waiting_for_human_on_ac_edit(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        lifecycle.get_or_create("220", "kanboard")  # parent
+        lifecycle.human_transition("220", "kanboard", TicketState.BLOCKED)
+        self._child(lifecycle, "221", "220")
+        self._child(lifecycle, "222", "220")
+        for c in ("221", "222"):
+            lifecycle.transition(c, "kanboard", TicketState.READY)
+            lifecycle.transition(c, "kanboard", TicketState.IN_PROGRESS)
+            lifecycle.transition(c, "kanboard", TicketState.DONE)
+
+        # Parked in Waiting for Human — the real mechanism that gets a
+        # decompose parent there once all children are done.
+        await workflow._check_parent_completion("220")
+        assert lifecycle.get("220", "kanboard").state == TicketState.WAITING_FOR_HUMAN
+
+        mock_kanban.add_comment.reset_mock()
+        event = _make_event(
+            {
+                "ticket_id": "220",
+                "new_ac_text": "- [ ] a\n- [ ] b\n<!-- Sub-ticket of #220 -->",
+                "new_hash": "some-new-hash",
+                "provider": "kanboard",
+            }
+        )
+
+        await workflow._on_ac_changed(event)
+
+        rec = lifecycle.get("220", "kanboard")
+        assert rec.state == TicketState.WAITING_FOR_HUMAN
+        assert rec.ai_agent_id is None
+        # No misleading "I'll re-read and adjust" comment either — no
+        # agent is going to act on this.
+        mock_kanban.add_comment.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_normal_in_progress_ticket_unaffected(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Sanity check: a normal (non-parent) ticket's own AC-edit
+        resume behavior is untouched by this fix."""
+        lifecycle.get_or_create("223", "kanboard")
+        lifecycle.transition("223", "kanboard", TicketState.READY)
+        lifecycle.transition("223", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("223", "kanboard", TicketState.WAITING_FOR_HUMAN)
+
+        event = _make_event(
+            {
+                "ticket_id": "223",
+                "new_ac_text": "- [ ] revised",
+                "new_hash": "abc",
+                "provider": "kanboard",
+            }
+        )
+
+        await workflow._on_ac_changed(event)
+
+        rec = lifecycle.get("223", "kanboard")
+        assert rec.state == TicketState.IN_PROGRESS
+        mock_kanban.add_comment.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # Webhook/poll echo: WFH resume re-claims, no duplicate "Started"
 # ---------------------------------------------------------------------------
@@ -4409,6 +4498,28 @@ class TestParentAutoComplete:
         assert rec.state == TicketState.WAITING_FOR_HUMAN
         assert rec.ai_agent_id is None
         mock_kanban.move_task_to_column.assert_any_call("200", "waiting for human")
+
+    @pytest.mark.asyncio
+    async def test_stale_merge_conflict_tag_cleared_on_parent_completion(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Regression: a parent that carries a STALE merge-conflict tag
+        (from before it was decomposed — a ticket that failed a merge,
+        got sent back to Ready to rebase, and was decomposed from there
+        via "@marcus decompose" instead of being resubmitted) must have
+        that tag cleared once it reaches Waiting for Human, same as every
+        other path into that column."""
+        lifecycle.get_or_create("206", "kanboard")  # parent
+        lifecycle.human_transition("206", "kanboard", TicketState.BLOCKED)
+        self._child(lifecycle, "207", "206")
+        lifecycle.transition("207", "kanboard", TicketState.READY)
+        lifecycle.transition("207", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("207", "kanboard", TicketState.DONE)
+
+        await workflow._maybe_complete_parent("207")
+
+        assert lifecycle.get("206", "kanboard").state == TicketState.WAITING_FOR_HUMAN
+        mock_kanban.set_merge_conflict_flag.assert_any_await("206", present=False)
 
     @pytest.mark.asyncio
     async def test_ai_gate_parent_completes_directly_without_human_review(
