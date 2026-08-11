@@ -42,11 +42,48 @@ live in ``cost_aggregator.py``; this file only handles inserts and schema.
 
 from __future__ import annotations
 
+import functools
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TypeVar
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def _synchronized(method: _F) -> _F:
+    """Serialize a CostStore method's ENTIRE body under ``self._lock``.
+
+    CostStore opens ONE sqlite3.Connection with ``check_same_thread=False``
+    so a background ingest thread (CostRecorder's ThreadPoolExecutor) and
+    the main event-loop thread (several MCP tool handlers call CostStore
+    methods directly and synchronously — e.g. src/marcus_mcp/tools/nlp.py,
+    src/marcus_mcp/tools/experiments.py) can both use it. That flag only
+    lifts sqlite3's own same-thread assertion; it does NOT make the
+    connection safe for interleaved statement execution from multiple
+    threads. Locking only individual ``self.conn.execute()``/``commit()``
+    calls (rather than a whole method) is not sufficient either — a
+    method's own execute()-then-commit() sequence must run as one atomic
+    unit relative to other threads, or another thread's execute() can
+    interleave between them and hit SQLite's "cannot start a transaction
+    within a transaction" / "cannot commit - no transaction is active"
+    errors. Empirically reproduced: 5 threads doing 200 unsynchronized
+    execute()+commit() calls each on one connection produced 40 such
+    errors and silently lost 20 of 1000 rows (rowcount 980).
+
+    Uses ``threading.RLock`` (re-entrant), not a plain ``Lock`` —
+    ``close_latest_open_run_for_project`` calls ``self.close_run(...)``
+    internally, so a single, non-reentrant lock would self-deadlock.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self: "CostStore", *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper  # type: ignore[return-value]
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -649,13 +686,20 @@ class CostStore:
     Notes
     -----
     The connection is opened with ``check_same_thread=False`` so background
-    ingesters can write from a different thread than queries. Callers are
-    responsible for serializing writes if multi-threaded access is needed;
-    SQLite's WAL mode gives concurrent readers + one writer for free.
+    ingesters can write from a different thread than queries. Every public
+    method is wrapped with ``@_synchronized``, which serializes it under
+    ``self._lock`` — a plain ``check_same_thread=False`` connection is NOT
+    safe for concurrent statement execution from multiple threads on its
+    own; see ``_synchronized``'s docstring for the empirically-reproduced
+    failure mode this closes. SQLite's WAL mode still gives concurrent
+    readers a separate benefit (not blocking on this Python-level lock at
+    the OS/file level), but the lock is what prevents this ONE Python
+    connection object's own state from being corrupted by concurrent use.
     """
 
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
+        self._lock = threading.RLock()
         if str(db_path) != ":memory:":
             db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(db_path), check_same_thread=False)
@@ -916,6 +960,7 @@ class CostStore:
 
     # -- writes ------------------------------------------------------------
 
+    @_synchronized
     def record_event(self, event: TokenEvent) -> int:
         """Insert one ``token_events`` row.
 
@@ -985,6 +1030,7 @@ class CostStore:
             raise RuntimeError("sqlite3 did not return lastrowid")
         return event_id
 
+    @_synchronized
     def update_attribution(
         self,
         request_id: str,
@@ -1035,6 +1081,7 @@ class CostStore:
         self.conn.commit()
         return cur.rowcount
 
+    @_synchronized
     def record_run(self, run: Run) -> None:
         """Upsert one ``runs`` row keyed by ``run_id``.
 
@@ -1089,6 +1136,7 @@ class CostStore:
         )
         self.conn.commit()
 
+    @_synchronized
     def persist_phase0_run_signals(
         self,
         run_id: str,
@@ -1192,6 +1240,7 @@ class CostStore:
         self.conn.commit()
         return cur.rowcount > 0
 
+    @_synchronized
     def close_run(
         self,
         run_id: str,
@@ -1333,6 +1382,7 @@ class CostStore:
             (run_id,),
         )
 
+    @_synchronized
     def close_latest_open_run_for_project(
         self,
         project_id: str,
@@ -1396,6 +1446,7 @@ class CostStore:
         )
         return run_id if closed else None
 
+    @_synchronized
     def record_price(self, price: ModelPrice) -> None:
         """Insert one ``model_prices`` row.
 
@@ -1426,6 +1477,7 @@ class CostStore:
         )
         self.conn.commit()
 
+    @_synchronized
     def upsert_project_name(self, project_id: str, name: str) -> None:
         """Snapshot a project's human-readable name into cost storage.
 
@@ -1452,6 +1504,7 @@ class CostStore:
         )
         self.conn.commit()
 
+    @_synchronized
     def get_project_name(self, project_id: str) -> Optional[str]:
         """Return the snapshotted name for ``project_id``, or None."""
         row = self.conn.execute(
@@ -1460,6 +1513,7 @@ class CostStore:
         ).fetchone()
         return row[0] if row else None
 
+    @_synchronized
     def record_task_name(self, task_id: str, name: str) -> None:
         """Snapshot a kanban task's name into cost storage (Marcus #530).
 
@@ -1488,6 +1542,7 @@ class CostStore:
         )
         self.conn.commit()
 
+    @_synchronized
     def get_task_name(self, task_id: str) -> Optional[str]:
         """Return the snapshotted name for ``task_id``, or None."""
         row = self.conn.execute(
@@ -1496,6 +1551,7 @@ class CostStore:
         ).fetchone()
         return row[0] if row else None
 
+    @_synchronized
     def rebind_project_id(self, *, from_id: str, to_id: str) -> int:
         """Re-attribute every token_events row from one project to another.
 
@@ -1525,6 +1581,7 @@ class CostStore:
         self.conn.commit()
         return cur.rowcount or 0
 
+    @_synchronized
     def set_project_budget(
         self,
         project_id: str,
@@ -1571,6 +1628,7 @@ class CostStore:
             )
         self.conn.commit()
 
+    @_synchronized
     def get_project_budget(self, project_id: str) -> Optional[Dict[str, Any]]:
         """Return the budget row for a project, or None if no cap is set.
 
@@ -1590,6 +1648,7 @@ class CostStore:
             return None
         return {"budget_usd": row[0], "set_at": row[1], "note": row[2]}
 
+    @_synchronized
     def load_seed_prices(self, prices: Optional[List[ModelPrice]] = None) -> None:
         """Insert default pricing rows if not already present.
 
@@ -1630,6 +1689,7 @@ class CostStore:
 
     # -- lifecycle ---------------------------------------------------------
 
+    @_synchronized
     def close(self) -> None:
         """Close the underlying SQLite connection."""
         self.conn.close()

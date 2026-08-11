@@ -578,6 +578,45 @@ class TestBoolToIntHelper:
             _b(0)  # type: ignore[arg-type]
 
 
+class TestConcurrentAccessSafety:
+    """CostStore opens ONE sqlite3.Connection with check_same_thread=False
+    so a background ingest thread (CostRecorder's ThreadPoolExecutor) and
+    callers on the main event-loop thread (several MCP tool handlers call
+    CostStore methods directly and synchronously) can both use it — but
+    that flag alone does not make concurrent statement execution safe.
+    Without every method serialized under one lock, concurrent threads
+    racing on the shared connection can interleave mid execute()-then-
+    commit() sequences and hit SQLite's "cannot start/commit a
+    transaction" errors, silently losing rows.
+    """
+
+    def test_concurrent_record_event_from_multiple_threads_loses_no_rows(
+        self, store: CostStore, base_event: TokenEvent
+    ) -> None:
+        import threading
+
+        errors: list[BaseException] = []
+        n_threads = 6
+        calls_per_thread = 50
+
+        def worker() -> None:
+            for _ in range(calls_per_thread):
+                try:
+                    store.record_event(base_event)
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == [], f"{len(errors)} exception(s) during concurrent writes: {errors[:3]}"
+        count = store.conn.execute("SELECT COUNT(*) FROM token_events").fetchone()[0]
+        assert count == n_threads * calls_per_thread
+
+
 class TestRecordEvent:
     """token_events insert behavior."""
 

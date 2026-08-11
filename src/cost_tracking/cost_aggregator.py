@@ -8,8 +8,12 @@ like the documented API responses, so the dashboard can pass them
 through with minimal transformation.
 
 All methods are synchronous (sqlite3 is sync). The aggregator is safe to
-share across threads because it relies on the underlying connection's
-WAL mode for concurrent readers.
+share across threads because its query helpers (``_rows``/``_row``) take
+the backing ``CostStore``'s own lock before touching the shared
+connection — WAL mode governs cross-connection/file-level locking, not
+this single Python ``sqlite3.Connection`` object's thread-safety for
+interleaved statement execution, so it alone would not have been
+sufficient.
 """
 
 from __future__ import annotations
@@ -38,15 +42,26 @@ class CostAggregator:
     # -- helpers -----------------------------------------------------------
 
     def _rows(self, sql: str, params: tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
-        """Run a query and return rows as plain dicts."""
-        cur = self.store.conn.execute(sql, params)
-        return [dict(row) for row in cur.fetchall()]
+        """Run a query and return rows as plain dicts.
+
+        Locked via the store's own ``_lock`` — the "safe because of WAL
+        mode" reasoning this class's docstring used to give was confused:
+        WAL governs cross-connection/file-level locking, not this single
+        Python ``sqlite3.Connection`` object's thread-safety for
+        interleaved statement execution (see CostStore's ``_synchronized``
+        decorator, which every write path is wrapped in for the same
+        reason).
+        """
+        with self.store._lock:
+            cur = self.store.conn.execute(sql, params)
+            return [dict(row) for row in cur.fetchall()]
 
     def _row(self, sql: str, params: tuple[Any, ...] = ()) -> Optional[Dict[str, Any]]:
-        """Run a query that returns at most one row."""
-        cur = self.store.conn.execute(sql, params)
-        r = cur.fetchone()
-        return dict(r) if r is not None else None
+        """Run a query that returns at most one row. See ``_rows`` re: locking."""
+        with self.store._lock:
+            cur = self.store.conn.execute(sql, params)
+            r = cur.fetchone()
+            return dict(r) if r is not None else None
 
     # -- public queries ---------------------------------------------------
 
