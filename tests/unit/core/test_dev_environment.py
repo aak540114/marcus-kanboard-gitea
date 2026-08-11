@@ -2,6 +2,7 @@
 Unit tests for src/core/dev_environment.py
 """
 
+import asyncio
 import socket
 import subprocess
 from pathlib import Path
@@ -720,6 +721,123 @@ class TestMaxParallelContainers:
             await mgr.start("T-25", "kanboard", "b1")
             await mgr.start("T-26", "kanboard", "b2")
         assert len(mgr.list_running()) == 2
+
+
+class TestStartConcurrencySafety:
+    """start() used to check-then-register with no lock: two concurrent
+    calls for the SAME ticket could both call _start_local/_start_docker
+    with the identical deterministic container_name (whichever finished
+    last silently destroyed the other's live container), and two
+    concurrent calls for DIFFERENT tickets could both pass the
+    max-parallel-containers check before either registered, exceeding the
+    configured limit."""
+
+    @pytest.fixture
+    def manager(self, tmp_path):
+        config = DevEnvironmentConfig(
+            repo_path=str(tmp_path),
+            use_docker=False,
+            dev_command="echo dev-server --port {port}",
+            port_range=(19900, 19950),
+        )
+        return DevEnvironmentManager(
+            config=config, settings_manager=DevEnvSettingsManager(data_dir=tmp_path)
+        )
+
+    @pytest.mark.asyncio
+    async def test_concurrent_starts_same_ticket_do_not_double_start(self, manager):
+        """The second concurrent call for the SAME ticket must wait for
+        the first to finish and return its result, never calling
+        _start_local a second time."""
+        call_count = {"n": 0}
+        release = asyncio.Event()
+        entered = asyncio.Event()
+        real_start_local = manager._start_local
+
+        async def slow_start_local(*args, **kwargs):
+            call_count["n"] += 1
+            entered.set()
+            await release.wait()
+            return await real_start_local(*args, **kwargs)
+
+        mock_popen = MagicMock(spec=subprocess.Popen)
+        mock_popen.poll.return_value = None
+
+        with patch.object(manager, "_start_local", side_effect=slow_start_local), \
+                patch("subprocess.Popen", return_value=mock_popen):
+            task_a = asyncio.create_task(manager.start("T-SAME", "kanboard", "b1"))
+            await entered.wait()
+            task_b = asyncio.create_task(manager.start("T-SAME", "kanboard", "b1"))
+            await asyncio.sleep(0)
+            release.set()
+            info_a, info_b = await asyncio.gather(task_a, task_b)
+
+        assert call_count["n"] == 1
+        assert info_a is info_b
+
+    @pytest.mark.asyncio
+    async def test_concurrent_starts_different_tickets_never_exceed_limit(
+        self, tmp_path
+    ):
+        """Two concurrent calls for DIFFERENT tickets racing a limit of 1
+        must not both succeed — one must be refused."""
+        settings = DevEnvSettingsManager(data_dir=tmp_path)
+        settings.set_max_parallel_containers(1)
+        config = DevEnvironmentConfig(
+            repo_path=str(tmp_path),
+            use_docker=False,
+            dev_command="echo dev-server --port {port}",
+            port_range=(19950, 20000),
+        )
+        limited_manager = DevEnvironmentManager(config=config, settings_manager=settings)
+
+        release = asyncio.Event()
+        entered = asyncio.Event()
+        real_start_local = limited_manager._start_local
+
+        async def slow_start_local(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return await real_start_local(*args, **kwargs)
+
+        mock_popen = MagicMock(spec=subprocess.Popen)
+        mock_popen.poll.return_value = None
+
+        with patch.object(
+            limited_manager, "_start_local", side_effect=slow_start_local
+        ), patch("subprocess.Popen", return_value=mock_popen):
+            task_a = asyncio.create_task(
+                limited_manager.start("T-DIFF-A", "kanboard", "b1")
+            )
+            await entered.wait()  # A has reserved its slot, is mid-startup
+            task_b = asyncio.create_task(
+                limited_manager.start("T-DIFF-B", "kanboard", "b2")
+            )
+            await asyncio.sleep(0)
+            release.set()
+            results = await asyncio.gather(task_a, task_b, return_exceptions=True)
+
+        successes = [r for r in results if not isinstance(r, Exception)]
+        failures = [r for r in results if isinstance(r, Exception)]
+        assert len(successes) == 1
+        assert len(failures) == 1
+        assert isinstance(failures[0], RuntimeError)
+
+    @pytest.mark.asyncio
+    async def test_container_names_do_not_collide_across_case_variants(self, manager):
+        """ticket_ids differing only by case must not compute the same
+        container_name — the registry key is case-sensitive but the old
+        container-name derivation lower-cased it, letting two distinct
+        tickets collide on one Docker container (reachable without auth
+        via the /dev-env/view route, which only regex-validates
+        characters, not board membership)."""
+        mock_popen = MagicMock(spec=subprocess.Popen)
+        mock_popen.poll.return_value = None
+        with patch("subprocess.Popen", return_value=mock_popen):
+            info_upper = await manager.start("ABC", "kanboard", "b1")
+            info_lower = await manager.start("abc", "kanboard", "b2")
+
+        assert info_upper.container_name != info_lower.container_name
 
 
 # ---------------------------------------------------------------------------

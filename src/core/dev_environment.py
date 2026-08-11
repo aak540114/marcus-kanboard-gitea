@@ -40,6 +40,7 @@ DevEnvironmentManager
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -513,10 +514,25 @@ class DevEnvironmentManager:
         # linger in 'exited' state long enough to read). Shown on the
         # "Preview could not start" page so the human can see WHY it exited.
         self._exit_logs: Dict[str, str] = {}
+        # Per-key locks serializing concurrent start() calls for the SAME
+        # ticket, and a small lock guarding the max-parallel-containers
+        # check-and-reserve step across ALL tickets — see start()'s
+        # docstring note on the race these close.
+        self._start_locks: Dict[str, asyncio.Lock] = {}
+        self._reservation_lock = asyncio.Lock()
+        self._reserved: Set[str] = set()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def _lock_for(self, key: str) -> asyncio.Lock:
+        """Return (creating on first use) the asyncio.Lock for *key*."""
+        lock = self._start_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._start_locks[key] = lock
+        return lock
 
     async def start(
         self,
@@ -558,40 +574,88 @@ class DevEnvironmentManager:
         RuntimeError
             If the configured max-parallel-containers limit has been
             reached and no environment is already running for this ticket.
+
+        Notes
+        -----
+        Concurrency: this method used to check-then-register with no lock,
+        which two real callers can race on — the `/dev-env/view` route is
+        unauthenticated-by-default and reachable by a double-click/browser
+        retry, and two agents' first `get_work_context` call can land
+        near-simultaneously for different tickets. Two consequences of the
+        old race, both closed here:
+
+        1. Two concurrent calls for the SAME ticket could both pass the
+           `key in self._envs` check and both call `_start_docker` with the
+           identical, deterministic `container_name` — whichever call's
+           startup ``_force_remove`` ran after the other's ``docker run``
+           had already succeeded silently destroyed the other's
+           already-registered, live container, leaking its allocated port.
+        2. Two concurrent calls for DIFFERENT tickets could both read
+           ``len(self._envs) < limit`` as true before either registered,
+           both proceeding and exceeding the configured
+           "Max dev environments" limit.
+
+        A per-key ``asyncio.Lock`` (case (1)) and a shared
+        ``_reservation_lock`` guarding a *reserved* set consulted by the
+        limit check (case (2)) close both — the reservation is held for
+        the full duration of the (slow) container start so the limit check
+        stays correct, while different tickets' container starts still run
+        concurrently once past their own reservation.
         """
         key = f"{provider}:{ticket_id}"
-        if key in self._envs:
-            logger.info(
-                "Dev env for %s already running on port %d", key, self._envs[key].port
-            )
-            return self._envs[key]
+        async with self._lock_for(key):
+            if key in self._envs:
+                logger.info(
+                    "Dev env for %s already running on port %d",
+                    key,
+                    self._envs[key].port,
+                )
+                return self._envs[key]
 
-        limit = self._settings.get_max_parallel_containers()
-        if limit is not None and len(self._envs) >= limit:
-            raise RuntimeError(
-                f"Max parallel dev environments ({limit}) reached — stop an "
-                "existing one before starting a new one."
-            )
+            async with self._reservation_lock:
+                limit = self._settings.get_max_parallel_containers()
+                active = len(self._envs) + len(self._reserved)
+                if limit is not None and active >= limit:
+                    raise RuntimeError(
+                        f"Max parallel dev environments ({limit}) reached — "
+                        "stop an existing one before starting a new one."
+                    )
+                self._reserved.add(key)
 
-        port = self._allocator.allocate()
-        container_name = f"marcus-dev-{provider}-{ticket_id.lower().replace('/', '-')}"
-        url = f"http://{self.config.host}:{port}"
-        effective_repo_path = repo_path or self.config.repo_path
+            try:
+                port = self._allocator.allocate()
+                # Container names must be INJECTIVE relative to `key` — the
+                # lowercase+dash-folding below is lossy (e.g. ticket_ids
+                # "ABC" and "abc", or "A/1" and "A-1", collapse to the same
+                # string), so a short hash of the full raw key is appended
+                # to guarantee two distinct tickets can never compute the
+                # same container_name and silently collide/overwrite each
+                # other's container. The `/dev-env/view` route only
+                # regex-validates characters, not board membership, so a
+                # collision here would otherwise be reachable without
+                # authentication.
+                slug = f"{provider}-{ticket_id.lower().replace('/', '-')}"
+                key_hash = hashlib.sha256(key.encode()).hexdigest()[:8]
+                container_name = f"marcus-dev-{slug}-{key_hash}"
+                url = f"http://{self.config.host}:{port}"
+                effective_repo_path = repo_path or self.config.repo_path
 
-        if self.config.use_docker:
-            info = await self._start_docker(
-                ticket_id, provider, branch_name, port, container_name, url,
-                project_stack=project_stack, repo_path=effective_repo_path,
-            )
-        else:
-            info = await self._start_local(
-                ticket_id, provider, branch_name, port, container_name, url,
-                repo_path=effective_repo_path,
-            )
+                if self.config.use_docker:
+                    info = await self._start_docker(
+                        ticket_id, provider, branch_name, port, container_name, url,
+                        project_stack=project_stack, repo_path=effective_repo_path,
+                    )
+                else:
+                    info = await self._start_local(
+                        ticket_id, provider, branch_name, port, container_name, url,
+                        repo_path=effective_repo_path,
+                    )
 
-        self._envs[key] = info
-        logger.info("Dev env started for %s at %s", key, url)
-        return info
+                self._envs[key] = info
+                logger.info("Dev env started for %s at %s", key, url)
+                return info
+            finally:
+                self._reserved.discard(key)
 
     async def stop(self, ticket_id: str, provider: str) -> bool:
         """Stop the dev environment for a ticket.
