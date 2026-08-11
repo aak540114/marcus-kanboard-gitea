@@ -36,6 +36,7 @@ Mapping file format (``project_repos.json``)
     }
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -90,6 +91,15 @@ class ProjectSyncWorkflow:
         self._webhook_target_url = webhook_target_url
         self._webhook_secret = webhook_secret
         self._mapping: Dict[str, Dict[str, Any]] = self._load_mapping()
+        # Serializes ensure_repo end-to-end — see that method's docstring
+        # for the races this closes (duplicate repo creation for the same
+        # project, and cross-project slug-collision disambiguation racing
+        # two projects' first-time provisioning). Repo provisioning is a
+        # rare, one-time-per-project event, not a hot path, so full
+        # serialization across projects is an acceptable trade for
+        # correctness here — matches BranchManager's equivalent
+        # per-instance lock fully serializing its own git operations.
+        self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Event wiring
@@ -147,88 +157,119 @@ class ProjectSyncWorkflow:
         -------
         Optional[Dict[str, Any]]
             The project's repo mapping, or None if repo creation failed.
+
+        Notes
+        -----
+        The whole method runs under ``self._lock``, serializing all calls
+        on this instance. Two real races this closes:
+
+        1. Two concurrent first-time calls for the SAME project (e.g. two
+           agents' first ``get_work_context`` landing near-simultaneously)
+           could both see ``key not in self._mapping``, both call
+           ``create_repo``/``init_with_readme`` — either producing two
+           competing writes (one caller's ``raise_for_status()`` surfacing
+           a spurious failure for a repo that really was created), or, if
+           the second caller's create lands after the first's, both
+           running ``git init``/``add``/``commit``/``push`` concurrently
+           against the SAME ``local_path`` working directory.
+        2. Two concurrent first-time calls for DIFFERENT projects whose
+           names slugify to the same string (e.g. "My App" and "my-app!")
+           both read ``self._mapping`` for ``taken_slugs`` before either
+           had written its entry, so both compute the identical
+           un-disambiguated slug and can end up cross-wired onto one
+           Gitea repo and one local clone — exactly what the
+           ``taken_slugs`` check below exists to prevent, but which is
+           itself racy without this lock.
+
+        Repo provisioning is a rare, one-time-per-project event, not a
+        hot path, so serializing across DIFFERENT projects too (not just
+        same-project calls) is an acceptable trade for closing both races
+        with one simple lock.
         """
-        key = f"kanboard:{project_id}"
-        if key in self._mapping:
-            cached = self._mapping[key]
-            if not cached.get("webhook_created"):
-                # The repo may have been provisioned before
-                # GITEA_WEBHOOK_TOKEN was set (or before Marcus was
-                # restarted with it), or a prior attempt may have failed —
-                # retry on every lookup until it's confirmed, rather than
-                # leaving this project permanently without a webhook.
-                # Prefer the stored slug: for disambiguated or empty-name
-                # repos, re-slugifying the project name yields the WRONG
-                # repo. Fall back to name-derived for pre-repo_slug files.
-                slug = cached.get("repo_slug") or _slugify(
-                    cached.get("kanboard_project_name") or project_name
+        async with self._lock:
+            key = f"kanboard:{project_id}"
+            if key in self._mapping:
+                cached = self._mapping[key]
+                if not cached.get("webhook_created"):
+                    # The repo may have been provisioned before
+                    # GITEA_WEBHOOK_TOKEN was set (or before Marcus was
+                    # restarted with it), or a prior attempt may have failed —
+                    # retry on every lookup until it's confirmed, rather than
+                    # leaving this project permanently without a webhook.
+                    # Prefer the stored slug: for disambiguated or empty-name
+                    # repos, re-slugifying the project name yields the WRONG
+                    # repo. Fall back to name-derived for pre-repo_slug files.
+                    slug = cached.get("repo_slug") or _slugify(
+                        cached.get("kanboard_project_name") or project_name
+                    )
+                    cached["webhook_created"] = await self._ensure_webhook(slug)
+                    self._save_mapping()
+                logger.debug(
+                    "Project %d already mapped — skipping repo creation", project_id
                 )
-                cached["webhook_created"] = await self._ensure_webhook(slug)
-                self._save_mapping()
-            logger.debug("Project %d already mapped — skipping repo creation", project_id)
-            return dict(cached)
+                return dict(cached)
 
-        slug = _slugify(project_name)
-        # Disambiguate before creating: create_repo() treats "repo already
-        # exists" as "already provisioned" and returns the existing repo's
-        # URL, so a slug collision with a DIFFERENT project ("My App" vs
-        # "my app!") would silently cross-wire both projects into one repo
-        # and one local clone — both projects' ticket branches merging
-        # into one main, with no error anywhere. An all-symbol name
-        # slugifies to "" and would permanently fail provisioning instead.
-        taken_slugs = {
-            os.path.basename(m.get("local_repo_path", ""))
-            for k, m in self._mapping.items()
-            if k != key
-        }
-        if not slug:
-            slug = f"project-{project_id}"
-        elif slug in taken_slugs:
-            logger.warning(
-                "Project %d (%r) slugifies to %r, already used by another "
-                "project — disambiguating to %r",
+            slug = _slugify(project_name)
+            # Disambiguate before creating: create_repo() treats "repo already
+            # exists" as "already provisioned" and returns the existing repo's
+            # URL, so a slug collision with a DIFFERENT project ("My App" vs
+            # "my app!") would silently cross-wire both projects into one repo
+            # and one local clone — both projects' ticket branches merging
+            # into one main, with no error anywhere. An all-symbol name
+            # slugifies to "" and would permanently fail provisioning instead.
+            taken_slugs = {
+                os.path.basename(m.get("local_repo_path", ""))
+                for k, m in self._mapping.items()
+                if k != key
+            }
+            if not slug:
+                slug = f"project-{project_id}"
+            elif slug in taken_slugs:
+                logger.warning(
+                    "Project %d (%r) slugifies to %r, already used by another "
+                    "project — disambiguating to %r",
+                    project_id,
+                    project_name,
+                    slug,
+                    f"{slug}-p{project_id}",
+                )
+                slug = f"{slug}-p{project_id}"
+            local_path = os.path.join(self._local_repos_base, slug)
+
+            try:
+                # Pass the (possibly disambiguated) slug, not the raw name —
+                # create_repo slugifies its argument, and _slugify is
+                # idempotent on an already-slugified string.
+                clone_url = await self._gitea.create_repo(slug, description)
+                await self._gitea.init_with_readme(clone_url, local_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Failed to create Gitea repo for project %d (%s): %s",
+                    project_id,
+                    project_name,
+                    exc,
+                )
+                return None
+
+            webhook_created = await self._ensure_webhook(slug)
+
+            self._mapping[key] = {
+                "kanboard_project_id": project_id,
+                "kanboard_project_name": project_name,
+                "repo_slug": slug,
+                "gitea_repo_url": clone_url,
+                "local_repo_path": local_path,
+                "webhook_created": webhook_created,
+            }
+            self._save_mapping()
+            logger.info(
+                "Project %d (%s) → Gitea %s (local: %s)",
                 project_id,
                 project_name,
-                slug,
-                f"{slug}-p{project_id}",
+                clone_url,
+                local_path,
             )
-            slug = f"{slug}-p{project_id}"
-        local_path = os.path.join(self._local_repos_base, slug)
-
-        try:
-            # Pass the (possibly disambiguated) slug, not the raw name —
-            # create_repo slugifies its argument, and _slugify is
-            # idempotent on an already-slugified string.
-            clone_url = await self._gitea.create_repo(slug, description)
-            await self._gitea.init_with_readme(clone_url, local_path)
-        except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "Failed to create Gitea repo for project %d (%s): %s",
-                project_id,
-                project_name,
-                exc,
-            )
-            return None
-
-        webhook_created = await self._ensure_webhook(slug)
-
-        self._mapping[key] = {
-            "kanboard_project_id": project_id,
-            "kanboard_project_name": project_name,
-            "repo_slug": slug,
-            "gitea_repo_url": clone_url,
-            "local_repo_path": local_path,
-            "webhook_created": webhook_created,
-        }
-        self._save_mapping()
-        logger.info(
-            "Project %d (%s) → Gitea %s (local: %s)",
-            project_id,
-            project_name,
-            clone_url,
-            local_path,
-        )
-        return dict(self._mapping[key])
+            return dict(self._mapping[key])
 
     async def _ensure_webhook(self, slug: str) -> bool:
         """Create the push webhook for a repo, if configured.
@@ -355,10 +396,32 @@ class ProjectSyncWorkflow:
             return {}
 
     def _save_mapping(self) -> None:
-        """Persist the project-repo mapping to disk."""
+        """Persist the project-repo mapping to disk.
+
+        Writes to a temp file and ``os.replace``s it into place (matching
+        ``TicketLifecycleManager._save``'s pattern) rather than writing
+        ``self._repos_path`` directly. A direct write left a truncated,
+        invalid file behind if the process was killed mid-write (OOM-kill,
+        a container restart under time pressure, disk-full raising inside
+        ``json.dump``) — ``_load_mapping`` would then silently discard the
+        ENTIRE mapping history to ``{}`` on the next load (caught by its
+        broad except, logged only as a warning), including every prior
+        slug-disambiguation decision. ``os.replace`` is atomic on both
+        POSIX and Windows, so a reader never observes a partially-written
+        file.
+        """
         os.makedirs(os.path.dirname(self._repos_path) or ".", exist_ok=True)
+        tmp_path = f"{self._repos_path}.tmp"
         try:
-            with open(self._repos_path, "w") as f:
+            with open(tmp_path, "w") as f:
                 json.dump(self._mapping, f, indent=2)
+            os.replace(tmp_path, self._repos_path)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not save project repos mapping: %s", exc)
+            # Clean up the (possibly partially-written) temp file so a
+            # failed save doesn't leave garbage behind or get confused
+            # for a real save on a future run.
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass

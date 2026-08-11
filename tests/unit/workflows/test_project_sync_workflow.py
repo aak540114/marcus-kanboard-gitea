@@ -7,7 +7,9 @@ collaborators (GiteaManager, Events, disk I/O) are mocked or redirected to
 tmp_path.
 """
 
+import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -447,3 +449,109 @@ class TestLoadMapping:
             local_repos_base=str(tmp_path / "repos"),
         )
         assert wf.all_mappings() == {}
+
+
+class TestEnsureRepoConcurrencySafety:
+    """ensure_repo() used to check-then-provision with no lock, letting
+    two concurrent calls race — see ensure_repo's own docstring for the
+    two failure modes closed by self._lock."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_calls_same_project_create_only_one_repo(
+        self, workflow, gitea_mgr
+    ):
+        """Two concurrent first-time calls for the SAME project must not
+        both call create_repo — the second must wait for the first
+        (serialized by self._lock) and then hit the now-populated cache."""
+        release = asyncio.Event()
+        entered = asyncio.Event()
+        real_create_repo = gitea_mgr.create_repo
+
+        async def slow_create_repo(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return await real_create_repo(*args, **kwargs)
+
+        gitea_mgr.create_repo = AsyncMock(side_effect=slow_create_repo)
+        gitea_mgr.create_webhook = AsyncMock(return_value=True)
+
+        task_a = asyncio.create_task(workflow.ensure_repo(1, "My App"))
+        await entered.wait()
+        task_b = asyncio.create_task(workflow.ensure_repo(1, "My App"))
+        await asyncio.sleep(0)
+        release.set()
+
+        result_a, result_b = await asyncio.gather(task_a, task_b)
+
+        assert gitea_mgr.create_repo.call_count == 1
+        assert result_a == result_b
+
+    @pytest.mark.asyncio
+    async def test_concurrent_calls_colliding_projects_still_disambiguate(
+        self, workflow, gitea_mgr
+    ):
+        """Two concurrent first-time calls for DIFFERENT projects whose
+        names slugify identically must not both compute the same
+        un-disambiguated slug — matches the sequential-call behavior in
+        TestSlugDisambiguation.test_colliding_slug_gets_project_id_suffix,
+        but exercised under real concurrency instead of two awaited
+        sequential calls."""
+        release = asyncio.Event()
+        entered = asyncio.Event()
+        real_create_repo = gitea_mgr.create_repo
+
+        async def slow_create_repo(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return await real_create_repo(*args, **kwargs)
+
+        gitea_mgr.create_repo = AsyncMock(side_effect=slow_create_repo)
+        gitea_mgr.create_webhook = AsyncMock(return_value=True)
+
+        task_a = asyncio.create_task(workflow.ensure_repo(1, "My App"))
+        await entered.wait()
+        task_b = asyncio.create_task(workflow.ensure_repo(2, "my app!"))
+        await asyncio.sleep(0)
+        release.set()
+
+        await asyncio.gather(task_a, task_b)
+
+        first = workflow.get_repo_for_project(1)
+        second = workflow.get_repo_for_project(2)
+        assert first is not None and second is not None
+        assert first["local_repo_path"] != second["local_repo_path"]
+
+
+class TestSaveMappingAtomicity:
+    """_save_mapping used to write self._repos_path directly — a process
+    killed mid-write (OOM-kill, container restart, disk-full raising
+    inside json.dump) left a truncated/invalid file that _load_mapping
+    silently discarded to {} on the next load, losing all prior
+    slug-disambiguation history."""
+
+    def test_failed_write_does_not_corrupt_existing_file(self, workflow):
+        workflow._mapping = {
+            "kanboard:1": {"kanboard_project_id": 1, "repo_slug": "app"}
+        }
+        workflow._save_mapping()
+        original_content = Path(workflow._repos_path).read_text()
+
+        # Poison the mapping with a non-JSON-serializable value so the
+        # next _save_mapping() call's json.dump raises partway through
+        # writing (after the file has already been opened/truncated, in
+        # the old direct-write implementation).
+        workflow._mapping["kanboard:2"] = {"bad": object()}
+        workflow._save_mapping()  # swallows the exception, logs a warning
+
+        assert Path(workflow._repos_path).read_text() == original_content
+        # No leftover temp file after either a successful or failed save.
+        assert not Path(f"{workflow._repos_path}.tmp").exists()
+
+    def test_successful_save_leaves_no_temp_file(self, workflow):
+        workflow._mapping = {"kanboard:1": {"kanboard_project_id": 1}}
+        workflow._save_mapping()
+
+        assert Path(workflow._repos_path).exists()
+        assert not Path(f"{workflow._repos_path}.tmp").exists()
+        with open(workflow._repos_path) as f:
+            assert json.load(f) == {"kanboard:1": {"kanboard_project_id": 1}}
