@@ -637,6 +637,17 @@ $agentsUrl = $marcusUrl . '/api/active-agents';
         return 'background:' + colors.bg + ';color:' + colors.fg + ';';
     }
 
+    // Escape every interpolation into innerHTML to prevent XSS — item.title
+    // and item.column come from a linked ticket's board data (/api/ticket-links),
+    // which is attacker-reachable: any project member (or an AI agent following
+    // injected instructions from a poisoned ticket) can set a ticket's title to
+    // markup and link it as a dependency.
+    function esc(s) {
+        return String(s).replace(/[&<>"]/g, function (c) {
+            return { '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c];
+        });
+    }
+
     function renderList(ul, items, emptyMsg) {
         ul.innerHTML = '';
         if (!items || items.length === 0) {
@@ -648,10 +659,10 @@ $agentsUrl = $marcusUrl . '/api/active-agents';
             var col = item.column || '';
             li.innerHTML =
                 '<span class="dep-badge" style="' + badgeStyle(col) + '">'
-                + (col || '?')
+                + (col ? esc(col) : '?')
                 + '</span>'
-                + '<strong>#' + item.task_id + '</strong>'
-                + (item.title ? ' &mdash; ' + item.title : '');
+                + '<strong>#' + esc(item.task_id) + '</strong>'
+                + (item.title ? ' &mdash; ' + esc(item.title) : '');
             ul.appendChild(li);
         });
     }
