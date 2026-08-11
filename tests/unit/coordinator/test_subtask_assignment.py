@@ -4,6 +4,7 @@ Unit tests for subtask assignment logic.
 Tests the bug fix for parallel subtask assignment.
 """
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
@@ -1354,6 +1355,92 @@ class TestParentTaskAttribution:
 
         assert result is False
         mock_state.log_event.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.unit
+    async def test_concurrent_completion_calls_run_side_effects_once(
+        self,
+        subtask_manager: SubtaskManager,
+        mock_kanban_client: Mock,
+        mock_state: Mock,
+        tmp_path: Any,
+    ) -> None:
+        """
+        Regression: two concurrent check_and_complete_parent_task calls for
+        the SAME parent — e.g. two sibling subtasks' report_task_progress
+        calls landing on separate MCP connections near-simultaneously, both
+        seeing every subtask already DONE — must only run the one-time
+        completion side effects ONCE. Without a guard, both calls
+        independently pass is_parent_complete() and both write the kanban
+        DONE update, post the "Auto-completed" comment, and emit a
+        task_assignment event — corrupting dashboard attribution with two
+        conflicting agent records for one completion.
+        """
+        from src.marcus_mcp.coordinator.subtask_assignment import (
+            check_and_complete_parent_task,
+        )
+
+        parent_id = "parent-concurrent-999"
+        subtasks_data = [
+            {
+                "name": "Sub 1",
+                "description": "first",
+                "estimated_hours": 1.0,
+                "dependencies": [],
+            },
+            {
+                "name": "Sub 2",
+                "description": "second",
+                "estimated_hours": 1.0,
+                "dependencies": [],
+            },
+        ]
+        subtask_manager.add_subtasks(parent_id, subtasks_data, None)
+        subtask_ids = list(subtask_manager.subtasks.keys())
+        for sid in subtask_ids:
+            subtask_manager.update_subtask_status(
+                sid, TaskStatus.DONE, None, assigned_to="agent_a"
+            )
+        mock_state.project_tasks = None
+
+        with (
+            patch(
+                "src.marcus_mcp.coordinator.subtask_assignment"
+                "._rollup_subtask_artifacts_to_parent",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "src.marcus_mcp.coordinator.subtask_assignment"
+                "._rollup_subtask_decisions_to_parent",
+                new_callable=AsyncMock,
+            ),
+        ):
+            results = await asyncio.gather(
+                check_and_complete_parent_task(
+                    parent_id,
+                    subtask_manager,
+                    mock_kanban_client,
+                    mock_state,
+                    completing_agent_id="agent_a",
+                ),
+                check_and_complete_parent_task(
+                    parent_id,
+                    subtask_manager,
+                    mock_kanban_client,
+                    mock_state,
+                    completing_agent_id="agent_b",
+                ),
+            )
+
+        assert sorted(results) == [False, True]
+        mock_kanban_client.update_task.assert_awaited_once()
+        mock_kanban_client.add_comment.assert_awaited_once()
+        task_assignment_calls = [
+            c
+            for c in mock_state.log_event.call_args_list
+            if c.args[0] == "task_assignment"
+        ]
+        assert len(task_assignment_calls) == 1
 
 
 class TestSubtaskAssignedToOnPickup:

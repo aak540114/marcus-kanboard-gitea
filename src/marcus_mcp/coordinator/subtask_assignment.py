@@ -5,13 +5,69 @@ This module handles finding and assigning subtasks to agents,
 integrating with the existing task assignment workflow.
 """
 
+import asyncio
 import logging
-from typing import Any, List, Optional
+import weakref
+from typing import Any, Dict, List, Optional, Set
 
 from src.core.models import Task, TaskStatus
 from src.marcus_mcp.coordinator.subtask_manager import Subtask, SubtaskManager
 
 logger = logging.getLogger(__name__)
+
+# Guards against two concurrent calls to check_and_complete_parent_task for
+# the SAME parent_task_id both passing is_parent_complete() and both running
+# the completion side effects (duplicate decisions/artifacts rollup, a
+# duplicate "Auto-completed" comment, and two conflicting task_assignment
+# telemetry events attributing one completion to two different agents).
+# Concretely reachable: two sibling subtasks' report_task_progress(completed)
+# calls, on separate MCP connections served by the same event loop, can both
+# flip their subtask to DONE synchronously and then both await real kanban
+# RPCs (update_subtask_progress_in_parent) before either reaches this check.
+#
+# Keyed by the `state` object itself (via WeakKeyDictionary, not id(state)) so
+# entries are automatically discarded when a state object — e.g. a test's
+# mock — is garbage collected, with no risk of a reused id() colliding
+# between an old and a new state object.
+_parent_completion_locks: "weakref.WeakKeyDictionary[Any, Dict[str, asyncio.Lock]]" = (
+    weakref.WeakKeyDictionary()
+)
+_completed_parent_task_ids: "weakref.WeakKeyDictionary[Any, Set[str]]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _get_parent_completion_lock(state: Any, parent_task_id: str) -> asyncio.Lock:
+    """Return (creating on first use) the lock for *parent_task_id* under *state*."""
+    locks = _parent_completion_locks.get(state)
+    if locks is None:
+        locks = {}
+        _parent_completion_locks[state] = locks
+    lock = locks.get(parent_task_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        locks[parent_task_id] = lock
+    return lock
+
+
+def _claim_parent_completion(state: Any, parent_task_id: str) -> bool:
+    """Atomically claim *parent_task_id* as completed under *state*.
+
+    Returns
+    -------
+    bool
+        True if this call is the first to claim it (caller should proceed
+        with the one-time completion side effects). False if it was already
+        claimed — a concurrent or earlier call already ran them.
+    """
+    completed = _completed_parent_task_ids.get(state)
+    if completed is None:
+        completed = set()
+        _completed_parent_task_ids[state] = completed
+    if parent_task_id in completed:
+        return False
+    completed.add(parent_task_id)
+    return True
 
 
 def _determine_task_type(task: Task) -> str:
@@ -288,7 +344,26 @@ async def check_and_complete_parent_task(
     """
     # Check if parent is complete using unified storage
     project_tasks = state.project_tasks if state else None
-    if subtask_manager.is_parent_complete(parent_task_id, project_tasks):
+
+    async def _do_check_and_complete() -> bool:
+        if not subtask_manager.is_parent_complete(parent_task_id, project_tasks):
+            return False
+
+        # Two sibling subtasks' report_task_progress(completed) calls, on
+        # separate MCP connections served by the same event loop, can both
+        # flip their subtask to DONE synchronously and then both reach here
+        # before either finishes. The lock above serializes them; this claim
+        # makes the SECOND one (which, after acquiring the lock, still sees
+        # is_parent_complete() == True — nothing resets it) a no-op instead
+        # of re-running the completion side effects a second time.
+        if state is not None and not _claim_parent_completion(state, parent_task_id):
+            logger.debug(
+                "Parent %s already auto-completed by a concurrent call "
+                "— skipping duplicate completion",
+                parent_task_id,
+            )
+            return False
+
         logger.info(
             f"All subtasks complete for {parent_task_id} " "- auto-completing parent"
         )
@@ -373,7 +448,10 @@ async def check_and_complete_parent_task(
 
         return True
 
-    return False
+    if state is not None:
+        async with _get_parent_completion_lock(state, parent_task_id):
+            return await _do_check_and_complete()
+    return await _do_check_and_complete()
 
 
 async def _rollup_subtask_artifacts_to_parent(
