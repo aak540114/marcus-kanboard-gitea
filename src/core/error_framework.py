@@ -623,6 +623,13 @@ class KanbanIntegrationError(IntegrationError):
                 long_term_solution="Implement Kanban health monitoring",
             ),
         )
+        # Pass service_name and operation explicitly to parent — without
+        # this, IntegrationError.__init__ never sees them (they were
+        # consumed here as named params, not passed through *args) and
+        # self.service_name/self.operation default to "unknown" regardless
+        # of what board_name/operation the caller actually passed.
+        kwargs["service_name"] = board_name
+        kwargs["operation"] = operation
         super().__init__(message, *args, **kwargs)
 
 
@@ -668,6 +675,10 @@ class AuthenticationError(IntegrationError):
                 escalation_path="Contact service provider",
             ),
         )
+        # Pass service_name explicitly to parent — see KanbanIntegrationError
+        # for why this is required (consumed here as a named param, so it
+        # never reaches IntegrationError.__init__ via kwargs/args otherwise).
+        kwargs["service_name"] = service_name
         super().__init__(message, *args, **kwargs)
 
 
@@ -692,6 +703,10 @@ class ExternalServiceError(IntegrationError):
                 long_term_solution="Implement service health monitoring",
             ),
         )
+        # Pass service_name explicitly to parent — see KanbanIntegrationError
+        # for why this is required (consumed here as a named param, so it
+        # never reaches IntegrationError.__init__ via kwargs/args otherwise).
+        kwargs["service_name"] = service_name
         super().__init__(message, *args, **kwargs)
 
 

@@ -244,6 +244,20 @@ class TestIntegrationErrors:
         assert error.category == ErrorCategory.INTEGRATION
         assert error.retryable is True
 
+    def test_kanban_integration_error_records_service_name_and_operation(self):
+        """Regression: .service_name/.operation must reflect the actual
+        board_name/operation passed in, not silently default to
+        "unknown". KanbanIntegrationError consumes board_name/operation
+        as named constructor params, so IntegrationError.__init__ (which
+        only reads them from kwargs or leading positional args) never
+        saw them unless the subclass explicitly forwards them —
+        AIProviderError already does this correctly; this class did not.
+        """
+        error = KanbanIntegrationError(board_name="test_board", operation="create_task")
+
+        assert error.service_name == "test_board"
+        assert error.operation == "create_task"
+
     def test_ai_provider_error(self):
         """Test AIProviderError creation"""
         error = AIProviderError(provider_name="openai", operation="text_generation")
@@ -260,6 +274,22 @@ class TestIntegrationErrors:
         assert error.severity == ErrorSeverity.HIGH
         assert error.retryable is False
         assert error.category == ErrorCategory.INTEGRATION
+
+    def test_authentication_error_records_service_name(self):
+        """Regression: .service_name must reflect the actual service_name
+        passed in, not silently default to "unknown" (same bug class as
+        KanbanIntegrationError above)."""
+        error = AuthenticationError(service_name="github")
+
+        assert error.service_name == "github"
+
+    def test_external_service_error_records_service_name(self):
+        """Regression: .service_name must reflect the actual service_name
+        passed in, not silently default to "unknown" (same bug class as
+        KanbanIntegrationError above)."""
+        error = ExternalServiceError(service_name="gitea", error_details="timeout")
+
+        assert error.service_name == "gitea"
 
 
 class TestSecurityErrors:
