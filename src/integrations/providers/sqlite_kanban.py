@@ -117,12 +117,22 @@ _COLUMN_TO_STATUS: Dict[str, TaskStatus] = {
     "backlog": TaskStatus.TODO,
     "todo": TaskStatus.TODO,
     "to do": TaskStatus.TODO,
-    "ready": TaskStatus.TODO,
+    "ready": TaskStatus.READY,
     "in progress": TaskStatus.IN_PROGRESS,
     "progress": TaskStatus.IN_PROGRESS,
     "in_progress": TaskStatus.IN_PROGRESS,
     "blocked": TaskStatus.BLOCKED,
     "on hold": TaskStatus.BLOCKED,
+    # human_gated_workflow.py calls move_task_to_column(ticket_id,
+    # "waiting for human") verbatim (see kanboard_kanban.py's own
+    # _COLUMN_STATUS_MAP for the same entry) — without it, every ticket
+    # parked for human review silently resolved to TODO here, hiding it
+    # from any WAITING_FOR_HUMAN-aware reader (e.g. get_project_metrics's
+    # per-status buckets) even though Marcus's own lifecycle record was
+    # correct.
+    "waiting for human": TaskStatus.WAITING_FOR_HUMAN,
+    "waiting_for_human": TaskStatus.WAITING_FOR_HUMAN,
+    "waiting": TaskStatus.WAITING_FOR_HUMAN,
     "done": TaskStatus.DONE,
     "completed": TaskStatus.DONE,
 }
@@ -818,15 +828,29 @@ class SQLiteKanban(KanbanInterface):
         status = self._resolve_status(column_name)
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        def _move(conn: sqlite3.Connection) -> None:
-            conn.execute(
+        def _move(conn: sqlite3.Connection) -> int:
+            cursor = conn.execute(
                 "UPDATE tasks SET status = ?, updated_at = ? " "WHERE id = ?",
                 (status.value, now_iso, task_id),
             )
             conn.commit()
+            return cursor.rowcount
 
         try:
-            await self._run_in_executor(lambda: self._with_connection(_move))
+            rowcount = await self._run_in_executor(lambda: self._with_connection(_move))
+            if rowcount == 0:
+                # No task matched task_id — a nonexistent, typo'd, or
+                # already-deleted id. Callers (human_gated_workflow.py)
+                # treat a False return as "the board has no matching
+                # column/task" and log a diagnostic warning instead of
+                # silently trusting success; an unconditional True here
+                # made that warning unreachable for the missing-row case.
+                logger.warning(
+                    "[SQLiteKanban] move_task_to_column: no task matched "
+                    "id %s — nothing moved",
+                    task_id,
+                )
+                return False
             return True
         except Exception as e:
             logger.error(f"[SQLiteKanban] move_task_to_column failed: {e}")

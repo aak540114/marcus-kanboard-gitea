@@ -608,6 +608,66 @@ class TestSQLiteKanbanMoveTask:
         assert updated is not None
         assert updated.status == TaskStatus.TODO
 
+    @pytest.mark.asyncio
+    async def test_move_maps_ready_substring_to_ready_not_todo(
+        self, connected_kanban: SQLiteKanban
+    ) -> None:
+        """Regression: a column name containing "ready" as a substring
+        must resolve via the alias dict to TaskStatus.READY, not TODO.
+
+        _COLUMN_TO_STATUS had "ready": TaskStatus.TODO — wrong entry.
+        The exact literal "ready" alone doesn't discriminate this bug,
+        since _resolve_status's direct-enum-value match
+        (TaskStatus.READY.value == "ready") catches it before the alias
+        dict is ever consulted — masking the bad entry for that one
+        input. A column name where "ready" is only a SUBSTRING (e.g.
+        "Ready Board") skips the direct match and falls through to the
+        alias dict's substring-match loop, which is where the wrong
+        entry was actually reachable.
+        """
+        task = await connected_kanban.create_task(_sample_task_data())
+        await connected_kanban.move_task_to_column(task.id, "Ready Board")
+        updated = await connected_kanban.get_task_by_id(task.id)
+        assert updated is not None
+        assert updated.status == TaskStatus.READY
+
+    @pytest.mark.asyncio
+    async def test_move_maps_waiting_for_human(
+        self, connected_kanban: SQLiteKanban
+    ) -> None:
+        """Regression: "waiting for human" (the literal string
+        human_gated_workflow.py uses via move_task_to_column) had no
+        entry in _COLUMN_TO_STATUS at all, so every ticket parked for
+        human review silently resolved to TODO on this provider instead
+        of WAITING_FOR_HUMAN — corrupting the board's status for the
+        entire review window even though Marcus's own lifecycle record
+        was correct. kanboard_kanban.py has the equivalent entry as a
+        sibling reference.
+        """
+        task = await connected_kanban.create_task(_sample_task_data())
+        await connected_kanban.move_task_to_column(task.id, "waiting for human")
+        updated = await connected_kanban.get_task_by_id(task.id)
+        assert updated is not None
+        assert updated.status == TaskStatus.WAITING_FOR_HUMAN
+
+    @pytest.mark.asyncio
+    async def test_move_to_nonexistent_task_returns_false(
+        self, connected_kanban: SQLiteKanban
+    ) -> None:
+        """Regression: move_task_to_column must return False (not True)
+        when task_id matches no row.
+
+        The UPDATE previously ran unconditionally and the method always
+        returned True regardless of whether any row actually matched —
+        callers (human_gated_workflow.py) rely on a False return to
+        detect "the board has no matching column/task" and log a
+        diagnostic warning instead of silently trusting a no-op success.
+        """
+        result = await connected_kanban.move_task_to_column(
+            "does-not-exist", "in progress"
+        )
+        assert result is False
+
 
 class TestSQLiteKanbanUpdateTask:
     """Test compound update_task behavior."""
