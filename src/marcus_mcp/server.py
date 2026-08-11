@@ -4842,6 +4842,16 @@ function save() {{
                     r.headers["Access-Control-Allow-Origin"] = "*"
                     return r
 
+                # A syntactically-valid but non-object JSON body (e.g. 5,
+                # "x", [1,2], null) parses fine above; body.get(...) below
+                # would then raise AttributeError (int/str/list/NoneType
+                # have no .get), turning into an uncaught 500 instead of
+                # this 400.
+                if not isinstance(body, dict):
+                    r = JSONResponse({"error": "JSON object required"}, status_code=400)
+                    r.headers["Access-Control-Allow-Origin"] = "*"
+                    return r
+
                 count = body.get("max_parallel_containers")
                 if not isinstance(count, int) or isinstance(count, bool) or count < 0:
                     r = JSONResponse(
@@ -5659,6 +5669,15 @@ function save() {{
                 except Exception:
                     return _cors(
                         JSONResponse({"error": "invalid JSON"}, status_code=400)
+                    )
+                # A syntactically-valid but non-object JSON body (e.g. 5,
+                # "x", [1,2], null) parses fine above; body.get(...) below
+                # would then raise AttributeError (int/str/list/NoneType
+                # have no .get), turning into an uncaught 500 instead of
+                # this 400.
+                if not isinstance(body, dict):
+                    return _cors(
+                        JSONResponse({"error": "JSON object required"}, status_code=400)
                     )
                 pid_raw = body.get("project_id")
                 enabled = body.get("enabled")
