@@ -313,10 +313,23 @@ class ErrorMonitor:
         now = datetime.now(timezone.utc)
         cutoff_time = now - timedelta(minutes=self.metrics_window_minutes)
 
-        # Count errors in time window
-        recent_errors = sum(
-            1 for error in self.error_history if error["timestamp"] > cutoff_time
-        )
+        # error_history is append-ordered (oldest first): walk backward
+        # from the newest entry and stop as soon as we pass the window
+        # boundary, instead of scanning the full (up to maxlen=10000)
+        # history on every single record_error() call. This runs
+        # synchronously inside record_error, which real callers invoke
+        # directly from async code with no offload (e.g.
+        # src/integrations/nlp_base.py's create_tasks_on_board) — a full
+        # scan gets more expensive exactly when errors are most frequent
+        # (an outage), turning this bookkeeping into a self-inflicted
+        # event-loop stall during the failure conditions it exists to
+        # detect. Bounds the cost to the number of errors actually within
+        # the window instead of the full history size.
+        recent_errors = 0
+        for error in reversed(self.error_history):
+            if error["timestamp"] <= cutoff_time:
+                break
+            recent_errors += 1
 
         self.current_metrics.error_rate_per_minute = (
             recent_errors / self.metrics_window_minutes
@@ -344,15 +357,17 @@ class ErrorMonitor:
         """Detect frequency-based error patterns."""
         error_type = error_record["error_type"]
 
-        # Count recent occurrences of this error type
-        recent_count = sum(
-            1
-            for error in self.error_history
-            if (
-                error["error_type"] == error_type
-                and now - error["timestamp"] < timedelta(minutes=10)
-            )
-        )
+        # Count recent occurrences of this error type. See
+        # _calculate_error_rate's comment: reverse-scan with an early
+        # break bounds the cost to errors actually within the window
+        # instead of a full scan of the (up to maxlen=10000) history.
+        cutoff = now - timedelta(minutes=10)
+        recent_count = 0
+        for error in reversed(self.error_history):
+            if error["timestamp"] <= cutoff:
+                break
+            if error["error_type"] == error_type:
+                recent_count += 1
 
         if recent_count >= self.pattern_thresholds["frequency_threshold"]:
             pattern_id = f"frequency_{error_type}_{now.strftime('%Y%m%d_%H%M')}"
@@ -387,12 +402,15 @@ class ErrorMonitor:
         self, error_record: Dict[str, Any], now: datetime
     ) -> None:
         """Detect burst error patterns."""
-        # Count all errors in last 5 minutes
-        burst_count = sum(
-            1
-            for error in self.error_history
-            if now - error["timestamp"] < timedelta(minutes=5)
-        )
+        # Count all errors in last 5 minutes. See _calculate_error_rate's
+        # comment: reverse-scan with an early break bounds the cost to
+        # errors actually within the window instead of a full scan.
+        cutoff = now - timedelta(minutes=5)
+        burst_count = 0
+        for error in reversed(self.error_history):
+            if error["timestamp"] <= cutoff:
+                break
+            burst_count += 1
 
         if burst_count >= self.pattern_thresholds["burst_threshold"]:
             pattern_id = f"burst_{now.strftime('%Y%m%d_%H%M')}"
@@ -425,15 +443,17 @@ class ErrorMonitor:
         if not agent_id:
             return
 
-        # Count errors from this agent in last 30 minutes
-        agent_errors = sum(
-            1
-            for error in self.error_history
-            if (
-                error.get("agent_id") == agent_id
-                and now - error["timestamp"] < timedelta(minutes=30)
-            )
-        )
+        # Count errors from this agent in last 30 minutes. See
+        # _calculate_error_rate's comment: reverse-scan with an early
+        # break bounds the cost to errors actually within the window
+        # instead of a full scan.
+        cutoff = now - timedelta(minutes=30)
+        agent_errors = 0
+        for error in reversed(self.error_history):
+            if error["timestamp"] <= cutoff:
+                break
+            if error.get("agent_id") == agent_id:
+                agent_errors += 1
 
         if agent_errors >= self.pattern_thresholds["agent_error_threshold"]:
             pattern_id = f"agent_{agent_id}_{now.strftime('%Y%m%d_%H%M')}"
@@ -460,9 +480,16 @@ class ErrorMonitor:
         self, error_record: Dict[str, Any], now: datetime
     ) -> None:
         """Detect cascade error patterns (related errors in sequence)."""
-        # Look for errors with similar context that occurred recently
+        # Look for errors with similar context that occurred recently.
+        # collections.deque has no slice support, and `list(dq)[-50:]`
+        # first materializes the ENTIRE deque (up to maxlen=10000) into a
+        # list just to take the last 50 — an O(n) scan disguised as a
+        # bounded one. Walking `reversed(self.error_history)` and
+        # stopping after 50 items is the actual O(50) equivalent.
         similar_errors = []
-        for error in list(self.error_history)[-50:]:  # Check last 50 errors
+        for i, error in enumerate(reversed(self.error_history)):
+            if i >= 50:  # Check last 50 errors
+                break
             if (
                 now - error["timestamp"] < timedelta(minutes=5)
                 and error["correlation_id"] != error_record["correlation_id"]

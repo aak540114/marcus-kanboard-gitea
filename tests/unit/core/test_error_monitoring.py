@@ -277,6 +277,107 @@ class TestErrorMonitor:
         assert "problematic_agent" in pattern.description
         assert "problematic_agent" in pattern.affected_agents
 
+    def test_old_errors_excluded_from_recent_counts_with_large_history(self):
+        """Regression: correctness check for the reverse-scan-with-early-
+        break optimization in _calculate_error_rate/_detect_frequency_
+        pattern/_detect_burst_pattern/_detect_agent_pattern.
+
+        A large volume of OLD errors — outside every pattern's time
+        window (10/5/30 minutes) — must still be correctly EXCLUDED from
+        "recent" counts, proving the early-break bound didn't silently
+        change WHICH errors count, only how many entries are visited to
+        find them.
+        """
+        old_ts = datetime.now(timezone.utc) - timedelta(hours=2)
+        for i in range(300):
+            self.monitor.error_history.append(
+                {
+                    "timestamp": old_ts,
+                    "error_type": "NetworkTimeoutError",
+                    "correlation_id": f"old-{i}",
+                    "agent_id": "problematic_agent",
+                }
+            )
+
+        error = self.create_test_error(NetworkTimeoutError)
+        self.monitor.record_error(error)
+
+        # Only the just-recorded error counts as "recent" — none of the
+        # 300 old (2-hours-ago) entries, even though they're still
+        # sitting in error_history.
+        assert self.monitor.current_metrics.error_rate_per_minute == pytest.approx(
+            1 / self.monitor.metrics_window_minutes
+        )
+
+    def test_reverse_scan_stops_at_window_boundary_not_full_history(self):
+        """record_error() runs synchronously inside async callers with no
+        offload (e.g. src/integrations/nlp_base.py's create_tasks_on_board
+        calls record_error_for_monitoring directly, no await/executor) —
+        a full scan of the (up to maxlen=10000) error_history on every
+        call compounds cost exactly during an error storm, when this
+        fires most often. The reverse scan must stop as soon as it walks
+        past each pattern's time-window boundary, not visit the entire
+        history — verified here by counting how many entries the scan
+        actually consumes.
+        """
+        import collections
+
+        class _CountingDeque(collections.deque):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                super().__init__(*args, **kwargs)
+                self.visited = 0
+
+            def __reversed__(self) -> Any:
+                for item in super().__reversed__():
+                    self.visited += 1
+                    yield item
+
+            def __iter__(self) -> Any:
+                # Also instrument forward iteration — a full scan written
+                # as `for error in self.error_history` or a generator
+                # expression over it goes through __iter__, not
+                # __reversed__, and must be caught the same way.
+                for item in super().__iter__():
+                    self.visited += 1
+                    yield item
+
+        old_ts = datetime.now(timezone.utc) - timedelta(hours=2)
+        counting = _CountingDeque(maxlen=self.monitor.error_history.maxlen)
+        for i in range(2000):
+            counting.append(
+                {
+                    "timestamp": old_ts,
+                    "error_type": "NetworkTimeoutError",
+                    "correlation_id": f"old-{i}",
+                    "agent_id": None,
+                }
+            )
+        self.monitor.error_history = counting
+
+        error = self.create_test_error(NetworkTimeoutError)
+        self.monitor.record_error(error)
+
+        # Capture into a plain int BEFORE asserting — reading
+        # counting.visited again inside a failure-message f-string would
+        # trigger ANOTHER iteration (pytest's assertion introspection
+        # reprs the deque, which iterates it), corrupting the very count
+        # being reported.
+        visited = counting.visited
+
+        # All 2000 planted entries are 2 hours old — past every pattern's
+        # window (max 30 minutes) — so the 4 window-based scans
+        # (_calculate_error_rate, _detect_frequency_pattern,
+        # _detect_burst_pattern, _detect_agent_pattern) should each stop
+        # after ~2 items (the 1 new error, then the first old one breaks
+        # the loop). _detect_cascade_pattern is bounded to a fixed last
+        # 50 by design (unrelated to the time window), so the expected
+        # total is roughly 4*2 + 50 = 58 — nowhere near a full 2000-entry
+        # history walk, let alone walking it 4-5 times over.
+        assert visited < 70, (
+            f"reverse scan visited {visited} entries — expected an early "
+            "break near the start (~58), not a full history walk"
+        )
+
     def test_correlation_tracking(self):
         """Test error correlation tracking"""
         # Create related errors (same operation + agent + integration)
