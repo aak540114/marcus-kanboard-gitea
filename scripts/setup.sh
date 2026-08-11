@@ -487,7 +487,16 @@ if ! docker compose exec -T -u git gitea gitea admin user create \
         --email root@example.com --admin --must-change-password=false \
         > "$create_log" 2>&1; then
     if grep -qi "user already exists" "$create_log"; then
-        log "Gitea admin account already exists — skipping."
+        # Gitea's CLI has no way to rotate an existing user's password, so
+        # this create call was a no-op — the account's REAL password is
+        # whatever it already was, not GITEA_ADMIN_PASSWORD (which, on a
+        # fresh .env with the volume preserved, is a brand-new random value
+        # that was never actually set on this account). Printing that value
+        # at the end of this script without this warning silently hands the
+        # user a login that won't work — this is exactly the ".env deleted,
+        # volume kept" scenario teardown.sh's own advice can produce.
+        log "Gitea admin account already exists — skipping (password unchanged)."
+        log "WARNING: GITEA_ADMIN_PASSWORD in .env may not match the account's actual password — Gitea cannot rotate an existing user's password via this CLI. If you deleted .env to get fresh credentials but kept the Gitea data volume, log in with the PREVIOUS password, or reset it manually: docker compose exec -u git gitea gitea admin user change-password --username root --password <new-password>"
     else
         err "Failed to create Gitea admin account:"
         cat "$create_log" >&2

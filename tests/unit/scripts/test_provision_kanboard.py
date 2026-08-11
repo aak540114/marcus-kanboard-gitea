@@ -420,3 +420,56 @@ class TestMain:
             rc = pk.main(["--url", "http://x/jsonrpc.php", "--token", "tok", "--project-name", "P"])
 
         assert rc == 1
+
+    def test_secure_admin_prints_secured_message_when_changed(self, capsys):
+        """ensure_admin_user() actually created/disabled something —
+        confirmation printed to stderr."""
+        with patch(
+            "provision_kanboard.find_or_create_project", return_value=5
+        ), patch("provision_kanboard.reconcile_columns", return_value=[]), patch(
+            "provision_kanboard.ensure_admin_user", return_value=True
+        ):
+            rc = pk.main(
+                [
+                    "--url", "http://x/jsonrpc.php",
+                    "--token", "tok",
+                    "--project-name", "P",
+                    "--secure-admin", "marcus_admin", "s3cret",
+                ]
+            )
+
+        assert rc == 0
+        err = capsys.readouterr().err
+        assert "Secured admin account" in err
+        assert "marcus_admin" in err
+
+    def test_secure_admin_warns_about_stale_password_when_unchanged(self, capsys):
+        """Regression: when ensure_admin_user() finds the account already
+        existing and makes no change, main() must warn that the
+        just-generated password may not match the account's real one —
+        Kanboard cannot rotate an existing user's password via the API,
+        so silently saying nothing (the old behavior) let a user who
+        deleted .env for fresh credentials but kept the Kanboard data
+        volume believe the newly-printed password was valid when it
+        was never actually set on the account.
+        """
+        with patch(
+            "provision_kanboard.find_or_create_project", return_value=5
+        ), patch("provision_kanboard.reconcile_columns", return_value=[]), patch(
+            "provision_kanboard.ensure_admin_user", return_value=False
+        ):
+            rc = pk.main(
+                [
+                    "--url", "http://x/jsonrpc.php",
+                    "--token", "tok",
+                    "--project-name", "P",
+                    "--secure-admin", "marcus_admin", "s3cret",
+                ]
+            )
+
+        assert rc == 0
+        err = capsys.readouterr().err
+        assert "Secured admin account" not in err
+        assert "marcus_admin" in err
+        assert "already exists" in err
+        assert "may not match" in err.lower()
