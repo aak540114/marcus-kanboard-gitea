@@ -1074,6 +1074,131 @@ class TestGetTaskLinks:
             await kanban.get_task_links("1")
 
 
+class TestGetRawTaskLinks:
+    """Test get_raw_task_links() — used by the clone-project feature,
+    which needs the unclassified raw rows (including any numeric
+    ``link_id`` type field) that classify_task_links() discards."""
+
+    @pytest.mark.asyncio
+    async def test_returns_raw_rows_unclassified(self, kanban):
+        kanban._client = AsyncMock()
+        raw = [
+            {"label": "is blocked by", "task_id": 5, "link_id": 2},
+            {"label": "blocks", "task_id": 9, "link_id": 2},
+        ]
+        kanban._client.post = AsyncMock(return_value=_rpc_response(raw))
+        result = await kanban.get_raw_task_links("1")
+        assert result == raw
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_list_on_no_links(self, kanban):
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(return_value=_rpc_response(None))
+        result = await kanban.get_raw_task_links("1")
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_raises_on_rpc_failure(self, kanban):
+        """Unlike get_task_links(), this is a raw low-level accessor and
+        propagates failures rather than soft-failing, so a caller doing
+        something consequential with the result (recreating links on a
+        clone) can't mistake an RPC error for "this ticket has no
+        links"."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(side_effect=RuntimeError("API error"))
+        with pytest.raises(RuntimeError, match="API error"):
+            await kanban.get_raw_task_links("1")
+
+    @pytest.mark.asyncio
+    async def test_raises_if_not_connected(self, kanban):
+        with pytest.raises(RuntimeError, match="connect()"):
+            await kanban.get_raw_task_links("1")
+
+    @pytest.mark.asyncio
+    async def test_get_task_links_uses_get_raw_task_links(self, kanban):
+        """Regression guard: get_task_links() must route through
+        get_raw_task_links() rather than a second inline getAllTaskLinks
+        call, so there's exactly one place that knows the RPC name."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(return_value=_rpc_response([]))
+        with patch.object(
+            kanban, "get_raw_task_links", wraps=kanban.get_raw_task_links
+        ) as spy:
+            await kanban.get_task_links("7")
+        spy.assert_awaited_once_with("7")
+
+
+class TestGetLinkTypeMap:
+    """Test get_link_type_map() — best-effort label->numeric link_type id
+    lookup via Kanboard's getAllLinks RPC, used to faithfully recreate a
+    link's exact type on a cloned project. Availability of this RPC on
+    the deployed Kanboard version is unverified, so failures are
+    swallowed and an empty map returned rather than raised."""
+
+    @pytest.mark.asyncio
+    async def test_builds_lowercased_label_to_id_map(self, kanban):
+        kanban._client = AsyncMock()
+        raw = [
+            {"id": 2, "label": "Blocks"},
+            {"id": 6, "label": "is a child of"},
+        ]
+        kanban._client.post = AsyncMock(return_value=_rpc_response(raw))
+        result = await kanban.get_link_type_map()
+        assert result == {"blocks": 2, "is a child of": 6}
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_dict_when_rpc_unavailable(self, kanban):
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(side_effect=RuntimeError("Method not found"))
+        result = await kanban.get_link_type_map()
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_dict_on_no_result(self, kanban):
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(return_value=_rpc_response(None))
+        result = await kanban.get_link_type_map()
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_raises_if_not_connected(self, kanban):
+        with pytest.raises(RuntimeError, match="connect()"):
+            await kanban.get_link_type_map()
+
+
+class TestResolveLinkType:
+    """Test resolve_link_type() — the module-level helper that picks the
+    numeric link_type id to use when recreating a raw link on a clone."""
+
+    def test_prefers_raw_link_id_when_present(self):
+        from src.integrations.providers.kanboard_kanban import resolve_link_type
+
+        raw_link = {"label": "blocks", "link_id": 2}
+        result = resolve_link_type(raw_link, {"blocks": 99})
+        assert result == 2
+
+    def test_falls_back_to_label_map(self):
+        from src.integrations.providers.kanboard_kanban import resolve_link_type
+
+        raw_link = {"label": "blocks"}
+        result = resolve_link_type(raw_link, {"blocks": 2})
+        assert result == 2
+
+    def test_falls_back_to_default_when_unresolvable(self):
+        from src.integrations.providers.kanboard_kanban import resolve_link_type
+
+        raw_link = {"label": "blocks"}
+        result = resolve_link_type(raw_link, {})
+        assert result == 6
+
+    def test_ignores_non_numeric_link_id(self):
+        from src.integrations.providers.kanboard_kanban import resolve_link_type
+
+        raw_link = {"label": "blocks", "link_id": "not-a-number"}
+        result = resolve_link_type(raw_link, {"blocks": 2})
+        assert result == 2
+
+
 # ---------------------------------------------------------------------------
 # move_task_to_column tests
 # ---------------------------------------------------------------------------
@@ -2131,6 +2256,56 @@ class TestSetMergeConflictFlag:
         assert result is False
 
 
+class TestSetTaskTags:
+    """Test set_task_tags() — a standalone public wrapper over Kanboard's
+    setTaskTags RPC, used by the clone-project feature to recreate a
+    baseline ticket's exact tag list on its clone (set_merge_conflict_flag
+    also uses this internally instead of duplicating the RPC call)."""
+
+    @pytest.mark.asyncio
+    async def test_sends_full_tag_list(self, kanban):
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(return_value=_rpc_response(True))
+        result = await kanban.set_task_tags("10", project_id=1, tags=["a", "b"])
+        assert result is True
+        call = kanban._client.post.await_args_list[0]
+        params = call.kwargs["json"]["params"]
+        assert params["project_id"] == 1
+        assert params["task_id"] == 10
+        assert params["tags"] == ["a", "b"]
+
+    @pytest.mark.asyncio
+    async def test_returns_false_on_falsy_result(self, kanban):
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(return_value=_rpc_response(False))
+        result = await kanban.set_task_tags("10", project_id=1, tags=[])
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_raises_if_not_connected(self, kanban):
+        with pytest.raises(RuntimeError, match="connect()"):
+            await kanban.set_task_tags("10", project_id=1, tags=[])
+
+    @pytest.mark.asyncio
+    async def test_set_merge_conflict_flag_uses_set_task_tags(self, kanban):
+        """Regression guard: set_merge_conflict_flag must route its write
+        through set_task_tags, not a second inline setTaskTags call, so
+        there is exactly one place that knows the RPC's field names."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response({"id": 10, "project_id": 1, "tags": []}),
+                _rpc_response(True),
+            ]
+        )
+        with patch.object(
+            kanban, "set_task_tags", wraps=kanban.set_task_tags
+        ) as spy:
+            result = await kanban.set_merge_conflict_flag("10", present=True)
+        assert result is True
+        spy.assert_awaited_once_with("10", project_id=1, tags=["merge-conflict"])
+
+
 # ---------------------------------------------------------------------------
 # get_task_color / create_task color_id tests
 # ---------------------------------------------------------------------------
@@ -2196,6 +2371,55 @@ class TestCreateTaskColor:
         await kanban.create_task({"name": "Child"})
         first_call = kanban._client.post.await_args_list[0]
         assert "color_id" not in first_call.kwargs["json"]["params"]
+
+
+# ---------------------------------------------------------------------------
+# create_project tests
+# ---------------------------------------------------------------------------
+
+
+class TestCreateProject:
+    """Test create_project() — used by the clone-project feature to
+    create the destination project before replicating tickets into it."""
+
+    @pytest.mark.asyncio
+    async def test_returns_new_project_id(self, kanban):
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(return_value=_rpc_response(42))
+        result = await kanban.create_project("Cloned Project")
+        assert result == 42
+
+    @pytest.mark.asyncio
+    async def test_sends_name_as_named_param(self, kanban):
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(return_value=_rpc_response(42))
+        await kanban.create_project("Cloned Project")
+        call = kanban._client.post.await_args_list[0]
+        body = call.kwargs["json"]
+        assert body["method"] == "createProject"
+        assert body["params"] == {"name": "Cloned Project"}
+
+    @pytest.mark.asyncio
+    async def test_raises_if_not_connected(self, kanban):
+        with pytest.raises(RuntimeError, match="connect()"):
+            await kanban.create_project("Cloned Project")
+
+    @pytest.mark.asyncio
+    async def test_raises_on_falsy_result(self):
+        """Kanboard's ProjectModel::create returns false on any failure
+        step (e.g. a duplicate project name) — surface that as an error
+        instead of silently returning a falsy id."""
+        kanban_instance = KanboardKanban(
+            {
+                "kanboard_url": "http://localhost:8080/jsonrpc.php",
+                "kanboard_api_token": "test-token",
+                "kanboard_project_id": 1,
+            }
+        )
+        kanban_instance._client = AsyncMock()
+        kanban_instance._client.post = AsyncMock(return_value=_rpc_response(False))
+        with pytest.raises(RuntimeError, match="createProject"):
+            await kanban_instance.create_project("Duplicate Name")
 
 
 # ---------------------------------------------------------------------------
@@ -2281,6 +2505,33 @@ class TestGetProjectName:
 
         assert first is None
         assert second == "Now Exists"
+
+
+class TestGetTasksForProject:
+    """Test get_tasks_for_project() — fetches every task (active + closed)
+    of a SPECIFIC project id, unlike get_all_tasks() which reads whatever
+    projects are in Marcus's configured scope. Used by the clone-project
+    feature to enumerate a baseline project's tickets regardless of
+    whether that project happens to be in scope."""
+
+    @pytest.mark.asyncio
+    async def test_returns_active_and_closed_tasks(self, kanban):
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response([]),  # getBoard-ish column load, if any
+                _rpc_response([_make_raw_task(task_id=1, project_id=7)]),
+                _rpc_response([_make_raw_task(task_id=2, project_id=7)]),
+            ]
+        )
+        result = await kanban.get_tasks_for_project(7)
+        ids = {t.id for t in result}
+        assert ids == {"1", "2"}
+
+    @pytest.mark.asyncio
+    async def test_raises_if_not_connected(self, kanban):
+        with pytest.raises(RuntimeError, match="connect()"):
+            await kanban.get_tasks_for_project(7)
 
 
 class TestGetProjectMetrics:

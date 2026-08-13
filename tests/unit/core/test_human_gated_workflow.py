@@ -2233,6 +2233,37 @@ class TestSyncMainBranchForProject:
 
 
 # ---------------------------------------------------------------------------
+# branch_manager_for_repo: public accessor over the private per-repo
+# BranchManager cache, used by ProjectCloneWorkflow to seed a cloned
+# in-flight ticket's branch without reaching into a private attribute.
+# ---------------------------------------------------------------------------
+
+
+class TestBranchManagerForRepo:
+    def test_none_repo_path_returns_injected_default(self, workflow, mock_branch):
+        result = workflow.branch_manager_for_repo(None)
+        assert result is mock_branch
+
+    def test_returns_a_manager_bound_to_repo_path(self, workflow):
+        result = workflow.branch_manager_for_repo("./data/repos/shopping-cart")
+        assert result.config.repo_path == "./data/repos/shopping-cart"
+
+    def test_same_repo_path_returns_cached_instance(self, workflow):
+        first = workflow.branch_manager_for_repo("./data/repos/shopping-cart")
+        second = workflow.branch_manager_for_repo("./data/repos/shopping-cart")
+        assert first is second
+
+    def test_delegates_to_branch_for_repo_path(self, workflow):
+        """Regression guard: must not duplicate the caching/config-copy
+        logic — route through the existing private helper."""
+        with patch.object(
+            workflow, "_branch_for_repo_path", wraps=workflow._branch_for_repo_path
+        ) as spy:
+            workflow.branch_manager_for_repo("./data/repos/shopping-cart")
+        spy.assert_called_once_with("./data/repos/shopping-cart")
+
+
+# ---------------------------------------------------------------------------
 # get_project_description
 # ---------------------------------------------------------------------------
 

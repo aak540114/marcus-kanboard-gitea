@@ -31,6 +31,7 @@ import asyncio
 import logging
 import os
 import re
+import tempfile
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -358,6 +359,70 @@ class GiteaManager:
             ["git", "push", "-u", "origin", "main"], cwd=local_path
         )
         logger.info("Pushed initial commit to %s", clone_url)
+
+    async def mirror_clone(
+        self, source_clone_url: str, new_clone_url: str, local_path: str
+    ) -> None:
+        """Replicate a source repo's ENTIRE git history into a new repo.
+
+        Used by the clone-project feature so a cloned project's git
+        history is not limited to a single default branch the way
+        :meth:`init_with_readme` is — every branch and tag from
+        *source_clone_url* is preserved under its original name via a
+        ``git clone --mirror`` + ``git push --mirror`` round trip through
+        a throwaway bare directory.
+
+        A ``--mirror`` clone produces a bare repository, which
+        :class:`~src.core.git_branch_manager.BranchManager` cannot operate
+        on directly (it expects ``repo_path`` to already be a normal,
+        checked-out working tree — see that class's docstring). So after
+        the mirror push completes, this also performs a normal
+        (non-mirror) clone of the new repo into *local_path*, matching
+        the working-tree contract :meth:`init_with_readme` already
+        provides for a from-scratch repo.
+
+        Parameters
+        ----------
+        source_clone_url : str
+            Plain (unauthenticated) Gitea HTTP clone URL of the source
+            repo to replicate.
+        new_clone_url : str
+            Plain (unauthenticated) Gitea HTTP clone URL of the
+            destination repo (must already exist, e.g. via
+            :meth:`create_repo`).
+        local_path : str
+            Local directory for the new project's working clone. Created
+            if its parent is missing; must not already exist.
+
+        Raises
+        ------
+        RuntimeError
+            If any git command fails.
+        """
+        auth_source = _auth_clone_url(source_clone_url, self._username or "", self._token)
+        auth_dest = _auth_clone_url(new_clone_url, self._username or "", self._token)
+
+        with tempfile.TemporaryDirectory(prefix="marcus-mirror-") as scratch_dir:
+            mirror_dir = os.path.join(scratch_dir, "mirror.git")
+            await _run_git(
+                ["git", "clone", "--mirror", auth_source, mirror_dir],
+                cwd=scratch_dir,
+            )
+            await _run_git(["git", "push", "--mirror", auth_dest], cwd=mirror_dir)
+
+        os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+        await _run_git(
+            ["git", "clone", auth_dest, local_path],
+            cwd=os.path.dirname(local_path) or ".",
+        )
+        await _run_git(["git", "config", "user.email", "marcus@localhost"], cwd=local_path)
+        await _run_git(["git", "config", "user.name", "Marcus"], cwd=local_path)
+        logger.info(
+            "Mirror-cloned %s -> %s (local: %s)",
+            source_clone_url,
+            new_clone_url,
+            local_path,
+        )
 
 
 # ---------------------------------------------------------------------------

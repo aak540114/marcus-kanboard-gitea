@@ -14,6 +14,8 @@ import os
 import re
 import signal
 import sys
+import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -3577,6 +3579,169 @@ def _get_project_access_mgr(server: "MarcusServer") -> Any:
     return mgr
 
 
+def _get_project_desc_mgr(server: "MarcusServer") -> Any:
+    """Return the shared ProjectDescriptionManager singleton, once built.
+
+    Same reasoning as :func:`_get_gate_settings_mgr`: several existing
+    ``/project-description`` and ``/api/project-description`` route
+    handlers already lazily construct and cache one on
+    ``server._project_desc_mgr`` inline; this gives that same singleton
+    a named accessor for :func:`_build_clone_workflow` to use, without
+    constructing a second, divergent instance.
+
+    Parameters
+    ----------
+    server : MarcusServer
+        The running server instance.
+
+    Returns
+    -------
+    ProjectDescriptionManager
+        The shared project description manager.
+    """
+    from src.core.project_description import ProjectDescriptionManager
+
+    mgr = getattr(server, "_project_desc_mgr", None)
+    if mgr is None:
+        mgr = ProjectDescriptionManager()
+        server._project_desc_mgr = mgr  # type: ignore[attr-defined]
+    return mgr
+
+
+@dataclass
+class CloneJob:
+    """In-memory progress record for one "clone this project" run.
+
+    Not persisted to disk — a clone job is a short-lived, one-shot
+    background task. If Marcus restarts mid-clone the job's tracked
+    status is simply lost; the partially-created Kanboard project itself
+    is unaffected (see :mod:`src.workflows.project_clone_workflow`'s
+    best-effort, no-rollback philosophy) and still usable, just without
+    a way to poll that specific run's outcome after the restart.
+
+    Parameters
+    ----------
+    job_id : str
+        Opaque id returned to the client, used to poll status.
+    baseline_project_id : int
+        The project being cloned.
+    new_name : str
+        Name requested for the new project.
+    status : str
+        One of ``"running"``, ``"done"``, ``"failed"``.
+    new_project_id : Optional[int]
+        Set once the new Kanboard project is created (as soon as
+        ``status`` is ``"done"``, or earlier — see
+        :func:`_build_clone_workflow`'s caller).
+    warnings : List[str]
+        Non-fatal issues from :class:`~src.workflows.
+        project_clone_workflow.CloneResult`, once ``status`` is ``"done"``.
+    error : Optional[str]
+        Set when ``status`` is ``"failed"``.
+    """
+
+    job_id: str
+    baseline_project_id: int
+    new_name: str
+    status: str = "running"
+    new_project_id: Optional[int] = None
+    warnings: List[str] = field(default_factory=list)
+    error: Optional[str] = None
+
+
+class CloneJobStore:
+    """In-memory registry of :class:`CloneJob` records, keyed by job id."""
+
+    def __init__(self) -> None:
+        self._jobs: Dict[str, CloneJob] = {}
+
+    def create(self, baseline_project_id: int, new_name: str) -> CloneJob:
+        """Create and register a new job in ``"running"`` state."""
+        job = CloneJob(
+            job_id=str(uuid.uuid4()),
+            baseline_project_id=baseline_project_id,
+            new_name=new_name,
+        )
+        self._jobs[job.job_id] = job
+        return job
+
+    def get(self, job_id: str) -> Optional[CloneJob]:
+        """Return the job for *job_id*, or ``None`` if unknown."""
+        return self._jobs.get(job_id)
+
+
+def _get_clone_job_store(server: "MarcusServer") -> CloneJobStore:
+    """Return the shared CloneJobStore singleton, constructing it once.
+
+    Must be the SAME instance across the POST (create job) and GET (poll
+    status) routes — a per-request instance would never see a job created
+    by an earlier request. Same reasoning as :func:`_get_gate_settings_mgr`.
+
+    Parameters
+    ----------
+    server : MarcusServer
+        The running server instance.
+
+    Returns
+    -------
+    CloneJobStore
+        The shared clone job store.
+    """
+    store = getattr(server, "_clone_job_store", None)
+    if store is None:
+        store = CloneJobStore()
+        server._clone_job_store = store  # type: ignore[attr-defined]
+    return store
+
+
+def _build_clone_workflow(server: "MarcusServer") -> Optional[Any]:
+    """Construct a ``ProjectCloneWorkflow`` from the server's shared
+    singletons, or ``None`` if its prerequisites aren't wired.
+
+    Reuses the SAME kanban client, lifecycle manager, project sync
+    workflow, and settings managers every other route/workflow already
+    shares (see :func:`_get_gate_settings_mgr`'s docstring for why a
+    second, divergent instance of any of these would be a real bug) —
+    never constructs a parallel instance of anything with its own cached
+    state.
+
+    Parameters
+    ----------
+    server : MarcusServer
+        The running server instance.
+
+    Returns
+    -------
+    Optional[ProjectCloneWorkflow]
+        ``None`` when Kanboard and/or ``HumanGatedWorkflow``/
+        ``ProjectSyncWorkflow`` aren't configured — the clone-project
+        feature has nothing to operate on in that case.
+    """
+    from src.workflows.project_clone_workflow import ProjectCloneWorkflow
+
+    human_gated_workflow = getattr(server, "_human_gated_workflow", None)
+    project_sync = getattr(server, "_project_sync", None)
+    lifecycle = getattr(human_gated_workflow, "_lifecycle", None)
+    if (
+        server.kanban_client is None
+        or human_gated_workflow is None
+        or project_sync is None
+        or lifecycle is None
+    ):
+        return None
+
+    return ProjectCloneWorkflow(
+        kanban=server.kanban_client,
+        lifecycle=lifecycle,
+        human_gated_workflow=human_gated_workflow,
+        project_sync=project_sync,
+        gate_settings=_get_gate_settings_mgr(server),
+        project_access=_get_project_access_mgr(server),
+        project_description=_get_project_desc_mgr(server),
+        provider=server.provider,
+    )
+
+
 def _resolve_ticket_branch(server: "MarcusServer", ticket_id: str, provider: str) -> str:
     """Return a ticket's real persisted branch name, falling back to convention.
 
@@ -5739,6 +5904,131 @@ function save() {{
                 )
             )
 
+        async def clone_project_api(request: Request) -> JSONResponse:
+            """POST: start cloning a baseline project under a new name.
+
+            Body (JSON): ``{"baseline_project_id": int, "new_name": str}``
+
+            Returns immediately with ``{"job_id": str}`` — the clone runs
+            in the background (mirror-cloning a git repo and recreating
+            every ticket can take a while; see
+            :class:`~src.workflows.project_clone_workflow.
+            ProjectCloneWorkflow`). Poll ``/api/clone-project-status?
+            job_id=...`` for progress/result.
+            """
+            def _cors(r: JSONResponse) -> JSONResponse:
+                r.headers["Access-Control-Allow-Origin"] = "*"
+                r.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+                return r
+
+            if request.method == "OPTIONS":
+                return _cors(JSONResponse({}))
+
+            try:
+                body = await request.json()
+            except Exception:
+                return _cors(
+                    JSONResponse({"error": "invalid JSON"}, status_code=400)
+                )
+            if not isinstance(body, dict):
+                return _cors(
+                    JSONResponse({"error": "JSON object required"}, status_code=400)
+                )
+
+            baseline_id_raw = body.get("baseline_project_id")
+            new_name_raw = body.get("new_name")
+            if (
+                not isinstance(baseline_id_raw, int)
+                or isinstance(baseline_id_raw, bool)
+                or not isinstance(new_name_raw, str)
+                or not new_name_raw.strip()
+            ):
+                return _cors(
+                    JSONResponse(
+                        {
+                            "error": "baseline_project_id (int) and new_name "
+                            "(non-empty str) are required"
+                        },
+                        status_code=400,
+                    )
+                )
+            new_name = new_name_raw.strip()
+
+            clone_workflow = _build_clone_workflow(server)
+            if clone_workflow is None:
+                return _cors(
+                    JSONResponse(
+                        {
+                            "error": "Clone-project feature is not available "
+                            "(Kanboard/project sync is not configured)"
+                        },
+                        status_code=503,
+                    )
+                )
+
+            job_store = _get_clone_job_store(server)
+            job = job_store.create(baseline_id_raw, new_name)
+
+            async def _run_clone() -> None:
+                try:
+                    result = await clone_workflow.clone_project(
+                        baseline_id_raw, new_name
+                    )
+                    job.new_project_id = result.new_project_id
+                    job.warnings = result.warnings
+                    job.status = "done"
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "clone_project(%d -> %r) failed: %s",
+                        baseline_id_raw,
+                        new_name,
+                        exc,
+                    )
+                    job.error = str(exc)
+                    job.status = "failed"
+
+            asyncio.create_task(_run_clone())
+
+            return _cors(JSONResponse({"job_id": job.job_id}))
+
+        async def clone_project_status_api(request: Request) -> JSONResponse:
+            """GET /api/clone-project-status?job_id=... — poll a clone job.
+
+            Returns: ``{"job_id", "status", "new_project_id", "warnings",
+            "error"}`` — ``status`` is one of ``"running"``/``"done"``/
+            ``"failed"``.
+            """
+            def _cors(r: JSONResponse) -> JSONResponse:
+                r.headers["Access-Control-Allow-Origin"] = "*"
+                return r
+
+            job_id = request.query_params.get("job_id", "").strip()
+            if not job_id:
+                return _cors(
+                    JSONResponse(
+                        {"error": "job_id query parameter is required"},
+                        status_code=400,
+                    )
+                )
+
+            job = _get_clone_job_store(server).get(job_id)
+            if job is None:
+                return _cors(
+                    JSONResponse({"error": "unknown job_id"}, status_code=404)
+                )
+
+            return _cors(
+                JSONResponse(
+                    {
+                        "job_id": job.job_id,
+                        "status": job.status,
+                        "new_project_id": job.new_project_id,
+                        "warnings": job.warnings,
+                        "error": job.error,
+                    }
+                )
+            )
+
         async def events_stream(request: Request) -> StreamingResponse:
             """Server-Sent Events stream that pushes a "refresh" the instant
             Marcus changes anything (a comment posted, a card moved, a state
@@ -5910,6 +6200,16 @@ function save() {{
                     "/api/project-enabled",
                     project_enabled_api,
                     methods=["GET", "PUT", "OPTIONS"],
+                ),
+                Route(
+                    "/api/clone-project",
+                    clone_project_api,
+                    methods=["POST", "OPTIONS"],
+                ),
+                Route(
+                    "/api/clone-project-status",
+                    clone_project_status_api,
+                    methods=["GET"],
                 ),
                 Route("/api/events/stream", events_stream, methods=["GET"]),
                 Route("/project-description", project_description_page, methods=["GET"]),

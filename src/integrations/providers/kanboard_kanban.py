@@ -407,6 +407,41 @@ class KanboardKanban(KanbanInterface):
                 tasks.append(self._to_task(raw))
         return tasks
 
+    async def get_tasks_for_project(self, project_id: int) -> List[Task]:
+        """
+        Fetch every task (active + closed) of a SPECIFIC project id.
+
+        Unlike :meth:`get_all_tasks` (which reads whichever projects are
+        in Marcus's configured scope — see :meth:`set_project_scope`),
+        this always reads exactly *project_id*, regardless of scope.
+        Used by the clone-project feature to enumerate a baseline
+        project's tickets even when that project isn't (or is no longer)
+        enabled for Marcus.
+
+        Parameters
+        ----------
+        project_id : int
+            Kanboard project ID.
+
+        Returns
+        -------
+        List[Task]
+            All tasks in the project, converted to Marcus ``Task``
+            objects.
+
+        Raises
+        ------
+        RuntimeError
+            If ``connect()`` has not been called first.
+        """
+        if self._client is None:
+            raise RuntimeError("Call connect() before get_tasks_for_project()")
+
+        await self._ensure_columns_loaded(project_id)
+        active = await self._rpc("getAllTasks", project_id=project_id, status_id=1)
+        closed = await self._rpc("getAllTasks", project_id=project_id, status_id=0)
+        return [self._to_task(raw) for raw in (active or []) + (closed or [])]
+
     async def get_available_tasks(self) -> List[Task]:
         """
         Return unassigned tasks in a TODO or READY column.
@@ -802,13 +837,7 @@ class KanboardKanban(KanbanInterface):
                 if present
                 else [t for t in current if t != _MERGE_CONFLICT_TAG]
             )
-            result = await self._rpc(
-                "setTaskTags",
-                project_id=project_id,
-                task_id=int(task_id),
-                tags=updated,
-            )
-            return bool(result)
+            return await self.set_task_tags(task_id, project_id=project_id, tags=updated)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "set_merge_conflict_flag(%s) failed for task %s: %s",
@@ -817,6 +846,46 @@ class KanboardKanban(KanbanInterface):
                 exc,
             )
             return False
+
+    async def set_task_tags(
+        self, task_id: str, *, project_id: int, tags: List[str]
+    ) -> bool:
+        """Replace a task's full tag list.
+
+        Kanboard's ``setTaskTags`` REPLACES the entire tag set rather
+        than adding to it (``TaskTagModel::save``'s
+        ``$remove_other_tags`` defaults to ``True``) — callers must pass
+        the complete desired list, not just an addition or removal (see
+        :meth:`set_merge_conflict_flag`, which builds that full list
+        before calling this). Exposed as a standalone public method
+        (rather than only the private call inside
+        ``set_merge_conflict_flag``) so the clone-project feature can
+        recreate a baseline ticket's exact tag list on its clone.
+
+        Parameters
+        ----------
+        task_id : str
+            Kanboard task ID.
+        project_id : int
+            The task's project id.
+        tags : List[str]
+            The complete desired tag list.
+
+        Returns
+        -------
+        bool
+            ``True`` on success, ``False`` on an RPC failure or falsy
+            result.
+        """
+        if self._client is None:
+            raise RuntimeError("Call connect() before set_task_tags()")
+        result = await self._rpc(
+            "setTaskTags",
+            project_id=project_id,
+            task_id=int(task_id),
+            tags=tags,
+        )
+        return bool(result)
 
     def _columns_for(self, project_id: int) -> Dict[str, int]:
         """Return the cached column-name→id map for a given project.
@@ -1338,17 +1407,96 @@ class KanboardKanban(KanbanInterface):
         if self._client is None:
             raise RuntimeError("Call connect() before get_task_links()")
         try:
-            # getAllTaskLinks is the real method name (Kanboard v1.2.52
-            # TaskLinkProcedure) — a previous "getTaskLinks" spelling does
-            # not exist in Kanboard's API, so every call hit the JSON-RPC
-            # "Method not found" error and this soft-fail path silently
-            # returned empty link data forever.
-            raw_links = await self._rpc("getAllTaskLinks", task_id=int(task_id))
+            raw_links = await self.get_raw_task_links(task_id)
         except Exception as exc:
             logger.warning("get_task_links failed for task %s: %s", task_id, exc)
             return empty
 
-        return classify_task_links(raw_links or [])
+        return classify_task_links(raw_links)
+
+    async def get_raw_task_links(self, task_id: str) -> List[Dict[str, Any]]:
+        """
+        Return this task's links, unclassified, straight from Kanboard.
+
+        Unlike :meth:`get_task_links` (which discards each raw row down
+        to just direction/task_id/title/column via
+        :func:`classify_task_links`), this returns Kanboard's full raw
+        rows — including any numeric link-type field a row carries —
+        needed by the clone-project feature to recreate a link with its
+        exact original type rather than a best-guess default.
+
+        Parameters
+        ----------
+        task_id : str
+            Kanboard task ID.
+
+        Returns
+        -------
+        List[Dict[str, Any]]
+            Raw link rows as returned by the API, or an empty list if the
+            task has no links.
+
+        Raises
+        ------
+        RuntimeError
+            If not connected.
+        Exception
+            Propagates any RPC failure — this is a low-level accessor;
+            callers that want a soft-fail-to-empty behavior should use
+            :meth:`get_task_links` instead.
+        """
+        if self._client is None:
+            raise RuntimeError("Call connect() before get_raw_task_links()")
+        # getAllTaskLinks is the real method name (Kanboard v1.2.52
+        # TaskLinkProcedure) — a previous "getTaskLinks" spelling does
+        # not exist in Kanboard's API, so every call hit the JSON-RPC
+        # "Method not found" error and a soft-fail path silently returned
+        # empty link data forever.
+        raw_links = await self._rpc("getAllTaskLinks", task_id=int(task_id))
+        return list(raw_links or [])
+
+    async def get_link_type_map(self) -> Dict[str, int]:
+        """
+        Return a best-effort ``label (lower-cased) -> numeric link_type
+        id`` map, built from Kanboard's ``getAllLinks`` metadata RPC.
+
+        Used by the clone-project feature to resolve the correct
+        ``link_type`` for :meth:`create_task_link` when recreating a
+        link whose raw row (see :meth:`get_raw_task_links`) has no
+        directly usable numeric type field. Whether ``getAllLinks``
+        exists on a given Kanboard version/build is not guaranteed, so
+        failures are swallowed and an empty map returned rather than
+        raised — callers should fall back to a sensible default (see
+        :func:`resolve_link_type`).
+
+        Returns
+        -------
+        Dict[str, int]
+            Empty if the RPC is unavailable, errors, or returns no data.
+        """
+        if self._client is None:
+            raise RuntimeError("Call connect() before get_link_type_map()")
+        try:
+            raw = await self._rpc("getAllLinks")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "getAllLinks unavailable — link-type map will be empty, "
+                "clone-project link recreation will fall back to defaults: %s",
+                exc,
+            )
+            return {}
+
+        result: Dict[str, int] = {}
+        for item in raw or []:
+            label = (item.get("label") or "").lower().strip()
+            link_id = item.get("id")
+            if not label or link_id is None:
+                continue
+            try:
+                result[label] = int(link_id)
+            except (TypeError, ValueError):
+                continue
+        return result
 
     async def get_project_metrics(self) -> Dict[str, Any]:
         """
@@ -1405,6 +1553,39 @@ class KanboardKanban(KanbanInterface):
         if pid == self._project_id:
             return self._project_name
         return self._project_names.get(pid, "")
+
+    async def create_project(self, name: str) -> int:
+        """Create a new Kanboard project and return its numeric id.
+
+        Used by the "clone this project" feature to create the
+        destination project before replicating a baseline project's
+        tickets into it.
+
+        Parameters
+        ----------
+        name : str
+            Name for the new project. Kanboard requires project names to
+            be unique; a duplicate name makes ``createProject`` fail.
+
+        Returns
+        -------
+        int
+            The newly created project's id.
+
+        Raises
+        ------
+        RuntimeError
+            If not connected, or if ``createProject`` returns a falsy
+            result (Kanboard's own ``ProjectModel::create`` returns
+            ``false`` on any failure step, e.g. a duplicate name).
+        """
+        if self._client is None:
+            raise RuntimeError("Call connect() before create_project()")
+
+        result = await self._rpc("createProject", name=name)
+        if not result:
+            raise RuntimeError(f"Kanboard createProject({name!r}) returned a falsy result")
+        return int(result)
 
     async def get_project_name(self, project_id: int) -> Optional[str]:
         """Return a Kanboard project's name by id.
@@ -2051,6 +2232,53 @@ def classify_task_links(
             relates_to.append(entry)
 
     return {"depends_on": depends_on, "blocks": blocks, "relates_to": relates_to}
+
+
+def resolve_link_type(raw_link: Dict[str, Any], label_map: Dict[str, int]) -> int:
+    """
+    Resolve the numeric ``link_type`` id to use when recreating *raw_link*
+    (a row from :meth:`KanboardKanban.get_raw_task_links`) on a cloned
+    project's tasks, via :meth:`KanboardKanban.create_task_link`.
+
+    Preference order:
+
+    1. The raw row's own ``link_id`` field, if present and numeric — this
+       is the exact type Kanboard used for this specific link
+       (``task_has_links.link_id``, a foreign key into the *global*
+       ``task_links`` type table shared by every project), so reusing it
+       verbatim is the most faithful option and needs no extra RPC call.
+    2. A lookup of the row's ``label`` text in *label_map* (built by
+       :meth:`KanboardKanban.get_link_type_map`).
+    3. ``6`` ("is a child of") — :meth:`KanboardKanban.create_task_link`'s
+       own default — when neither of the above resolves. This is a
+       documented, unavoidable best-effort fallback: without a live
+       Kanboard instance to confirm other default type ids (e.g. for
+       "blocks"/"is blocked by"), guessing one would risk silently
+       mislabeling the recreated link's direction.
+
+    Parameters
+    ----------
+    raw_link : Dict[str, Any]
+        One raw row from ``get_raw_task_links``.
+    label_map : Dict[str, int]
+        Label (lower-cased) -> numeric type id, from ``get_link_type_map``
+        (pass ``{}`` if that RPC was unavailable).
+
+    Returns
+    -------
+    int
+        The numeric link_type id to pass to ``create_task_link``.
+    """
+    raw_id = raw_link.get("link_id")
+    if raw_id is not None:
+        try:
+            return int(raw_id)
+        except (TypeError, ValueError):
+            pass
+    label = (raw_link.get("label") or "").lower().strip()
+    if label in label_map:
+        return label_map[label]
+    return 6
 
 
 def _parse_kanboard_ts(value: Any) -> Optional[datetime]:

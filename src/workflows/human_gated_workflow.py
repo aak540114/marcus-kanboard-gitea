@@ -3629,6 +3629,29 @@ class HumanGatedWorkflow:
         repo_path = mapping.get("local_repo_path") if mapping else None
         return self._branch_for_repo_path(repo_path)
 
+    def branch_manager_for_repo(self, repo_path: Optional[str]) -> BranchManager:
+        """Public accessor for the per-repo :class:`BranchManager` cache.
+
+        Thin wrapper over :meth:`_branch_for_repo_path`, exposed so
+        external callers (e.g. ``ProjectCloneWorkflow``, which needs to
+        seed a cloned in-flight ticket's branch from its baseline
+        ticket's branch) don't have to reach into a private attribute to
+        get the manager bound to a project's local clone.
+
+        Parameters
+        ----------
+        repo_path : Optional[str]
+            The project's local clone path (from a
+            :class:`~src.workflows.project_sync_workflow.ProjectSyncWorkflow`
+            mapping's ``local_repo_path``), or ``None``.
+
+        Returns
+        -------
+        BranchManager
+            See :meth:`_branch_for_repo_path`.
+        """
+        return self._branch_for_repo_path(repo_path)
+
     def _branch_for_repo_path(self, repo_path: Optional[str]) -> BranchManager:
         """Return a cached BranchManager bound to *repo_path*.
 

@@ -40,7 +40,7 @@ import asyncio
 import json
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from src.core.events import Events
 from src.integrations.gitea_manager import GiteaManager, _slugify
@@ -209,32 +209,7 @@ class ProjectSyncWorkflow:
                 )
                 return dict(cached)
 
-            slug = _slugify(project_name)
-            # Disambiguate before creating: create_repo() treats "repo already
-            # exists" as "already provisioned" and returns the existing repo's
-            # URL, so a slug collision with a DIFFERENT project ("My App" vs
-            # "my app!") would silently cross-wire both projects into one repo
-            # and one local clone — both projects' ticket branches merging
-            # into one main, with no error anywhere. An all-symbol name
-            # slugifies to "" and would permanently fail provisioning instead.
-            taken_slugs = {
-                os.path.basename(m.get("local_repo_path", ""))
-                for k, m in self._mapping.items()
-                if k != key
-            }
-            if not slug:
-                slug = f"project-{project_id}"
-            elif slug in taken_slugs:
-                logger.warning(
-                    "Project %d (%r) slugifies to %r, already used by another "
-                    "project — disambiguating to %r",
-                    project_id,
-                    project_name,
-                    slug,
-                    f"{slug}-p{project_id}",
-                )
-                slug = f"{slug}-p{project_id}"
-            local_path = os.path.join(self._local_repos_base, slug)
+            slug, local_path = self._resolve_slug_and_path(project_id, project_name)
 
             try:
                 # Pass the (possibly disambiguated) slug, not the raw name —
@@ -270,6 +245,143 @@ class ProjectSyncWorkflow:
                 local_path,
             )
             return dict(self._mapping[key])
+
+    async def ensure_repo_from_source(
+        self,
+        project_id: int,
+        project_name: str,
+        source_clone_url: str,
+        description: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """Return (creating if necessary) a new project's Gitea repo as a
+        full mirror clone of an existing (baseline) repo.
+
+        The "clone this project" feature's git-level counterpart to
+        :meth:`ensure_repo`: instead of seeding the new repo with a fresh
+        README, this replicates *source_clone_url*'s ENTIRE history —
+        every branch and tag, under their original names — via
+        :meth:`GiteaManager.mirror_clone`. Idempotent and lock-serialized
+        the same way as ``ensure_repo`` (see that method's docstring for
+        the races this closes), and shares its slug-disambiguation logic
+        via :meth:`_resolve_slug_and_path` so a cloned project's name
+        colliding with an existing project's slug can't cross-wire their
+        local clones either.
+
+        Parameters
+        ----------
+        project_id : int
+            The NEW Kanboard project's ID (not the baseline's).
+        project_name : str
+            Human-readable name for the new project (slugified for the
+            Gitea repo).
+        source_clone_url : str
+            Plain Gitea HTTP clone URL of the baseline project's repo to
+            replicate.
+        description : str
+            Optional description for the new Gitea repo.
+
+        Returns
+        -------
+        Optional[Dict[str, Any]]
+            The new project's repo mapping, or None if creation/mirroring
+            failed.
+        """
+        async with self._lock:
+            key = f"kanboard:{project_id}"
+            if key in self._mapping:
+                logger.debug(
+                    "Project %d already mapped — skipping clone", project_id
+                )
+                return dict(self._mapping[key])
+
+            slug, local_path = self._resolve_slug_and_path(project_id, project_name)
+
+            try:
+                clone_url = await self._gitea.create_repo(slug, description)
+                await self._gitea.mirror_clone(source_clone_url, clone_url, local_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Failed to clone Gitea repo for project %d (%s) from %s: %s",
+                    project_id,
+                    project_name,
+                    source_clone_url,
+                    exc,
+                )
+                return None
+
+            webhook_created = await self._ensure_webhook(slug)
+
+            self._mapping[key] = {
+                "kanboard_project_id": project_id,
+                "kanboard_project_name": project_name,
+                "repo_slug": slug,
+                "gitea_repo_url": clone_url,
+                "local_repo_path": local_path,
+                "webhook_created": webhook_created,
+            }
+            self._save_mapping()
+            logger.info(
+                "Project %d (%s) cloned from %s → Gitea %s (local: %s)",
+                project_id,
+                project_name,
+                source_clone_url,
+                clone_url,
+                local_path,
+            )
+            return dict(self._mapping[key])
+
+    def _resolve_slug_and_path(
+        self, project_id: int, project_name: str
+    ) -> Tuple[str, str]:
+        """Compute a disambiguated Gitea slug + local clone path for a
+        not-yet-provisioned project.
+
+        Shared by :meth:`ensure_repo` and :meth:`ensure_repo_from_source`
+        so both paths apply the identical collision-safety rule: two
+        Kanboard projects whose names slugify to the same string (e.g.
+        "My App" / "my app!") must never resolve to the same Gitea repo
+        or local clone — see :meth:`ensure_repo`'s docstring for why.
+
+        Parameters
+        ----------
+        project_id : int
+            The project's Kanboard ID.
+        project_name : str
+            Human-readable project name.
+
+        Returns
+        -------
+        Tuple[str, str]
+            ``(slug, local_path)``.
+        """
+        key = f"kanboard:{project_id}"
+        slug = _slugify(project_name)
+        # Disambiguate before creating: create_repo() treats "repo already
+        # exists" as "already provisioned" and returns the existing repo's
+        # URL, so a slug collision with a DIFFERENT project ("My App" vs
+        # "my app!") would silently cross-wire both projects into one repo
+        # and one local clone — both projects' ticket branches merging
+        # into one main, with no error anywhere. An all-symbol name
+        # slugifies to "" and would permanently fail provisioning instead.
+        taken_slugs = {
+            os.path.basename(m.get("local_repo_path", ""))
+            for k, m in self._mapping.items()
+            if k != key
+        }
+        if not slug:
+            slug = f"project-{project_id}"
+        elif slug in taken_slugs:
+            logger.warning(
+                "Project %d (%r) slugifies to %r, already used by another "
+                "project — disambiguating to %r",
+                project_id,
+                project_name,
+                slug,
+                f"{slug}-p{project_id}",
+            )
+            slug = f"{slug}-p{project_id}"
+        local_path = os.path.join(self._local_repos_base, slug)
+        return slug, local_path
 
     async def _ensure_webhook(self, slug: str) -> bool:
         """Create the push webhook for a repo, if configured.

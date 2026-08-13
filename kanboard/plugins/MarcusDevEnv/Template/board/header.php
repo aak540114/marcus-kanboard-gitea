@@ -64,6 +64,8 @@ $devEnvMainStopUrl = $marcusUrl . '/dev-env/main/stop'
 $devEnvMainStatusUrl = $marcusUrl . '/api/dev-env/main/status'
                   . '?project_id=' . urlencode((string) $projectId)
                   . '&provider='   . urlencode('kanboard');
+$cloneProjectUrl       = $marcusUrl . '/api/clone-project';
+$cloneProjectStatusUrl = $marcusUrl . '/api/clone-project-status';
 ?>
 <style>
 /* ── Active agents badge ──────────────────────────────────────────────── */
@@ -438,6 +440,16 @@ $devEnvMainStatusUrl = $marcusUrl . '/api/dev-env/main/status'
         <span style="font-size:12px;color:#aaa;">Checking main preview&hellip;</span>
     </span>
 
+    <!-- Clone this project -->
+    <span style="display:inline-flex;align-items:center;gap:6px;">
+        <button id="marcus-clone-project-btn" class="marcus-main-preview-btn start"
+                onclick="cloneThisProject()"
+                title="Create a new project under a new name that replicates every ticket, the project description, settings, and the git repository of this project">
+            &#128203; Clone this project
+        </button>
+        <span id="marcus-clone-status" style="font-size:11px;color:#6b7280;"></span>
+    </span>
+
 </div>
 
 <script>
@@ -453,6 +465,8 @@ $devEnvMainStatusUrl = $marcusUrl . '/api/dev-env/main/status'
     var DEV_ENV_MAIN_VIEW_URL   = <?= json_encode($devEnvMainViewUrl) ?>;
     var DEV_ENV_MAIN_STOP_URL   = <?= json_encode($devEnvMainStopUrl) ?>;
     var DEV_ENV_MAIN_STATUS_URL = <?= json_encode($devEnvMainStatusUrl) ?>;
+    var CLONE_PROJECT_URL        = <?= json_encode($cloneProjectUrl) ?>;
+    var CLONE_PROJECT_STATUS_URL = <?= json_encode($cloneProjectStatusUrl) ?>;
     var PROJECT_ID       = <?= json_encode((int) $projectId) ?>;
     var MARCUS_TOKEN     = <?= json_encode($marcusToken) ?>;
     var INTERVAL         = 15000;
@@ -985,5 +999,75 @@ $devEnvMainStatusUrl = $marcusUrl . '/api/dev-env/main/status'
             })
             .catch(function () { renderStopped(); });
     }());
+
+    /* ── Clone this project ──────────────────────────────────────────────
+       Creates a brand-new Kanboard project (+ Gitea repo) that replicates
+       every ticket (title, description, column, labels, links), the
+       project description, and gate/access settings of THIS project —
+       see src/workflows/project_clone_workflow.py. The clone runs in the
+       background on Marcus (it can take a while: mirror-cloning a git
+       repo and recreating every ticket), so the click starts a job and
+       this polls /api/clone-project-status instead of blocking. */
+    (function () {
+        var statusEl = document.getElementById('marcus-clone-status');
+        if (!PROJECT_ID || !statusEl) { return; }
+
+        // ~10 minutes of 2s polling before giving up on the POLL (not the
+        // clone itself, which keeps running server-side regardless).
+        var MAX_POLL_ATTEMPTS = 300;
+
+        function poll(jobId, attempt) {
+            fetch(CLONE_PROJECT_STATUS_URL + '?job_id=' + encodeURIComponent(jobId), {
+                cache: 'no-store', headers: marcusHeaders(),
+            })
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    if (data.status === 'running') {
+                        if (attempt >= MAX_POLL_ATTEMPTS) {
+                            statusEl.textContent = 'Still cloning… check back later.';
+                            return;
+                        }
+                        setTimeout(function () { poll(jobId, attempt + 1); }, 2000);
+                        return;
+                    }
+                    if (data.status === 'done') {
+                        var warnCount = (data.warnings || []).length;
+                        statusEl.textContent = 'Clone complete (project #' + mEsc(data.new_project_id) + ')'
+                            + (warnCount ? ' — ' + warnCount + ' warning(s), see Marcus logs' : '') + '.';
+                        return;
+                    }
+                    statusEl.textContent = 'Clone failed: ' + mEsc(data.error || 'unknown error');
+                })
+                .catch(function () {
+                    statusEl.textContent = 'Lost contact with Marcus while cloning — it may still finish in the background.';
+                });
+        }
+
+        window.cloneThisProject = function () {
+            var name = window.prompt('Name for the cloned project:');
+            if (!name) { return; }
+            name = name.trim();
+            if (!name) { return; }
+
+            statusEl.textContent = 'Starting clone…';
+            fetch(CLONE_PROJECT_URL, {
+                method: 'POST',
+                headers: marcusHeaders({ 'Content-Type': 'application/json' }),
+                body: JSON.stringify({ baseline_project_id: PROJECT_ID, new_name: name }),
+            })
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    if (!data.job_id) {
+                        statusEl.textContent = 'Could not start clone: ' + mEsc(data.error || 'unknown error');
+                        return;
+                    }
+                    statusEl.textContent = 'Cloning…';
+                    poll(data.job_id, 0);
+                })
+                .catch(function () {
+                    statusEl.textContent = 'Could not reach Marcus to start the clone.';
+                });
+        };
+    })();
 }());
 </script>

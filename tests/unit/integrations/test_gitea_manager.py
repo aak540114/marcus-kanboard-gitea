@@ -539,3 +539,123 @@ class TestInitWithReadme:
         assert set_url[-1] == "http://root:tok@localhost:3000/root/my-app.git"
         # And the push is finally reached.
         assert ["git", "push", "-u", "origin", "main"] in run_calls
+
+
+class TestMirrorClone:
+    """Test mirror_clone() — used by the clone-project feature to
+    replicate a baseline project's ENTIRE git history (every branch and
+    tag, under their original names) into a brand-new Gitea repo."""
+
+    @pytest.mark.asyncio
+    async def test_mirror_clones_source_then_mirror_pushes_to_dest(self, tmp_path):
+        mgr = GiteaManager("http://localhost:3000", "tok")
+        mgr._username = "root"
+
+        run_calls = []
+
+        async def fake_run_git(args, cwd):
+            run_calls.append((tuple(args), cwd))
+
+        local_path = str(tmp_path / "cloned-app")
+        with patch(
+            "src.integrations.gitea_manager._run_git", side_effect=fake_run_git
+        ):
+            await mgr.mirror_clone(
+                "http://localhost:3000/root/orig-app.git",
+                "http://localhost:3000/root/cloned-app.git",
+                local_path,
+            )
+
+        args_only = [c[0] for c in run_calls]
+        mirror_clone_call = next(
+            c for c in args_only if c[:3] == ("git", "clone", "--mirror")
+        )
+        assert mirror_clone_call[3] == "http://root:tok@localhost:3000/root/orig-app.git"
+
+        mirror_push_call = next(
+            c for c in args_only if c[:3] == ("git", "push", "--mirror")
+        )
+        assert (
+            mirror_push_call[3]
+            == "http://root:tok@localhost:3000/root/cloned-app.git"
+        )
+        # The mirror push must run inside the just-cloned bare mirror dir,
+        # not the eventual working-tree local_path.
+        push_cwd = next(cwd for (a, cwd) in run_calls if a[:3] == ("git", "push", "--mirror"))
+        assert push_cwd == mirror_clone_call[4]
+
+        # Order: mirror clone before mirror push, before the final
+        # normal working-tree clone at local_path.
+        working_clone_call = next(
+            c
+            for c in args_only
+            if c[:2] == ("git", "clone") and c[2] != "--mirror"
+        )
+        assert working_clone_call[2] == (
+            "http://root:tok@localhost:3000/root/cloned-app.git"
+        )
+        assert working_clone_call[3] == local_path
+        assert args_only.index(mirror_clone_call) < args_only.index(mirror_push_call)
+        assert args_only.index(mirror_push_call) < args_only.index(working_clone_call)
+
+    @pytest.mark.asyncio
+    async def test_configures_git_identity_on_working_clone(self, tmp_path):
+        mgr = GiteaManager("http://localhost:3000", "tok")
+        mgr._username = "root"
+        run_calls = []
+
+        async def fake_run_git(args, cwd):
+            run_calls.append(tuple(args))
+
+        local_path = str(tmp_path / "cloned-app")
+        with patch(
+            "src.integrations.gitea_manager._run_git", side_effect=fake_run_git
+        ):
+            await mgr.mirror_clone(
+                "http://localhost:3000/root/orig-app.git",
+                "http://localhost:3000/root/cloned-app.git",
+                local_path,
+            )
+
+        assert ("git", "config", "user.email", "marcus@localhost") in run_calls
+        assert ("git", "config", "user.name", "Marcus") in run_calls
+
+    @pytest.mark.asyncio
+    async def test_raises_when_mirror_clone_fails(self, tmp_path):
+        mgr = GiteaManager("http://localhost:3000", "tok")
+        mgr._username = "root"
+
+        async def fake_run_git(args, cwd):
+            if args[:3] == ["git", "clone", "--mirror"]:
+                raise RuntimeError("fatal: repository not found")
+
+        local_path = str(tmp_path / "cloned-app")
+        with patch(
+            "src.integrations.gitea_manager._run_git", side_effect=fake_run_git
+        ):
+            with pytest.raises(RuntimeError, match="repository not found"):
+                await mgr.mirror_clone(
+                    "http://localhost:3000/root/orig-app.git",
+                    "http://localhost:3000/root/cloned-app.git",
+                    local_path,
+                )
+
+    @pytest.mark.asyncio
+    async def test_raises_when_mirror_push_fails(self, tmp_path):
+        mgr = GiteaManager("http://localhost:3000", "tok")
+        mgr._username = "root"
+
+        async def fake_run_git(args, cwd):
+            if args[:3] == ["git", "push", "--mirror"]:
+                raise RuntimeError("fatal: repository not found")
+
+        local_path = str(tmp_path / "cloned-app")
+        with patch(
+            "src.integrations.gitea_manager._run_git", side_effect=fake_run_git
+        ):
+            with pytest.raises(RuntimeError, match="repository not found"):
+                await mgr.mirror_clone(
+                    "http://localhost:3000/root/orig-app.git",
+                    "http://localhost:3000/root/cloned-app.git",
+                    local_path,
+                )

@@ -33,6 +33,7 @@ def gitea_mgr():
     mgr = MagicMock()
     mgr.create_repo = AsyncMock(return_value="http://localhost:3000/root/shopping-cart.git")
     mgr.init_with_readme = AsyncMock(return_value=None)
+    mgr.mirror_clone = AsyncMock(return_value=None)
     return mgr
 
 
@@ -150,6 +151,98 @@ class TestEnsureRepo:
         # the non-colliding case and REQUIRED for the colliding one.
         gitea_mgr.create_repo.assert_called_once_with("shopping-cart", "desc")
         assert workflow.get_repo_for_project(1) is not None
+
+
+class TestEnsureRepoFromSource:
+    """Test ensure_repo_from_source() — creates a new project's Gitea
+    repo as a full mirror clone of an existing (baseline) repo, used by
+    the clone-project feature."""
+
+    @pytest.mark.asyncio
+    async def test_creates_repo_and_mirror_clones_from_source(
+        self, workflow, gitea_mgr
+    ):
+        mapping = await workflow.ensure_repo_from_source(
+            2, "Cloned App", "http://localhost:3000/root/orig-app.git", "desc"
+        )
+
+        gitea_mgr.create_repo.assert_called_once_with("cloned-app", "desc")
+        gitea_mgr.mirror_clone.assert_called_once()
+        call_args = gitea_mgr.mirror_clone.call_args.args
+        assert call_args[0] == "http://localhost:3000/root/orig-app.git"
+        assert call_args[1] == "http://localhost:3000/root/shopping-cart.git"
+        assert call_args[2].endswith("cloned-app")
+        assert mapping is not None
+        assert mapping["gitea_repo_url"] == "http://localhost:3000/root/shopping-cart.git"
+        assert mapping["local_repo_path"].endswith("cloned-app")
+        assert mapping["local_repo_path"] == call_args[2]
+
+    @pytest.mark.asyncio
+    async def test_persists_mapping_to_disk(self, workflow, tmp_path):
+        await workflow.ensure_repo_from_source(
+            2, "Cloned App", "http://localhost:3000/root/orig-app.git"
+        )
+
+        raw = json.loads((tmp_path / "project_repos.json").read_text())
+        assert raw["kanboard:2"]["gitea_repo_url"] == (
+            "http://localhost:3000/root/shopping-cart.git"
+        )
+
+    @pytest.mark.asyncio
+    async def test_second_call_is_idempotent(self, workflow, gitea_mgr):
+        first = await workflow.ensure_repo_from_source(
+            2, "Cloned App", "http://localhost:3000/root/orig-app.git"
+        )
+        gitea_mgr.create_repo.reset_mock()
+        gitea_mgr.mirror_clone.reset_mock()
+
+        second = await workflow.ensure_repo_from_source(
+            2, "Cloned App", "http://localhost:3000/root/orig-app.git"
+        )
+
+        gitea_mgr.create_repo.assert_not_called()
+        gitea_mgr.mirror_clone.assert_not_called()
+        assert second == first
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_create_repo_failure(self, workflow, gitea_mgr):
+        gitea_mgr.create_repo = AsyncMock(side_effect=RuntimeError("Gitea unreachable"))
+
+        result = await workflow.ensure_repo_from_source(
+            2, "Cloned App", "http://localhost:3000/root/orig-app.git"
+        )
+
+        assert result is None
+        assert workflow.get_repo_for_project(2) is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_mirror_clone_failure(self, workflow, gitea_mgr):
+        gitea_mgr.mirror_clone = AsyncMock(side_effect=RuntimeError("push failed"))
+
+        result = await workflow.ensure_repo_from_source(
+            2, "Cloned App", "http://localhost:3000/root/orig-app.git"
+        )
+
+        assert result is None
+        assert workflow.get_repo_for_project(2) is None
+
+    @pytest.mark.asyncio
+    async def test_colliding_slug_gets_disambiguated(self, workflow, gitea_mgr):
+        """Cloning under a name that collides with an existing project's
+        slug must not cross-wire the two projects' local clones — same
+        disambiguation guarantee as ensure_repo()."""
+        gitea_mgr.create_webhook = AsyncMock(return_value=True)
+        await workflow.ensure_repo(1, "My App")
+
+        await workflow.ensure_repo_from_source(
+            2, "my app!", "http://localhost:3000/root/orig-app.git"
+        )
+
+        second_repo_name = gitea_mgr.create_repo.call_args_list[1].args[0]
+        assert second_repo_name == "my-app-p2"
+        first = workflow.get_repo_for_project(1)
+        second = workflow.get_repo_for_project(2)
+        assert first["local_repo_path"] != second["local_repo_path"]
 
 
 class TestSlugDisambiguation:
