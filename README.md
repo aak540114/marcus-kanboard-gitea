@@ -28,7 +28,10 @@ A production deployment of **[Marcus](https://github.com/lwgray/marcus)** — th
 | **Project Description system** | Per-project markdown doc (tech stack, architecture notes) AI agents read via `get_project_description`. Marcus **infers** it from the ticket when it's missing — instead of blocking the ticket on a human — and agents can refine it via `update_project_description`. A human's edit always wins and is never overwritten. Editable from the board. |
 | **Enriched ticket context** | `get_work_context` — the first call every agent makes — also returns labels, dependency links (`depends_on`/`blocks`/`relates_to`), and the ticket's last 10 comments, so a human's reply to a paused ticket is actually visible to the agent |
 | **Human Gate / AI Gate toggle** | Per-project and per-ticket control over whether humans review AI work before it merges |
-| **AI Verify** | Configurable N-round LLM code review before any AI-gate merge; each round posts a comment with findings; agent fixes issues between rounds; 0 rounds = disabled |
+| **Manual-testing instructions** | The "Ready for Review" comment posted when a Human Gate ticket reaches **Waiting for Human** includes an LLM-authored, ticket-specific "How to test this" checklist — concrete steps to exercise the change in the live preview (e.g. "open the Checkout page, confirm the Submit button now renders green"), not just a generic AC checklist. Falls back to a heuristic built from the acceptance criteria when no LLM is configured. |
+| **AI Verify** | Configurable N-round LLM code review before any AI-gate merge; each round posts a comment enumerating every finding verbatim; agent fixes issues between rounds; 0 rounds = disabled |
+| **Clone this project** | A **"📋 Clone this project"** button in every board header creates a brand-new Kanboard project + Gitea repo that replicates a baseline project's entire visible state — every ticket (title, description, column, labels, links), the project description, gate/access/decompose settings, and the full git history (every branch, via a mirror clone) — under a human-supplied new name. The clone is fully isolated from the baseline the moment it's created. See [Cloning a project](#cloning-a-project). |
+| **Project stats** | A **"📊 Project Stats"** board-header link opens a per-project page tracking tickets moved into **Done** and **Waiting for Human** per hour (starting from each column's first-ever move), an hours-vs-tickets chart, and the repository's total line count on `main`, kept current on every Done move. See [Project stats](#project-stats). |
 | **Claude subscription provider** | Marcus's own planner calls (decomposition, dependency inference, effort estimation) can run through a locally logged-in `claude` CLI instead of a metered API key — see [AI provider](#ai-provider). No `CLAUDE_API_KEY` prompt during setup. |
 | **Remote agents + auth** | Opt in during setup to let AI agents on other machines connect; access is gated by a bearer token so unaccounted agents are rejected, with optional built-in HTTPS — see [Authenticating remote agents](#authenticating-remote-agents). |
 | **Remote Kanboard access for humans** | The same setup opt-in also makes Kanboard's UI reachable remotely — its `admin`/`admin` login is replaced with a generated account first, since Kanboard's API can't rotate an existing password — see [Network access](#network-access). |
@@ -60,7 +63,9 @@ The plugin ships in `kanboard/plugins/MarcusDevEnv/` and is automatically active
 | **Agent presence badge** | Two live counts: **connected** (agents polling Marcus for work every ~10 s, counted even when idle) and **working** (agents actively working a claimed ticket — a strict subset). Hover to see each claimed ticket, its agent, and that agent's reported subscription usage. Updates every 15 s. |
 | **Actively-worked card highlight** | Cards an AI agent is working **right now** get a pulsing golden ring. It's driven by a *liveness* signal — the agent reported progress within the last ~40 s — **not** by ticket state/column, so a state-management bug that leaves a card stuck can't make the ring lie. It clears the moment the agent stops (finished, handed off, blocked, or went silent). Re-applied after Kanboard's own board redraws, so it never gets lost. |
 | **Project Description button** | Opens the Marcus-served project description page for this project — the AI agents' shared source of truth for language, framework, and architecture. |
+| **Project Stats button** | Opens the Marcus-served [project stats](#project-stats) page — tickets/hour into Done and Waiting for Human, plus the repo's total line count on `main`. |
 | **Repository button** | Links to this project's Gitea repository (opens in a new tab). Appears once the repo has been provisioned. |
+| **Clone this project button** | Prompts for a new project name, then creates a full, isolated copy of this project (tickets, settings, description, git history) under that name. See [Cloning a project](#cloning-a-project). |
 | **Human Gate / AI Gate toggle** | Sets the project-level gate mode. Human Gate (default): AI pauses for human review before done. AI Gate: AI merges and closes autonomously. |
 | **Decompose ON/OFF toggle** | Separate from the Marcus ON/OFF switch above — controls only whether Marcus may auto-split a large ticket into sub-tickets (or honor `@marcus decompose`) in this project. Defaults **ON**. |
 | **AI Verify counter** | Appears when AI Gate is active. `[−] N [+]` sets how many sequential LLM review rounds run before the branch auto-merges. 0 = disabled. |
@@ -394,7 +399,11 @@ AI agent works on the branch (its own clone)
 
   Human Gate (default):
     → Ticket moves to "Waiting for Human"
-    → Human reviews branch + live preview
+    → Marcus posts a "Ready for Review" comment: AC checklist, preview
+      link, and a "How to test this" step-by-step walkthrough tailored
+      to what THIS ticket actually changed (LLM-authored from the
+      branch diff; falls back to the AC checklist without an LLM)
+    → Human reviews branch + live preview, following those steps
     → Approve: drag the card to "Done" OR comment "@marcus approve"
       (plain "approve"/"lgtm" works too) → Marcus fetches the agent's
       pushed branch and merges it to main
@@ -416,6 +425,24 @@ AI agent works on the branch (its own clone)
               next signal_ready → merges with no further verification
     (LLM errors are fail-open: merge proceeds; kanban errors are fail-safe: default to 1 round)
 ```
+
+---
+
+## Cloning a project
+
+Every board header has a **"📋 Clone this project"** button. Click it, type a new project name, and Marcus creates a brand-new Kanboard project + Gitea repo that replicates the baseline project's entire visible state — under that new name, in the background (the click starts a job and polls for its result, since a large project can take a while to clone).
+
+**What gets copied:**
+- Every ticket — title, description, column/status, labels, and dependency/relation links between cloned tickets — recreated as brand-new tickets on the new project's board, not references to the originals.
+- The project description document, including whether a human has locked it against automated updates.
+- Gate mode, AI Verify round count, decompose-enabled, and the Marcus ON/OFF access setting — each copied only if the baseline has an explicit value; an unconfigured baseline setting means the clone also falls back to Marcus's hard default, not a frozen copy of it.
+- The git repository — every branch, under its original name, via a full mirror clone (not just `main`). A ticket that was in progress on the baseline gets its clone's branch seeded from the baseline ticket's branch, so an agent can resume exactly where the original left off, and the clone's lifecycle state (Ready / In Progress / Blocked / Waiting for Human / Done) mirrors the baseline ticket's state at clone time.
+
+**What starts fresh, not copied:** the new project's [Project Stats](#project-stats) (ticket-movement history, line-of-code count) and Marcus cost-tracking data — a clone's own history starts the moment its own tickets start moving, not backdated from the baseline's.
+
+**Isolation.** The moment a clone is created, it is completely independent of its baseline — a separate Kanboard project, a separate Gitea repository, separate settings entries, separate lifecycle records for every ticket. Changing the baseline's gate mode, editing its description, or moving one of its tickets afterward never touches the clone, and vice versa. This is verified directly: `tests/unit/workflows/test_project_clone_isolation.py` wires the clone workflow against the same real settings/lifecycle stores Marcus runs in production and asserts each direction explicitly.
+
+Triggered via `POST /api/clone-project` (`{"baseline_project_id": int, "new_name": str}` → `{"job_id": str}`) and polled via `GET /api/clone-project-status?job_id=<id>` — see [HTTP endpoints](#http-endpoints).
 
 ---
 
@@ -453,6 +480,22 @@ AI Verify adds an independent LLM code-review step to the AI Gate auto-merge pat
 
 ---
 
+## Project stats
+
+Every board header links to a **"📊 Project Stats"** page (`/project-stats?project_id=<id>`) tracking three things per project, refreshed automatically every 30s:
+
+| Stat | Tracked from |
+|---|---|
+| **Tickets moved to Done, per hour** | Every real move into the Done column, deduplicated against the double-delivery that happens when both a Gitea/Kanboard webhook and the next board poll report the same transition. Tracking for a project starts the first time any of its tickets is ever moved to Done — there's no backfill before that. |
+| **Tickets moved to Waiting for Human, per hour** | Same tracking, for the Waiting for Human column. |
+| **Lines of code on `main`** | `git diff --shortstat` against the empty tree, on the project's Gitea repo — every tracked line counts as an "insertion" relative to nothing, and git itself excludes binary files from that count. Recomputed every time a ticket is freshly counted as moved to Done, so the figure is always current without polling git on every page load. |
+
+The page shows each stat's count for the current hour as a headline number, plus an hours-vs-tickets bar chart for Done and Waiting for Human — hours with zero movement are simply omitted (not shown as empty bars), and each bar is labeled with its actual date/time.
+
+Backed by `GET /api/project-stats?project_id=<id>` (see [HTTP endpoints](#http-endpoints)) and `src/core/project_stats.py`.
+
+---
+
 ## HTTP endpoints
 
 When `MARCUS_AGENT_TOKEN` is set (automatic once you allow remote access — see [Authenticating remote agents](#authenticating-remote-agents)), **every** endpoint below except `/webhooks/kanboard` and `/webhooks/gitea` requires an `Authorization: Bearer <token>` header and returns `401` without it. Those two webhook routes authenticate separately (their own `?token=` / HMAC signature). With no token set (localhost-only default), all endpoints are open.
@@ -483,6 +526,10 @@ When `MARCUS_AGENT_TOKEN` is set (automatic once you allow remote access — see
 | `/api/gate-setting/ticket` | PUT | Set per-ticket gate override (`human`\|`ai`\|`null`) and/or `verify_count` (int ≥ 0 or `null` to inherit) |
 | `/api/decompose-setting?project_id=<id>` | GET | Whether Marcus may auto-decompose large tickets in this project — `{"project_id": int, "decompose_enabled": bool}`. Default `true`. Project-scoped only, no per-ticket override |
 | `/api/decompose-setting` | PUT | Body `{"project_id": int, "decompose_enabled": bool}` — see [board header](#board-header) Decompose toggle |
+| `/project-stats?project_id=<id>` | GET | Human-readable [project stats](#project-stats) page — tickets/hour into Done and Waiting for Human, plus the repo's line count on `main` |
+| `/api/project-stats?project_id=<id>` | GET | JSON backing the stats page — `{"project_id", "loc_count", "done": {"last_hour", "hourly"}, "waiting_for_human": {"last_hour", "hourly"}}` |
+| `/api/clone-project` | POST | Body `{"baseline_project_id": int, "new_name": str}` — starts [cloning a project](#cloning-a-project) as a background job, returns `{"job_id": str}` immediately |
+| `/api/clone-project-status?job_id=<id>` | GET | Poll a clone job — `{"job_id", "status": "running"\|"done"\|"failed", "new_project_id", "warnings", "error"}` |
 
 ### Hot-reload dev environments
 
