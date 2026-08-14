@@ -383,6 +383,118 @@ class TestMergeFailureClearsCounter:
         assert any("rebase" in body.lower() for body in posted_bodies)
 
 
+class TestFindingsSummaryIncludedInComment:
+    """The whole point of AI Verify posting anything at all: whatever
+    gaps/bugs the verifier actually found must be summarized, verbatim,
+    in the ticket comment — not just a generic "issues found" header.
+    Every prior test in this file asserts the header text is present;
+    none of them assert the FINDING CONTENT itself made it into the
+    comment body, which is the part a human/agent actually needs to act
+    on."""
+
+    @pytest.mark.asyncio
+    async def test_single_finding_text_appears_verbatim_in_comment(self, workflow):
+        workflow._gate.set_project_gate(1, "ai")
+        workflow._gate.set_project_verify_count(1, 1)
+        workflow._verifier.verify = AsyncMock(
+            return_value=_fail_result(
+                ["Off-by-one error in the pagination loop at line 42"]
+            )
+        )
+
+        record = _make_record()
+        workflow._lifecycle.get_or_create("42", "kanboard")
+        workflow._lifecycle._records[("42", "kanboard")] = record
+
+        await workflow._autocomplete_ticket("42", record)
+
+        comment_body = workflow._kanban.add_comment.call_args[0][1]
+        assert (
+            "Off-by-one error in the pagination loop at line 42" in comment_body
+        )
+
+    @pytest.mark.asyncio
+    async def test_multiple_findings_all_appear_in_comment(self, workflow):
+        workflow._gate.set_project_gate(1, "ai")
+        workflow._gate.set_project_verify_count(1, 1)
+        findings = [
+            "Missing null check on the response payload",
+            "SQL query is vulnerable to injection via the search param",
+            "New endpoint has no test coverage",
+        ]
+        workflow._verifier.verify = AsyncMock(
+            return_value=_fail_result(list(findings))
+        )
+
+        record = _make_record()
+        workflow._lifecycle.get_or_create("42", "kanboard")
+        workflow._lifecycle._records[("42", "kanboard")] = record
+
+        await workflow._autocomplete_ticket("42", record)
+
+        comment_body = workflow._kanban.add_comment.call_args[0][1]
+        for finding in findings:
+            assert finding in comment_body
+
+    @pytest.mark.asyncio
+    async def test_findings_appear_on_the_final_round_failure_too(self, workflow):
+        """The last-round-failed comment variant (different wording/
+        action text) must still include the actual findings, not just
+        the "final round" framing."""
+        workflow._gate.set_project_gate(1, "ai")
+        workflow._gate.set_project_verify_count(1, 2)
+        workflow._verifier.verify = AsyncMock(
+            side_effect=[
+                _pass_result(),
+                _fail_result(["Race condition when two agents claim the same slot"]),
+            ]
+        )
+
+        record = _make_record()
+        workflow._lifecycle.get_or_create("42", "kanboard")
+        workflow._lifecycle._records[("42", "kanboard")] = record
+
+        await workflow._autocomplete_ticket("42", record)  # round 1: passes
+        workflow._kanban.add_comment.reset_mock()
+
+        await workflow._autocomplete_ticket("42", record)  # round 2 (last): fails
+
+        comment_body = workflow._kanban.add_comment.call_args[0][1]
+        assert (
+            "Race condition when two agents claim the same slot" in comment_body
+        )
+
+    @pytest.mark.asyncio
+    async def test_findings_survive_across_a_multi_round_fix_cycle(self, workflow):
+        """Round 1's findings must be distinguishable from round 2's —
+        each round's own comment carries only that round's findings, not
+        a stale carryover from a previous round."""
+        workflow._gate.set_project_gate(1, "ai")
+        workflow._gate.set_project_verify_count(1, 3)
+        workflow._verifier.verify = AsyncMock(
+            side_effect=[
+                _fail_result(["Round-one-only issue: unhandled exception"]),
+                _fail_result(["Round-two-only issue: leaked file handle"]),
+                _pass_result(),
+            ]
+        )
+
+        record = _make_record()
+        workflow._lifecycle.get_or_create("42", "kanboard")
+        workflow._lifecycle._records[("42", "kanboard")] = record
+
+        await workflow._autocomplete_ticket("42", record)  # round 1: fails
+        round1_body = workflow._kanban.add_comment.call_args[0][1]
+        assert "Round-one-only issue: unhandled exception" in round1_body
+        assert "Round-two-only issue" not in round1_body
+        workflow._kanban.add_comment.reset_mock()
+
+        await workflow._autocomplete_ticket("42", record)  # round 2: fails
+        round2_body = workflow._kanban.add_comment.call_args[0][1]
+        assert "Round-two-only issue: leaked file handle" in round2_body
+        assert "Round-one-only issue" not in round2_body
+
+
 class TestVerifierErrorFailsOpen:
     """An exception from the LLM verifier must not leave the ticket stuck."""
 
