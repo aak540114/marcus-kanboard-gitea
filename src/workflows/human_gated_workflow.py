@@ -1621,7 +1621,24 @@ class HumanGatedWorkflow:
                 if pid_raw:
                     parent_project_id = int(pid_raw)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("Decompose: could not fetch %s: %s", ticket_id, exc)
+            # Fail CLOSED, not open: every gate below is
+            # `if parent_project_id is not None and not <check>`, which a
+            # bare `parent_project_id = None` here would silently skip —
+            # bypassing both the project-enabled and decompose-enabled
+            # checks. Worse, create_task's payload then omits
+            # "project_id" entirely, so the provider falls back to its
+            # own DEFAULT configured project: a transient RPC blip while
+            # decomposing project B's ticket would silently create child
+            # tickets on project A's board instead. Abort rather than
+            # guess which project this ticket belongs to.
+            logger.warning(
+                "Decompose: could not resolve project for ticket %s (%s) — "
+                "aborting rather than risk creating sub-tickets on the "
+                "wrong project.",
+                ticket_id,
+                exc,
+            )
+            return []
 
         # Children inherit the parent's card color — the most visible way
         # to show "these belong together" on the board itself, since the
@@ -2020,13 +2037,23 @@ class HumanGatedWorkflow:
                         unassigned.append(f"#{rec.ticket_id}")
                 continue
             if rec.state == TicketState.WAITING_FOR_HUMAN:
-                paused.append(f"#{rec.ticket_id}")
+                # Same project-enablement check as every other branch here
+                # (unassigned-Ready above, by_project below) — a paused
+                # ticket in a project Marcus isn't enabled for is that
+                # project's state, not something to hand to an agent
+                # working a different (or no) project. Regression: this
+                # branch used to append unconditionally.
+                pid = await self._resolve_kanboard_project_id(rec.ticket_id)
+                if pid is None or self._project_access.is_enabled(pid):
+                    paused.append(f"#{rec.ticket_id}")
                 continue
             if rec.state == TicketState.BLOCKED:
-                blocked.append(
-                    f"#{rec.ticket_id} (blocked by "
-                    f"{rec.blocked_by or 'another ticket'})"
-                )
+                pid = await self._resolve_kanboard_project_id(rec.ticket_id)
+                if pid is None or self._project_access.is_enabled(pid):
+                    blocked.append(
+                        f"#{rec.ticket_id} (blocked by "
+                        f"{rec.blocked_by or 'another ticket'})"
+                    )
                 continue
             if rec.state not in (TicketState.READY, TicketState.IN_PROGRESS):
                 continue

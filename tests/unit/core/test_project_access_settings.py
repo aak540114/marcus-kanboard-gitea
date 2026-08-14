@@ -103,3 +103,45 @@ class TestEnabledProjectIds:
         mgr.set_project_enabled(8, True)
         mgr._data["projects"]["oops"] = {"enabled": True}
         assert mgr.enabled_project_ids() == [8]
+
+
+class TestSaveAtomicity:
+    """_save() used to write self._path directly — this ONE file is the
+    master allowlist for EVERY project. A process killed mid-write left
+    a truncated/invalid file; _load's broad except-and-reset-to-empty on
+    the next load would then silently disable every project Marcus was
+    enabled for, not just the one being changed — a crash while
+    disabling project B taking project A offline too."""
+
+    def test_failed_write_does_not_corrupt_existing_file(self, tmp_path):
+        mgr = ProjectAccessSettingManager(data_dir=tmp_path)
+        mgr.set_project_enabled(1, True)
+        original_content = (tmp_path / "project_access_settings.json").read_text()
+
+        mgr._data["projects"]["2"] = {"enabled": object()}
+        mgr._save()  # swallows the exception, logs an error
+
+        assert (
+            tmp_path / "project_access_settings.json"
+        ).read_text() == original_content
+        assert not (tmp_path / "project_access_settings.json.tmp").exists()
+
+    def test_successful_save_leaves_no_temp_file(self, tmp_path):
+        mgr = ProjectAccessSettingManager(data_dir=tmp_path)
+        mgr.set_project_enabled(1, True)
+
+        assert (tmp_path / "project_access_settings.json").exists()
+        assert not (tmp_path / "project_access_settings.json.tmp").exists()
+
+    def test_a_project_b_crash_does_not_disable_project_a(self, tmp_path):
+        """The concrete two-project failure scenario: a poisoned write
+        for project B must never be able to revert project A's
+        already-saved enabled state."""
+        mgr = ProjectAccessSettingManager(data_dir=tmp_path)
+        mgr.set_project_enabled(1, True)  # project A, saved successfully
+
+        mgr._data["projects"]["2"] = {"enabled": object()}  # unsavable
+        mgr._save()  # project B's poisoned write fails
+
+        reloaded = ProjectAccessSettingManager(data_dir=tmp_path)
+        assert reloaded.is_enabled(1) is True  # project A still enabled

@@ -1312,9 +1312,18 @@ def _resolve_project_for_cost(
     1. ``project_id`` explicitly in the tool arguments.
     2. ``agent_id`` → ``state.agent_project_map`` (set by register_agent).
     3. ``state.selected_project_id`` (the active project on the server).
-       **Skipped for tools in :data:`_PROJECT_CREATION_TOOLS`** so that
-       project-creation work isn't mis-attributed to the previously
-       active project.
+       **Skipped for tools in :data:`_PROJECT_CREATION_TOOLS`**, and
+       skipped whenever an ``agent_id`` was given but isn't (yet) in
+       ``agent_project_map``, so that work isn't mis-attributed to
+       whichever project happens to be active. Cross-project isolation:
+       with two projects enabled at once, an explicit ``agent_id`` names
+       a SPECIFIC agent working a SPECIFIC (possibly different) project —
+       guessing "the selected one" for it is the same failure class PR
+       #503 fixed for project-creation tools, just triggered by an
+       unmapped agent instead of a creation-tool name. A call with NO
+       ``agent_id`` at all (a system/server-level call) still falls back
+       to the selected project — there's no more specific candidate to
+       prefer there.
 
     Returns ``None`` when none of those resolve, in which case the
     recorder falls back to its ``'unassigned'`` bucket — visible in
@@ -1328,6 +1337,7 @@ def _resolve_project_for_cost(
         mapped = getattr(state, "agent_project_map", {}).get(agent_id)
         if mapped:
             return str(mapped)
+        return None
     if tool_name in _PROJECT_CREATION_TOOLS:
         return None
     selected = getattr(state, "selected_project_id", None) or getattr(

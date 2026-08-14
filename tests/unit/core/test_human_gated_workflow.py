@@ -3788,6 +3788,43 @@ class TestDecomposition:
         mock_kanban.create_task.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_aborts_when_parent_project_lookup_fails(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """Cross-project isolation regression: a TRANSIENT get_task_by_id
+        failure must abort decomposition entirely, not silently proceed
+        with parent_project_id=None.
+
+        Every downstream gate (project-enabled, decompose-enabled) is
+        `if parent_project_id is not None and not <check>` — skippable
+        by leaving parent_project_id at None. Before this fix, a
+        transient RPC blip during that one lookup bypassed BOTH gates
+        and, since create_task's payload then also had no "project_id"
+        key, silently created child tickets on the provider's DEFAULT
+        configured project instead of the parent's real one — project B's
+        ticket #100 decomposing onto project A's board during a hiccup.
+        """
+        self._big_ticket(lifecycle)
+        mock_project_access.is_enabled = MagicMock(return_value=True)
+        llm_called = {"yes": False}
+
+        async def fake_llm(prompt):
+            llm_called["yes"] = True
+            return '{"subtasks": []}'
+
+        workflow._llm_generate = fake_llm
+        mock_kanban.get_task_by_id = AsyncMock(
+            side_effect=RuntimeError("Kanboard database is locked")
+        )
+        mock_kanban.create_task = AsyncMock()
+
+        children = await workflow.decompose_ticket("100")
+
+        assert children == []
+        assert llm_called["yes"] is False
+        mock_kanban.create_task.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_refuses_to_write_children_disabled_during_the_llm_call(
         self, workflow, lifecycle, mock_kanban, mock_project_access
     ):
@@ -5782,6 +5819,91 @@ class TestProjectAccessGate:
         result = await workflow.orchestrate_work(agent_id="worker-G")
 
         assert "#40" not in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_withheld_reasons_hide_waiting_for_human_ticket_in_disabled_project(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """A ticket paused Waiting-for-Human in a project Marcus is NOT
+        enabled for must never be named to an agent — the disabled
+        project's ticket ids and comments-reference are that project's
+        state, not something a worker on a DIFFERENT project should see.
+
+        Regression: the WAITING_FOR_HUMAN and BLOCKED branches used to
+        append unconditionally, unlike every other branch in this
+        function, which all check project enablement first.
+        """
+        task = MagicMock()
+        task.source_context = {"kanboard_task": {"project_id": 9}}
+        mock_kanban.get_task_by_id = AsyncMock(return_value=task)
+        mock_project_access.is_enabled = MagicMock(return_value=False)
+        lifecycle.get_or_create("50", "kanboard")
+        lifecycle.transition("50", "kanboard", TicketState.READY)
+        lifecycle.transition("50", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("50", "kanboard", TicketState.WAITING_FOR_HUMAN)
+        lifecycle.set_assignee("50", "kanboard", "alice")
+
+        result = await workflow.orchestrate_work(agent_id="worker-H")
+
+        assert "#50" not in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_withheld_reasons_show_waiting_for_human_ticket_in_enabled_project(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """The same ticket in an ENABLED project is still reported —
+        confirms the fix doesn't just hide every paused ticket."""
+        task = MagicMock()
+        task.source_context = {"kanboard_task": {"project_id": 9}}
+        mock_kanban.get_task_by_id = AsyncMock(return_value=task)
+        mock_project_access.is_enabled = MagicMock(return_value=True)
+        lifecycle.get_or_create("51", "kanboard")
+        lifecycle.transition("51", "kanboard", TicketState.READY)
+        lifecycle.transition("51", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("51", "kanboard", TicketState.WAITING_FOR_HUMAN)
+        lifecycle.set_assignee("51", "kanboard", "alice")
+
+        result = await workflow.orchestrate_work(agent_id="worker-I")
+
+        assert "#51" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_withheld_reasons_hide_blocked_ticket_in_disabled_project(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """A BLOCKED ticket in a disabled project must not leak its id or
+        its blocker text to an agent working a different project."""
+        task = MagicMock()
+        task.source_context = {"kanboard_task": {"project_id": 9}}
+        mock_kanban.get_task_by_id = AsyncMock(return_value=task)
+        mock_project_access.is_enabled = MagicMock(return_value=False)
+        lifecycle.get_or_create("52", "kanboard")
+        lifecycle.transition("52", "kanboard", TicketState.READY)
+        lifecycle.transition("52", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("52", "kanboard", TicketState.BLOCKED)
+        lifecycle.set_assignee("52", "kanboard", "alice")
+
+        result = await workflow.orchestrate_work(agent_id="worker-J")
+
+        assert "#52" not in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_withheld_reasons_show_blocked_ticket_in_enabled_project(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        task = MagicMock()
+        task.source_context = {"kanboard_task": {"project_id": 9}}
+        mock_kanban.get_task_by_id = AsyncMock(return_value=task)
+        mock_project_access.is_enabled = MagicMock(return_value=True)
+        lifecycle.get_or_create("53", "kanboard")
+        lifecycle.transition("53", "kanboard", TicketState.READY)
+        lifecycle.transition("53", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("53", "kanboard", TicketState.BLOCKED)
+        lifecycle.set_assignee("53", "kanboard", "alice")
+
+        result = await workflow.orchestrate_work(agent_id="worker-K")
+
+        assert "#53" in result["message"]
 
     @pytest.mark.asyncio
     async def test_project_id_lookup_is_cached_per_ticket(

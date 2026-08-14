@@ -65,13 +65,23 @@ class TestResolveProjectForCost:
         state = _State()
         assert _resolve_project_for_cost({}, state) is None
 
-    def test_unknown_agent_falls_through(self) -> None:
-        """agent_id not in the map → keep looking at selected_project_id."""
+    def test_unknown_agent_does_not_fall_back_to_selected_project(self) -> None:
+        """agent_id present but not (yet) in the map -> unresolvable, NOT
+        the selected project.
+
+        Cross-project isolation regression: with two projects enabled
+        simultaneously, an agent_id names a SPECIFIC agent working a
+        SPECIFIC (possibly different) project — guessing "whatever is
+        selected right now" risks attributing that agent's cost to the
+        wrong project's totals, same failure class PR #503 already fixed
+        for project-creation tools (see TestCodexP1ProjectCreationGuard).
+        Falls to the visible 'unassigned' bucket instead of guessing.
+        """
         state = _State(
             agent_project_map={"a1": "p_a1"},
             selected_project_id="p_selected",
         )
-        assert _resolve_project_for_cost({"agent_id": "unknown"}, state) == "p_selected"
+        assert _resolve_project_for_cost({"agent_id": "unknown"}, state) is None
 
 
 class TestCodexP1ProjectCreationGuard:
@@ -122,3 +132,32 @@ class TestCodexP1ProjectCreationGuard:
         """Backward compat: callers that don't pass tool_name still fall back."""
         state = _State(selected_project_id="p_active")
         assert _resolve_project_for_cost({}, state) == "p_active"
+
+
+class TestUnmappedAgentIsolationGuard:
+    """Regression: an agent_id present but absent from agent_project_map
+    must not inherit state.selected_project_id — see
+    test_unknown_agent_does_not_fall_back_to_selected_project above for
+    the full reasoning. This class covers the surrounding edge cases."""
+
+    def test_no_agent_id_at_all_still_falls_back_to_selected(self) -> None:
+        """No agent-specific signal whatsoever (a system/server-level
+        call) is the one case where 'whatever is selected' remains the
+        best available guess — unchanged from before."""
+        state = _State(selected_project_id="p_selected")
+        assert _resolve_project_for_cost({}, state) == "p_selected"
+
+    def test_unmapped_agent_still_returns_none_for_creation_tools(self) -> None:
+        """Both guards compose: an unmapped agent_id on a creation tool
+        is still unresolvable, not a fallback to the other guard."""
+        state = _State(selected_project_id="p_selected")
+        assert (
+            _resolve_project_for_cost(
+                {"agent_id": "unknown"}, state, tool_name="create_project"
+            )
+            is None
+        )
+
+    def test_unmapped_agent_with_no_selected_project_returns_none(self) -> None:
+        state = _State()
+        assert _resolve_project_for_cost({"agent_id": "unknown"}, state) is None

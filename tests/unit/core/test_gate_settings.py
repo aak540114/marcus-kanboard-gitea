@@ -374,3 +374,52 @@ class TestGateSettingManager:
         raw = json.loads((tmp_path / "gate_settings.json").read_text())
         assert "verify" not in raw["projects"]["1"]
         assert raw["projects"]["1"]["verify_count"] == 1
+
+
+class TestSaveAtomicity:
+    """_save() used to write self._path directly — a process killed
+    mid-write (OOM-kill, container restart, disk-full raising inside
+    json.dump) left a truncated/invalid file. Since this ONE file holds
+    every project's gate/verify/decompose settings, _load's broad
+    except-and-reset-to-empty-structure on the next load would silently
+    revert EVERY enabled project back to defaults (gate="human",
+    verify_count=0, decompose_enabled=True) — a crash while writing
+    project B's setting corrupting project A's stored state too.
+    Cross-project isolation regression, not just a durability one."""
+
+    def test_failed_write_does_not_corrupt_existing_file(self, tmp_path):
+        mgr = GateSettingManager(data_dir=tmp_path)
+        mgr.set_project_gate(1, "ai")
+        original_content = (tmp_path / "gate_settings.json").read_text()
+
+        # Poison the in-memory data with a non-JSON-serializable value so
+        # the next _save() call's json.dump raises partway through
+        # writing (after the file has already been opened/truncated, in
+        # the old direct-write implementation).
+        mgr._data["projects"]["2"] = {"gate": object()}
+        mgr._save()  # swallows the exception, logs an error
+
+        assert (tmp_path / "gate_settings.json").read_text() == original_content
+        assert not (tmp_path / "gate_settings.json.tmp").exists()
+
+    def test_successful_save_leaves_no_temp_file(self, tmp_path):
+        mgr = GateSettingManager(data_dir=tmp_path)
+        mgr.set_project_gate(1, "ai")
+
+        assert (tmp_path / "gate_settings.json").exists()
+        assert not (tmp_path / "gate_settings.json.tmp").exists()
+        raw = json.loads((tmp_path / "gate_settings.json").read_text())
+        assert raw["projects"]["1"]["gate"] == "ai"
+
+    def test_a_project_b_crash_does_not_revert_project_a(self, tmp_path):
+        """The concrete two-project failure scenario: writing project B's
+        setting must never be able to corrupt project A's already-saved
+        setting, even on a mid-write failure."""
+        mgr = GateSettingManager(data_dir=tmp_path)
+        mgr.set_project_gate(1, "ai")  # project A, saved successfully
+
+        mgr._data["projects"]["2"] = {"gate": object()}  # unsavable
+        mgr._save()  # project B's poisoned write fails
+
+        reloaded = GateSettingManager(data_dir=tmp_path)
+        assert reloaded.get_project_gate(1) == "ai"  # project A intact

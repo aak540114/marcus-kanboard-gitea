@@ -431,10 +431,29 @@ class GateSettingManager:
             return {"projects": {}, "tickets": {}}
 
     def _save(self) -> None:
-        """Write settings to disk."""
+        """Write settings to disk.
+
+        Writes to a temp file and ``os.replace``s it into place (matching
+        ``ProjectSyncWorkflow._save_mapping``'s pattern) rather than
+        writing ``self._path`` directly. This one file holds EVERY
+        project's gate/verify/decompose settings, so a process killed
+        mid-write (or a `json.dump` failure partway through, e.g. an
+        unexpectedly non-serializable value) used to leave a
+        truncated/invalid file behind — `_load`'s broad except-and-reset
+        would then silently revert every project's settings to defaults
+        on the next load, not just the one being written. `os.replace`
+        is atomic on both POSIX and Windows, so a reader never observes
+        a partially-written file.
+        """
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = f"{self._path}.tmp"
         try:
-            with open(self._path, "w", encoding="utf-8") as fh:
+            with open(tmp_path, "w", encoding="utf-8") as fh:
                 json.dump(self._data, fh, indent=2)
-        except OSError as exc:
+            os.replace(tmp_path, self._path)
+        except Exception as exc:  # noqa: BLE001
             logger.error("Could not write gate_settings.json: %s", exc)
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass

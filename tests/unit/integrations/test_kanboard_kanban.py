@@ -2592,13 +2592,68 @@ class TestGetProjectMetrics:
             ),
         ]
         kanban._client = AsyncMock()  # satisfy the connection guard
-        kanban.get_all_tasks = AsyncMock(return_value=tasks)
+        kanban.get_tasks_for_project = AsyncMock(return_value=tasks)
         metrics = await kanban.get_project_metrics()
         assert metrics["total_tasks"] == 4
         assert metrics["backlog_tasks"] == 1
         assert metrics["in_progress_tasks"] == 1
         assert metrics["completed_tasks"] == 1
         assert metrics["blocked_tasks"] == 1
+
+    @pytest.mark.asyncio
+    async def test_scopes_to_configured_project_not_every_visible_project(
+        self, kanban
+    ):
+        """Regression: get_project_metrics()'s own docstring promises
+        "the configured project", but it used to call get_all_tasks() —
+        which, since set_project_scope() has no production caller, reads
+        EVERY project on the Kanboard instance. With two projects
+        enabled, project A's metrics call must not include project B's
+        tickets."""
+        now = datetime.now(timezone.utc)
+
+        def _task(tid, status):
+            return Task(
+                id=tid,
+                name=f"T{tid}",
+                status=status,
+                assigned_to=None,
+                priority=Priority.MEDIUM,
+                description="",
+                created_at=now,
+                updated_at=now,
+                due_date=None,
+                estimated_hours=0.0,
+            )
+
+        kanban._client = AsyncMock()
+        # get_all_tasks() spans every project (10 tasks) — must NOT be
+        # what get_project_metrics() counts.
+        kanban.get_all_tasks = AsyncMock(
+            return_value=[_task(str(i), TaskStatus.TODO) for i in range(10)]
+        )
+        # get_tasks_for_project() is scoped to exactly one project (2 tasks).
+        kanban.get_tasks_for_project = AsyncMock(
+            return_value=[_task("1", TaskStatus.TODO), _task("2", TaskStatus.DONE)]
+        )
+
+        metrics = await kanban.get_project_metrics()
+
+        assert metrics["total_tasks"] == 2
+        kanban.get_all_tasks.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_uses_the_configured_project_id(self, kanban):
+        kanban._client = AsyncMock()
+        kanban.get_tasks_for_project = AsyncMock(return_value=[])
+        await kanban.get_project_metrics()
+        # `config` fixture sets kanboard_project_id: 1.
+        kanban.get_tasks_for_project.assert_awaited_once_with(1)
+
+    @pytest.mark.asyncio
+    async def test_raises_if_not_connected(self, kanban):
+        with pytest.raises(RuntimeError, match="connect()"):
+            await kanban.get_project_metrics()
 
 
 # ---------------------------------------------------------------------------

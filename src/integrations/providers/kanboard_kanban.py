@@ -1502,6 +1502,15 @@ class KanboardKanban(KanbanInterface):
         """
         Return task counts by status for the configured project.
 
+        Scoped to exactly ``self._project_id`` via
+        :meth:`get_tasks_for_project` — NOT :meth:`get_all_tasks`, which
+        reads every project Marcus can see (``set_project_scope`` has no
+        production caller, so ``get_all_tasks`` falls through to reading
+        the WHOLE Kanboard instance). Regression: this method's own
+        docstring always promised "the configured project", but used to
+        call ``get_all_tasks()`` — with a second project enabled, its
+        counts silently included that project's tickets too.
+
         Returns
         -------
         Dict[str, Any]
@@ -1511,7 +1520,7 @@ class KanboardKanban(KanbanInterface):
         if self._client is None:
             raise RuntimeError("Call connect() before get_project_metrics()")
 
-        all_tasks = await self.get_all_tasks()
+        all_tasks = await self.get_tasks_for_project(self._project_id)
         metrics: Dict[str, Any] = {
             "total_tasks": len(all_tasks),
             "backlog_tasks": sum(1 for t in all_tasks if t.status == TaskStatus.TODO),
