@@ -188,6 +188,59 @@ class TestBoardWatcherPollOnce:
         assert status_events[0].data["new_status"] == "in_progress"
 
     @pytest.mark.asyncio
+    async def test_status_changed_task_payload_includes_project_id(
+        self, watcher, events, mock_kanban
+    ):
+        """The emitted task dict carries project_id (from
+        source_context["kanboard_task"]["project_id"], the shape
+        KanboardKanban._to_task always sets) — needed by project-stats
+        tracking, which has no other way to resolve a project id from
+        the poll path's event payload alone."""
+        task_todo = _make_task(
+            "T-4b",
+            status=TaskStatus.TODO,
+            source_context={"kanboard_task": {"project_id": 7}},
+        )
+        task_done = _make_task(
+            "T-4b",
+            status=TaskStatus.DONE,
+            source_context={"kanboard_task": {"project_id": 7}},
+        )
+
+        mock_kanban.get_all_tasks = AsyncMock(return_value=[task_todo])
+        await watcher.poll_once()
+
+        status_events: List[Any] = []
+        events.subscribe("ticket.status_changed", lambda e: status_events.append(e))
+
+        mock_kanban.get_all_tasks = AsyncMock(return_value=[task_done])
+        await watcher.poll_once()
+
+        assert len(status_events) == 1
+        assert status_events[0].data["task"]["project_id"] == 7
+
+    @pytest.mark.asyncio
+    async def test_task_payload_project_id_none_when_no_source_context(
+        self, watcher, events, mock_kanban
+    ):
+        """A task with no source_context (non-Kanboard provider) must not
+        crash — project_id is simply absent/None."""
+        task_todo = _make_task("T-4c", status=TaskStatus.TODO)
+        task_done = _make_task("T-4c", status=TaskStatus.DONE)
+
+        mock_kanban.get_all_tasks = AsyncMock(return_value=[task_todo])
+        await watcher.poll_once()
+
+        status_events: List[Any] = []
+        events.subscribe("ticket.status_changed", lambda e: status_events.append(e))
+
+        mock_kanban.get_all_tasks = AsyncMock(return_value=[task_done])
+        await watcher.poll_once()
+
+        assert len(status_events) == 1
+        assert status_events[0].data["task"].get("project_id") is None
+
+    @pytest.mark.asyncio
     async def test_emits_closed_when_status_becomes_done(
         self, watcher, events, mock_kanban
     ):

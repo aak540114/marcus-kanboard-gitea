@@ -7,6 +7,9 @@
  *
  * Section 1 — Active AI Agents badge (polls /api/active-agents every 15 s)
  * Section 2 — Project Description link button
+ * Section 2b — Project Stats link button (tickets/hour into Done and
+ *              Waiting for Human, plus main-branch line count — see
+ *              /project-stats and src/core/project_stats.py)
  * Section 3 — Project-level Human Gate / AI Gate toggle
  * Section 4 — AI Verify counter (only visible when AI Gate is active)
  *             Shows [−] N [+] where N is the number of required LLM review
@@ -41,6 +44,8 @@ $marcusToken      = getenv('MARCUS_AGENT_TOKEN') ?: '';
 $apiUrl           = $marcusUrl . '/api/active-agents';
 $projectId        = $project['id'] ?? '';
 $descUrl          = $marcusUrl . '/project-description?project_id=' . urlencode((string) $projectId)
+                  . ($marcusToken !== '' ? '&token=' . urlencode($marcusToken) : '');
+$statsUrl         = $marcusUrl . '/project-stats?project_id=' . urlencode((string) $projectId)
                   . ($marcusToken !== '' ? '&token=' . urlencode($marcusToken) : '');
 $gateApiBase      = $marcusUrl . '/api/gate-setting';
 $projectEnabledUrl = $marcusUrl . '/api/project-enabled';
@@ -377,6 +382,14 @@ $cloneProjectStatusUrl = $marcusUrl . '/api/clone-project-status';
               font-size:12px;font-weight:600;text-decoration:none;
               background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;">
         &#128196; Project Description
+    </a>
+
+    <!-- Project Stats link -->
+    <a href="<?= htmlspecialchars($statsUrl) ?>" target="_blank" rel="noopener noreferrer"
+       style="display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:12px;
+              font-size:12px;font-weight:600;text-decoration:none;
+              background:#ecfeff;color:#0e7490;border:1px solid #a5f3fc;">
+        &#128202; Project Stats
     </a>
 
     <!-- Gitea repository link (shown once the repo is provisioned) -->

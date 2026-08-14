@@ -448,6 +448,16 @@ class BoardWatcher:
                 # produces no assignment/status diff events afterwards, so
                 # the assignment state must travel with ticket.new itself.
                 "assignee": self._extract_assignee(task) or "",
+                # Needed by the project-stats tracker (subscribed to
+                # ticket.status_changed in server.py), which has no other
+                # way to resolve a project id from this poll-path event —
+                # the webhook path's raw Kanboard task hash already
+                # carries this key natively; KanboardKanban._to_task
+                # always sets source_context["kanboard_task"]["project_id"],
+                # so this is None only for a non-Kanboard provider.
+                "project_id": (task.source_context or {})
+                .get("kanboard_task", {})
+                .get("project_id"),
             },
         }
         data.update(extra)

@@ -3579,6 +3579,38 @@ def _get_project_access_mgr(server: "MarcusServer") -> Any:
     return mgr
 
 
+def _get_project_stats_mgr(server: "MarcusServer") -> Any:
+    """Return the shared ProjectStatsManager singleton, constructing it once.
+
+    Must be the SAME instance across every call: each instance owns its
+    own ``asyncio.Lock`` (see ``ProjectStatsManager.__init__``), so two
+    separate instances — one built for a poll-path status-change event,
+    another for a concurrent webhook-path one — would not actually be
+    serialized against each other, reopening the lost-update race that
+    lock exists to close. The ``/api/project-stats`` route also reads
+    through this same instance, so it always sees the latest in-memory
+    counts without an extra disk reload. Same reasoning as
+    :func:`_get_gate_settings_mgr`.
+
+    Parameters
+    ----------
+    server : MarcusServer
+        The running server instance.
+
+    Returns
+    -------
+    ProjectStatsManager
+        The shared project stats manager.
+    """
+    from src.core.project_stats import ProjectStatsManager
+
+    mgr = getattr(server, "_project_stats_mgr", None)
+    if mgr is None:
+        mgr = ProjectStatsManager()
+        server._project_stats_mgr = mgr  # type: ignore[attr-defined]
+    return mgr
+
+
 def _get_project_desc_mgr(server: "MarcusServer") -> Any:
     """Return the shared ProjectDescriptionManager singleton, once built.
 
@@ -4105,6 +4137,56 @@ async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
             "a kanban provider)."
         )
         return
+
+    async def _track_project_stats(event: Any) -> None:
+        """Feed ProjectStatsManager from every ticket.status_changed event.
+
+        Independent of Gitea/ProjectWatcher — only needs the event bus,
+        so it's wired here rather than inside the ``kb_url``-gated block
+        below. A handler exception is isolated by Events.publish's own
+        per-handler try/except, so a stats bug can never break ticket
+        processing.
+        """
+        data = event.data
+        ticket_id = str(data.get("ticket_id", ""))
+        new_status = data.get("new_status")
+        task_data = data.get("task") or {}
+        pid_raw = task_data.get("project_id")
+        if not ticket_id or not new_status or pid_raw is None:
+            return
+        try:
+            project_id = int(pid_raw)
+        except (TypeError, ValueError):
+            return
+        stats_mgr = _get_project_stats_mgr(server)
+        counted = await stats_mgr.record_status_change(
+            project_id, ticket_id, new_status, event.timestamp
+        )
+
+        # Keep the "lines of code" figure current from the moment a
+        # ticket is genuinely (not a poll-echo duplicate) moved to Done —
+        # per the user's explicit requirement, not just refreshed
+        # periodically. Best-effort: refresh_loc_count already logs and
+        # returns None on any git failure rather than raising.
+        if counted and new_status == "done":
+            project_sync = getattr(server, "_project_sync", None)
+            mapping = (
+                project_sync.get_repo_for_project(project_id)
+                if project_sync is not None
+                else None
+            )
+            repo_path = mapping.get("local_repo_path") if mapping else None
+            if repo_path:
+                try:
+                    await stats_mgr.refresh_loc_count(project_id, repo_path)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Could not refresh LOC count for project %d: %s",
+                        project_id,
+                        exc,
+                    )
+
+    server.events.subscribe("ticket.status_changed", _track_project_stats)
 
     from src.core.dev_environment import DevEnvironmentManager
     from src.integrations.gitea_manager import GiteaManager
@@ -4845,6 +4927,203 @@ function save() {{
 
             response.headers["Access-Control-Allow-Origin"] = "*"
             return response
+
+        async def project_stats_api(request: Request) -> JSONResponse:
+            """GET /api/project-stats?project_id=<id>
+
+            Returns hourly Done / Waiting-for-Human ticket-movement
+            counts for a project, plus each column's "last hour"
+            headline number. Backs ``/project-stats``'s periodic
+            refresh (see :class:`~src.core.project_stats.ProjectStatsManager`).
+
+            Returns
+            -------
+            JSON: ``{"project_id": int,
+                      "done": {"last_hour": int, "hourly": [{"hour": str, "count": int}, ...]},
+                      "waiting_for_human": {"last_hour": int, "hourly": [...]},
+                      "loc_count": int | null}``
+                ``loc_count`` is the main branch's total tracked line
+                count as of the last Done move (``null`` if never
+                computed — no repo, or no Done move has happened yet).
+            """
+            project_id_str = request.query_params.get("project_id", "")
+            try:
+                pid = int(project_id_str)
+            except ValueError:
+                response = JSONResponse({"error": "invalid project_id"}, status_code=400)
+                response.headers["Access-Control-Allow-Origin"] = "*"
+                return response
+
+            stats_mgr = _get_project_stats_mgr(server)
+            payload = {
+                "project_id": pid,
+                "loc_count": stats_mgr.get_loc_count(pid),
+                "done": {
+                    "last_hour": stats_mgr.get_last_hour_count(pid, "done"),
+                    "hourly": stats_mgr.get_hourly_stats(pid, "done"),
+                },
+                "waiting_for_human": {
+                    "last_hour": stats_mgr.get_last_hour_count(pid, "waiting_for_human"),
+                    "hourly": stats_mgr.get_hourly_stats(pid, "waiting_for_human"),
+                },
+            }
+            response = JSONResponse(payload)
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            return response
+
+        async def project_stats_page(request: Request) -> Response:
+            """Serve the project stats as a human-readable HTML page.
+
+            Query params:
+                project_id  (required)
+            """
+            project_id_str = request.query_params.get("project_id", "")
+            try:
+                pid = int(project_id_str)
+            except ValueError:
+                return HTMLResponse("<h1>Missing or invalid project_id</h1>", status_code=400)
+
+            api_url = f"/api/project-stats?project_id={pid}"
+            page = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Project {pid} — Stats</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; color: #1a1a2e; }}
+  h1 {{ font-size: 1.4rem; color: #2563eb; }}
+  h2 {{ font-size: 1.1rem; margin-top: 36px; color: #1e293b; }}
+  .headline {{ font-size: 2rem; font-weight: 700; color: #16a34a; }}
+  .headline.wfh {{ color: #7c3aed; }}
+  .sublabel {{ font-size: 12px; color: #64748b; }}
+  .chart-wrap {{ margin-top: 12px; overflow-x: auto; }}
+  .empty {{ color: #94a3b8; font-size: 13px; padding: 20px 0; }}
+  svg text {{ font-family: system-ui, sans-serif; }}
+  .bar {{ fill: #60a5fa; }}
+  .bar.wfh {{ fill: #c4b5fd; }}
+  .bar:hover {{ fill: #2563eb; }}
+  .bar.wfh:hover {{ fill: #7c3aed; }}
+  .headline.loc {{ color: #0891b2; font-size: 1.5rem; }}
+</style>
+</head>
+<body>
+<h1>&#128202; Project Stats &mdash; Project #{pid}</h1>
+<p class="sublabel">Tracks ticket movement into the Done and Waiting for Human
+columns. Tracking for each column starts the first time a ticket ever moves
+there. Refreshes automatically every 30s.</p>
+
+<h2>&#128196; Lines of Code (main branch)</h2>
+<div class="headline loc" id="loc-headline">&hellip;</div>
+<div class="sublabel">total tracked lines on the repository's main branch &mdash; updated every time a ticket moves to Done</div>
+
+<h2>&#9989; Done</h2>
+<div class="headline" id="done-headline">&hellip;</div>
+<div class="sublabel">tickets moved to Done in the last hour</div>
+<div class="chart-wrap"><div id="done-chart"></div></div>
+
+<h2>&#128172; Waiting for Human</h2>
+<div class="headline wfh" id="wfh-headline">&hellip;</div>
+<div class="sublabel">tickets moved to Waiting for Human in the last hour</div>
+<div class="chart-wrap"><div id="wfh-chart"></div></div>
+
+<script>
+var API_URL = '{api_url}';
+
+function fmtHour(hourStr) {{
+    // hourStr like "2026-08-13T14:00", always UTC — appending "Z" lets
+    // Date parse it as UTC and render it in the viewer's local time.
+    var d = new Date(hourStr + 'Z');
+    if (isNaN(d.getTime())) {{ return hourStr; }}
+    return d.toLocaleString(undefined, {{
+        month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'
+    }});
+}}
+
+function renderChart(containerId, buckets, barClass) {{
+    var el = document.getElementById(containerId);
+    if (!buckets || !buckets.length) {{
+        el.innerHTML = '<div class="empty">No tickets moved here yet.</div>';
+        return;
+    }}
+    var barWidth = 46, gap = 14, chartHeight = 160, labelHeight = 46;
+    var maxCount = Math.max.apply(null, buckets.map(function (b) {{ return b.count; }}));
+    var width = buckets.length * (barWidth + gap) + gap;
+    var height = chartHeight + labelHeight;
+    var svgNs = 'http://www.w3.org/2000/svg';
+    var svg = document.createElementNS(svgNs, 'svg');
+    svg.setAttribute('width', width);
+    svg.setAttribute('height', height);
+    svg.setAttribute('role', 'img');
+
+    buckets.forEach(function (b, i) {{
+        var barHeight = maxCount > 0 ? Math.round((b.count / maxCount) * (chartHeight - 24)) : 0;
+        var x = gap + i * (barWidth + gap);
+        var y = chartHeight - barHeight;
+        var label = fmtHour(b.hour);
+
+        var rect = document.createElementNS(svgNs, 'rect');
+        rect.setAttribute('class', 'bar' + (barClass ? ' ' + barClass : ''));
+        rect.setAttribute('x', x);
+        rect.setAttribute('y', y);
+        rect.setAttribute('width', barWidth);
+        rect.setAttribute('height', Math.max(barHeight, 1));
+        var title = document.createElementNS(svgNs, 'title');
+        title.textContent = label + ': ' + b.count;
+        rect.appendChild(title);
+        svg.appendChild(rect);
+
+        var countText = document.createElementNS(svgNs, 'text');
+        countText.setAttribute('x', x + barWidth / 2);
+        countText.setAttribute('y', y - 6);
+        countText.setAttribute('text-anchor', 'middle');
+        countText.setAttribute('font-size', '12');
+        countText.setAttribute('fill', '#1e293b');
+        countText.textContent = String(b.count);
+        svg.appendChild(countText);
+
+        var hourText = document.createElementNS(svgNs, 'text');
+        hourText.setAttribute('x', x + barWidth / 2);
+        hourText.setAttribute('y', chartHeight + 16);
+        hourText.setAttribute('text-anchor', 'middle');
+        hourText.setAttribute('font-size', '10');
+        hourText.setAttribute('fill', '#64748b');
+        hourText.setAttribute(
+            'transform',
+            'rotate(45 ' + (x + barWidth / 2) + ' ' + (chartHeight + 16) + ')'
+        );
+        hourText.textContent = label;
+        svg.appendChild(hourText);
+    }});
+
+    el.innerHTML = '';
+    el.appendChild(svg);
+}}
+
+function refresh() {{
+    fetch(API_URL, {{ cache: 'no-store' }})
+        .then(function (r) {{ return r.json(); }})
+        .then(function (data) {{
+            document.getElementById('loc-headline').textContent =
+                (data.loc_count === null || data.loc_count === undefined)
+                    ? 'Not yet computed (no ticket moved to Done yet)'
+                    : data.loc_count.toLocaleString();
+            document.getElementById('done-headline').textContent = data.done.last_hour;
+            document.getElementById('wfh-headline').textContent = data.waiting_for_human.last_hour;
+            renderChart('done-chart', data.done.hourly, '');
+            renderChart('wfh-chart', data.waiting_for_human.hourly, 'wfh');
+        }})
+        .catch(function () {{
+            document.getElementById('loc-headline').textContent = '?';
+            document.getElementById('done-headline').textContent = '?';
+            document.getElementById('wfh-headline').textContent = '?';
+        }});
+}}
+refresh();
+setInterval(refresh, 30000);
+</script>
+</body>
+</html>"""
+            return HTMLResponse(page)
 
         async def gate_setting_api(request: Request) -> JSONResponse:
             """GET/PUT gate-mode settings for a project or ticket.
@@ -6214,6 +6493,8 @@ function save() {{
                 Route("/api/events/stream", events_stream, methods=["GET"]),
                 Route("/project-description", project_description_page, methods=["GET"]),
                 Route("/api/project-description", project_description_api, methods=["GET", "PUT"]),
+                Route("/project-stats", project_stats_page, methods=["GET"]),
+                Route("/api/project-stats", project_stats_api, methods=["GET"]),
                 Route("/api/gate-setting", gate_setting_api, methods=["GET"]),
                 Route("/api/gate-setting/project", gate_setting_api, methods=["PUT"]),
                 Route("/api/gate-setting/ticket", gate_setting_api, methods=["PUT"]),
