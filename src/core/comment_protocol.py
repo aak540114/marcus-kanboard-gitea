@@ -406,6 +406,7 @@ class CommentFormatter:
         *,
         dev_env_url: Optional[str] = None,
         commit_count: int = 0,
+        testing_instructions: Optional[str] = None,
     ) -> str:
         """Comment posted when the AI agent finishes and awaits acceptance.
 
@@ -421,6 +422,15 @@ class CommentFormatter:
             URL to the hot-reload dev environment, if available.
         commit_count : int
             Number of commits on the ticket branch.
+        testing_instructions : Optional[str]
+            Step-by-step instructions (markdown, typically a numbered
+            list) telling the human reviewer exactly what to click/type/
+            look at in the live preview to manually verify THIS ticket's
+            change — see
+            :meth:`~src.workflows.human_gated_workflow.HumanGatedWorkflow.
+            _generate_testing_instructions`. Omitted entirely (not shown
+            as an empty section) when ``None``, matching the existing
+            optional-section convention used for ``dev_env_url``.
 
         Returns
         -------
@@ -436,6 +446,11 @@ class CommentFormatter:
                 "on this ticket.\n"
             )
         )
+        testing_section = (
+            f"\n**How to test this:**\n{testing_instructions}\n"
+            if testing_instructions
+            else ""
+        )
         commits_note = f" ({commit_count} commits)" if commit_count else ""
 
         body = (
@@ -444,7 +459,8 @@ class CommentFormatter:
             f"Implementation complete{commits_note}. "
             f"All acceptance criteria addressed:\n\n"
             f"{ac_section}\n"
-            f"{dev_section}\n"
+            f"{dev_section}"
+            f"{testing_section}\n"
             f"**Branch:** `{branch_name}`\n\n"
             f"**To accept:** close this ticket (or transition it to *Done*). "
             f"The branch will be merged to main automatically.\n\n"

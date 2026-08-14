@@ -52,6 +52,7 @@ import asyncio
 import logging
 import math
 import os
+import textwrap
 import time
 import uuid
 from datetime import datetime, timezone
@@ -132,6 +133,11 @@ _PARENT_RECONCILE_INTERVAL_SECONDS = 60.0
 _MAX_TRACKED_ACCOUNTS = 100   # distinct accounts kept in memory (evict oldest)
 _ACCOUNT_ID_MAX = 128         # max length of an account id / agent id
 _USAGE_SCALAR_MAX = 64        # max length of a used/limit/unit string value
+
+#: Matches AIVerifier's own diff cap (src/ai/verification/ai_verifier.py) —
+#: keeps the testing-instructions prompt size bounded regardless of ticket
+#: size.
+_MAX_TESTING_DIFF_CHARS = 12_000
 
 
 def _safe_usage_scalar(value: Any, max_len: int = _USAGE_SCALAR_MAX) -> Any:
@@ -1491,6 +1497,113 @@ class HumanGatedWorkflow:
             return "waiting"
 
         return "progress"
+
+    async def _generate_testing_instructions(
+        self,
+        ticket_title: str,
+        ticket_description: str,
+        diff_text: str,
+        ac_items: List[str],
+    ) -> Optional[str]:
+        """Generate step-by-step manual-testing instructions for a human.
+
+        Posted alongside the "Ready for Review" comment (see
+        :meth:`signal_ready_for_review`) so the human doesn't have to
+        reverse-engineer HOW to exercise the change from the diff or the
+        acceptance criteria themselves — told concretely what to click,
+        type, or look at in the live preview, tailored to what THIS
+        ticket actually changed (e.g. "open the Checkout page and
+        confirm the Submit button now renders green") rather than a
+        generic "review the code" instruction.
+
+        Parameters
+        ----------
+        ticket_title : str
+            Ticket title.
+        ticket_description : str
+            Ticket description/body.
+        diff_text : str
+            The ticket branch's diff against main (may be empty if it
+            could not be fetched — degrades to the heuristic fallback).
+        ac_items : List[str]
+            Acceptance criteria items, used both as LLM context and as
+            the heuristic fallback's own checklist.
+
+        Returns
+        -------
+        Optional[str]
+            Markdown (typically a numbered list), or ``None`` when
+            there's nothing meaningful to say (no AC and no LLM
+            configured, or an empty diff with no AC).
+        """
+        if self._llm_generate is None:
+            return self._heuristic_testing_instructions(ac_items)
+
+        truncated_diff = diff_text[:_MAX_TESTING_DIFF_CHARS]
+        if len(diff_text) > _MAX_TESTING_DIFF_CHARS:
+            truncated_diff += (
+                f"\n\n[... diff truncated at {_MAX_TESTING_DIFF_CHARS} "
+                "characters ...]"
+            )
+        ac_section = (
+            "\n".join(f"- {item}" for item in ac_items)
+            if ac_items
+            else "(none recorded)"
+        )
+        prompt = textwrap.dedent(f"""
+            You are writing instructions for a NON-technical human reviewer
+            who will open a live preview of this change in their browser and
+            needs to know exactly what to click, type, or look at to confirm
+            it works.
+
+            Ticket title: {ticket_title}
+            Ticket description:
+            {ticket_description}
+
+            Acceptance criteria:
+            {ac_section}
+
+            Code diff:
+            ```diff
+            {truncated_diff}
+            ```
+
+            Write a short numbered list of CONCRETE manual testing steps a
+            human can follow in the running preview app to verify this
+            change — name the specific page/screen/element/button to look
+            at or interact with, and what result to expect. Do NOT describe
+            the code or say "review the code" — describe what to DO in the
+            running software. Output ONLY the numbered list, nothing else.
+        """).strip()
+        try:
+            result = await self._llm_generate(prompt)
+            text = (result or "").strip()
+            return text or self._heuristic_testing_instructions(ac_items)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "LLM testing-instructions generation failed, falling back "
+                "to heuristic: %s",
+                exc,
+            )
+            return self._heuristic_testing_instructions(ac_items)
+
+    @staticmethod
+    def _heuristic_testing_instructions(ac_items: List[str]) -> Optional[str]:
+        """Rule-based fallback when no LLM is configured (or it failed).
+
+        Reuses the acceptance criteria as the checklist of things to
+        verify in the preview — the best available signal without an
+        LLM to interpret the diff.
+        """
+        if not ac_items:
+            return None
+        lines = [
+            "1. Open the live preview (see link below, or start it from "
+            "the ticket sidebar / `@marcus start-dev-env`)."
+        ]
+        for i, item in enumerate(ac_items, start=2):
+            lines.append(f"{i}. Verify: {item}")
+        return "\n".join(lines)
 
     async def _summarize_report(self, report: str) -> str:
         """Summarize a worker's raw report into one line for a ticket comment."""
@@ -2913,12 +3026,44 @@ class HumanGatedWorkflow:
         branch_mgr = await self._branch_for_ticket(ticket_id)
         commits = await branch_mgr.get_branch_commits(record.branch_name)
         ac_items = self._get_ac_items(record)
+
+        # Best-effort: neither of these must ever block the review signal
+        # itself (see the recoverability note above) — a transient
+        # failure here just means the comment omits testing instructions,
+        # not that the ticket fails to reach Waiting for Human.
+        try:
+            diff_text = await branch_mgr.get_branch_diff(record.branch_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "Ticket %s: could not fetch diff for testing instructions: %s",
+                ticket_id,
+                exc,
+            )
+            diff_text = ""
+        ticket_title, ticket_description = ticket_id, ""
+        try:
+            task = await self._kanban.get_task_by_id(ticket_id)
+            if task:
+                ticket_title = task.name or ticket_title
+                ticket_description = task.description or ""
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "Ticket %s: could not fetch task details for testing "
+                "instructions: %s",
+                ticket_id,
+                exc,
+            )
+        testing_instructions = await self._generate_testing_instructions(
+            ticket_title, ticket_description, diff_text, ac_items
+        )
+
         comment = CommentFormatter.ready_for_review(
             ticket_id=ticket_id,
             branch_name=record.branch_name,
             ac_items=ac_items,
             dev_env_url=dev_url,
             commit_count=len(commits),
+            testing_instructions=testing_instructions,
         )
         posted = await self._post_comment(ticket_id, comment)
         if not posted:

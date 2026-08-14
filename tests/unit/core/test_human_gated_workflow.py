@@ -963,6 +963,191 @@ class TestReviewSignalOrdering:
 
 
 # ---------------------------------------------------------------------------
+# Manual-testing instructions posted alongside the "ready for review" comment
+# ---------------------------------------------------------------------------
+
+
+class TestGenerateTestingInstructions:
+    """_generate_testing_instructions produces step-by-step manual-testing
+    steps for the human reviewer — via the LLM when one is configured,
+    falling back to a heuristic (reusing the AC checklist) otherwise."""
+
+    @pytest.mark.asyncio
+    async def test_no_llm_falls_back_to_heuristic_from_ac_items(self, workflow):
+        workflow._llm_generate = None
+        result = await workflow._generate_testing_instructions(
+            "Change button color", "", "", ["Submit button is green, not blue"]
+        )
+        assert result is not None
+        assert "Submit button is green, not blue" in result
+
+    @pytest.mark.asyncio
+    async def test_no_llm_and_no_ac_items_returns_none(self, workflow):
+        """Nothing meaningful to say without an LLM or any AC — omit the
+        section entirely rather than posting an empty/generic placeholder."""
+        workflow._llm_generate = None
+        result = await workflow._generate_testing_instructions(
+            "Some ticket", "", "", []
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_uses_llm_when_configured(self, workflow):
+        captured_prompt = {}
+
+        async def fake_llm(prompt):
+            captured_prompt["value"] = prompt
+            return (
+                "1. Open the preview.\n"
+                "2. Go to Checkout.\n"
+                "3. Confirm the Submit button is green."
+            )
+
+        workflow._llm_generate = fake_llm
+
+        result = await workflow._generate_testing_instructions(
+            "Change Submit button color to green",
+            "The button was blue, change it to green",
+            "diff --git a/checkout.css b/checkout.css\n+ .submit { color: green; }",
+            ["Submit button renders green"],
+        )
+
+        assert result == (
+            "1. Open the preview.\n"
+            "2. Go to Checkout.\n"
+            "3. Confirm the Submit button is green."
+        )
+        # The prompt actually carries the ticket-specific context, not a
+        # generic template with nothing filled in.
+        assert "Change Submit button color to green" in captured_prompt["value"]
+        assert "Submit button renders green" in captured_prompt["value"]
+        assert ".submit { color: green; }" in captured_prompt["value"]
+
+    @pytest.mark.asyncio
+    async def test_llm_failure_falls_back_to_heuristic(self, workflow):
+        async def broken_llm(prompt):
+            raise RuntimeError("LLM unavailable")
+
+        workflow._llm_generate = broken_llm
+
+        result = await workflow._generate_testing_instructions(
+            "Add export button", "", "", ["CSV export downloads correctly"]
+        )
+
+        assert result is not None
+        assert "CSV export downloads correctly" in result
+
+    @pytest.mark.asyncio
+    async def test_llm_empty_response_falls_back_to_heuristic(self, workflow):
+        async def empty_llm(prompt):
+            return "   "
+
+        workflow._llm_generate = empty_llm
+
+        result = await workflow._generate_testing_instructions(
+            "Add export button", "", "", ["CSV export downloads correctly"]
+        )
+
+        assert result is not None
+        assert "CSV export downloads correctly" in result
+
+    @pytest.mark.asyncio
+    async def test_large_diff_is_truncated_before_prompting(self, workflow):
+        from src.workflows.human_gated_workflow import _MAX_TESTING_DIFF_CHARS
+
+        captured_prompt = {}
+
+        async def fake_llm(prompt):
+            captured_prompt["value"] = prompt
+            return "1. Do a thing."
+
+        workflow._llm_generate = fake_llm
+        huge_diff = "+" * (_MAX_TESTING_DIFF_CHARS + 5000)
+
+        await workflow._generate_testing_instructions(
+            "Big change", "", huge_diff, []
+        )
+
+        prompt = captured_prompt["value"]
+        assert "truncated" in prompt
+        # The full untruncated diff must not have been sent.
+        assert huge_diff not in prompt
+
+
+class TestTestingInstructionsInReadyForReview:
+    """The generated instructions actually reach the posted comment when
+    a ticket moves to Waiting for Human — the whole point of the feature."""
+
+    def _in_progress_ticket(self, workflow, lifecycle, tid="70"):
+        lifecycle.get_or_create(tid, "kanboard")
+        lifecycle.transition(tid, "kanboard", TicketState.READY)
+        lifecycle.transition(tid, "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.set_assignee(tid, "kanboard", "alice")
+        lifecycle.claim_ticket(tid, "kanboard", workflow._agent_id)
+        lifecycle.update_acceptance_criteria(
+            tid, "kanboard", "- [ ] Button renders green", "hash"
+        )
+        return lifecycle.get(tid, "kanboard")
+
+    @pytest.mark.asyncio
+    async def test_testing_instructions_posted_on_ready_for_review(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        self._in_progress_ticket(workflow, lifecycle, tid="70")
+        mock_branch.get_branch_diff = AsyncMock(
+            return_value="+ .submit { color: green; }"
+        )
+        task = MagicMock()
+        task.name = "Change Submit button color"
+        task.description = "Make the submit button green"
+        mock_kanban.get_task_by_id = AsyncMock(return_value=task)
+
+        async def fake_llm(prompt):
+            return "1. Open the preview.\n2. Confirm the button is green."
+
+        workflow._llm_generate = fake_llm
+
+        result = await workflow.signal_ready_for_review("70")
+
+        assert result is True
+        comment_body = mock_kanban.add_comment.call_args[0][1]
+        assert "How to test this" in comment_body
+        assert "Confirm the button is green" in comment_body
+
+    @pytest.mark.asyncio
+    async def test_no_llm_still_posts_heuristic_instructions_from_ac(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        self._in_progress_ticket(workflow, lifecycle, tid="71")
+        workflow._llm_generate = None
+
+        result = await workflow.signal_ready_for_review("71")
+
+        assert result is True
+        comment_body = mock_kanban.add_comment.call_args[0][1]
+        assert "How to test this" in comment_body
+        assert "Button renders green" in comment_body
+
+    @pytest.mark.asyncio
+    async def test_diff_fetch_failure_does_not_block_the_review_signal(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """A broken get_branch_diff() must not prevent signal_ready_for_review
+        from completing — testing instructions are a best-effort addition,
+        not a hard requirement to move the ticket to Waiting for Human."""
+        self._in_progress_ticket(workflow, lifecycle, tid="72")
+        mock_branch.get_branch_diff = AsyncMock(
+            side_effect=RuntimeError("git fetch failed")
+        )
+
+        result = await workflow.signal_ready_for_review("72")
+
+        assert result is True
+        rec = lifecycle.get("72", "kanboard")
+        assert rec.state == TicketState.WAITING_FOR_HUMAN
+
+
+# ---------------------------------------------------------------------------
 # Claim-release gaps: todo reset and restart ghosts
 # ---------------------------------------------------------------------------
 

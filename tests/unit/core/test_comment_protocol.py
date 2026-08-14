@@ -167,6 +167,36 @@ class TestCommentFormatter:
         )
         assert "http://localhost:9100" in body
 
+    def test_ready_for_review_omits_testing_section_when_not_given(self):
+        """No testing_instructions arg -> no 'How to test this' section at
+        all, not an empty one — matches the existing optional-section
+        convention (e.g. dev_env_url)."""
+        body = CommentFormatter.ready_for_review(
+            ticket_id="T-7b",
+            branch_name="b",
+            ac_items=["test"],
+        )
+        assert "How to test this" not in body
+
+    def test_ready_for_review_includes_testing_instructions_verbatim(self):
+        """The step-by-step manual-testing instructions must appear in
+        the comment body, verbatim — this is the whole point of the
+        feature: a human reading the ticket sees exactly what to do in
+        the live preview, not just that AC items are checked off."""
+        steps = (
+            "1. Open the live preview.\n"
+            "2. Go to the Checkout page.\n"
+            "3. Confirm the Submit button is now green, not blue."
+        )
+        body = CommentFormatter.ready_for_review(
+            ticket_id="T-7c",
+            branch_name="b",
+            ac_items=["test"],
+            testing_instructions=steps,
+        )
+        assert "How to test this" in body
+        assert steps in body
+
     def test_dev_env_started_shows_url_and_port(self):
         """dev_env_started comment shows URL and port."""
         body = CommentFormatter.dev_env_started(
