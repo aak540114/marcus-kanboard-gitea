@@ -1073,6 +1073,74 @@ class TestGenerateTestingInstructions:
         # The full untruncated diff must not have been sent.
         assert huge_diff not in prompt
 
+    @pytest.mark.asyncio
+    async def test_empty_diff_falls_back_to_heuristic_even_with_llm_configured(
+        self, workflow
+    ):
+        """Regression: the docstring promises an empty diff "degrades to
+        the heuristic fallback", but the code only ever checked whether
+        an LLM was configured — an LLM-configured deployment whose diff
+        fetch failed (empty diff_text) was sending the LLM a prompt with
+        an empty ```diff``` block instead of falling back, producing an
+        ungrounded response instead of the more reliable AC-based
+        heuristic."""
+        llm_called = {"yes": False}
+
+        async def fake_llm(prompt):
+            llm_called["yes"] = True
+            return "should not be reached"
+
+        workflow._llm_generate = fake_llm
+
+        result = await workflow._generate_testing_instructions(
+            "Some ticket", "desc", "", ["Verify the thing works"]
+        )
+
+        assert llm_called["yes"] is False
+        assert result is not None
+        assert "Verify the thing works" in result
+
+    @pytest.mark.asyncio
+    async def test_whitespace_only_diff_also_falls_back_to_heuristic(self, workflow):
+        llm_called = {"yes": False}
+
+        async def fake_llm(prompt):
+            llm_called["yes"] = True
+            return "should not be reached"
+
+        workflow._llm_generate = fake_llm
+
+        result = await workflow._generate_testing_instructions(
+            "Some ticket", "desc", "   \n  ", ["Verify the thing works"]
+        )
+
+        assert llm_called["yes"] is False
+        assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_llm_output_is_capped_to_a_reasonable_length(self, workflow):
+        """Regression: unlike _summarize_report (which hard-caps LLM
+        output to [:400] as a safety net even though its own prompt asks
+        for something short), this method applied no cap at all — an
+        uncooperative or verbose LLM response could balloon the posted
+        comment without bound."""
+        from src.workflows.human_gated_workflow import (
+            _MAX_TESTING_INSTRUCTIONS_CHARS,
+        )
+
+        async def verbose_llm(prompt):
+            return "x" * (_MAX_TESTING_INSTRUCTIONS_CHARS + 5000)
+
+        workflow._llm_generate = verbose_llm
+
+        result = await workflow._generate_testing_instructions(
+            "Title", "desc", "some diff content", []
+        )
+
+        assert result is not None
+        assert len(result) <= _MAX_TESTING_INSTRUCTIONS_CHARS + 200
+        assert "truncated" in result
+
 
 class TestTestingInstructionsInReadyForReview:
     """The generated instructions actually reach the posted comment when
@@ -1127,6 +1195,53 @@ class TestTestingInstructionsInReadyForReview:
         comment_body = mock_kanban.add_comment.call_args[0][1]
         assert "How to test this" in comment_body
         assert "Button renders green" in comment_body
+
+    @pytest.mark.asyncio
+    async def test_no_llm_skips_diff_fetch_entirely(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """Regression: the heuristic fallback never reads diff_text, so
+        fetching it anyway wastes a git diff fetch (network I/O) on
+        every single review signal in any deployment with no LLM wired
+        up. (get_task_by_id is NOT asserted here — _get_effective_gate
+        already calls it unconditionally, for unrelated project-gate
+        resolution, so a blanket "never called" assertion would be
+        testing something that was never true.)"""
+        self._in_progress_ticket(workflow, lifecycle, tid="73")
+        workflow._llm_generate = None
+        mock_branch.get_branch_diff = AsyncMock(return_value="+ something")
+
+        result = await workflow.signal_ready_for_review("73")
+
+        assert result is True
+        mock_branch.get_branch_diff.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_llm_ignores_task_title_and_description(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """Whatever get_task_by_id returns (fetched for unrelated gate
+        resolution — see the test above) must not leak into testing-
+        instructions generation when there's no LLM to use it: the
+        heuristic path must be invoked with the un-fetched defaults."""
+        self._in_progress_ticket(workflow, lifecycle, tid="74")
+        workflow._llm_generate = None
+        task = MagicMock()
+        task.name = "A real fetched title"
+        task.description = "A real fetched description"
+        mock_kanban.get_task_by_id = AsyncMock(return_value=task)
+
+        with patch.object(
+            workflow,
+            "_generate_testing_instructions",
+            wraps=workflow._generate_testing_instructions,
+        ) as spy:
+            result = await workflow.signal_ready_for_review("74")
+
+        assert result is True
+        call_args = spy.call_args.args
+        assert call_args[0] == "74"  # ticket_id default, not the fetched title
+        assert call_args[1] == ""  # not the fetched description
 
     @pytest.mark.asyncio
     async def test_diff_fetch_failure_does_not_block_the_review_signal(

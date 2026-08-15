@@ -139,6 +139,13 @@ _USAGE_SCALAR_MAX = 64        # max length of a used/limit/unit string value
 #: size.
 _MAX_TESTING_DIFF_CHARS = 12_000
 
+#: Hard cap on the LLM's raw output before it's posted to the ticket —
+#: matches _summarize_report's [:400] safety net (below), just sized for
+#: a multi-step numbered list rather than a one-line summary. The prompt
+#: already asks for something short; this is the defensive backstop for
+#: when it doesn't comply.
+_MAX_TESTING_INSTRUCTIONS_CHARS = 3_000
+
 
 def _safe_usage_scalar(value: Any, max_len: int = _USAGE_SCALAR_MAX) -> Any:
     """Coerce an agent-supplied usage value to a safe JSON scalar, or ``None``.
@@ -1536,7 +1543,13 @@ class HumanGatedWorkflow:
             there's nothing meaningful to say (no AC and no LLM
             configured, or an empty diff with no AC).
         """
-        if self._llm_generate is None:
+        if self._llm_generate is None or not diff_text.strip():
+            # No LLM configured, OR a diff that could not be fetched
+            # (empty/whitespace-only) — asking the LLM to describe how
+            # to test a change it cannot see produces an ungrounded (or
+            # outright hallucinated) response. The AC-based heuristic is
+            # strictly more reliable in that case, matching what this
+            # method's own docstring already promised.
             return self._heuristic_testing_instructions(ac_items)
 
         truncated_diff = diff_text[:_MAX_TESTING_DIFF_CHARS]
@@ -1578,7 +1591,15 @@ class HumanGatedWorkflow:
         try:
             result = await self._llm_generate(prompt)
             text = (result or "").strip()
-            return text or self._heuristic_testing_instructions(ac_items)
+            if not text:
+                return self._heuristic_testing_instructions(ac_items)
+            if len(text) > _MAX_TESTING_INSTRUCTIONS_CHARS:
+                text = (
+                    text[:_MAX_TESTING_INSTRUCTIONS_CHARS]
+                    + f"\n\n[... truncated at {_MAX_TESTING_INSTRUCTIONS_CHARS} "
+                    "characters ...]"
+                )
+            return text
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "LLM testing-instructions generation failed, falling back "
@@ -3030,29 +3051,35 @@ class HumanGatedWorkflow:
         # Best-effort: neither of these must ever block the review signal
         # itself (see the recoverability note above) — a transient
         # failure here just means the comment omits testing instructions,
-        # not that the ticket fails to reach Waiting for Human.
-        try:
-            diff_text = await branch_mgr.get_branch_diff(record.branch_name)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "Ticket %s: could not fetch diff for testing instructions: %s",
-                ticket_id,
-                exc,
-            )
-            diff_text = ""
+        # not that the ticket fails to reach Waiting for Human. Skipped
+        # entirely when no LLM is configured: _generate_testing_instructions
+        # falls straight to its AC-based heuristic in that case and never
+        # reads diff_text/ticket_title/ticket_description, so fetching
+        # them would just be a wasted git diff fetch (network I/O) and a
+        # Kanboard RPC call on every single review signal.
+        diff_text = ""
         ticket_title, ticket_description = ticket_id, ""
-        try:
-            task = await self._kanban.get_task_by_id(ticket_id)
-            if task:
-                ticket_title = task.name or ticket_title
-                ticket_description = task.description or ""
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "Ticket %s: could not fetch task details for testing "
-                "instructions: %s",
-                ticket_id,
-                exc,
-            )
+        if self._llm_generate is not None:
+            try:
+                diff_text = await branch_mgr.get_branch_diff(record.branch_name)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "Ticket %s: could not fetch diff for testing instructions: %s",
+                    ticket_id,
+                    exc,
+                )
+            try:
+                task = await self._kanban.get_task_by_id(ticket_id)
+                if task:
+                    ticket_title = task.name or ticket_title
+                    ticket_description = task.description or ""
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "Ticket %s: could not fetch task details for testing "
+                    "instructions: %s",
+                    ticket_id,
+                    exc,
+                )
         testing_instructions = await self._generate_testing_instructions(
             ticket_title, ticket_description, diff_text, ac_items
         )
