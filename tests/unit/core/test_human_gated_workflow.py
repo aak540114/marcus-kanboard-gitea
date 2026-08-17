@@ -1142,6 +1142,139 @@ class TestGenerateTestingInstructions:
         assert "truncated" in result
 
 
+class TestMoveColumnWithRetry:
+    """_move_column_with_retry() — regression coverage for the bug where
+    an AI agent posts its "Ready for Review" comment but the ticket
+    never visibly moves to Waiting for Human.
+
+    Root cause: move_task_to_column() frequently fails CLEANLY (returns
+    False, no exception) rather than raising, and every call site that
+    moved to "waiting for human" only ever caught a RAISED exception —
+    a clean False return was completely invisible, and even a caught
+    exception was just logged and forgotten. Either way Marcus's own
+    lifecycle state moved on regardless while the visible Kanboard card
+    silently stayed put.
+    """
+
+    @pytest.mark.asyncio
+    async def test_succeeds_on_first_attempt_no_retry_no_extra_comment(
+        self, workflow, mock_kanban
+    ):
+        mock_kanban.move_task_to_column = AsyncMock(return_value=True)
+
+        result = await workflow._move_column_with_retry("70", "waiting for human")
+
+        assert result is True
+        mock_kanban.move_task_to_column.assert_awaited_once_with(
+            "70", "waiting for human"
+        )
+        mock_kanban.add_comment.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_recovers_after_a_transient_clean_false_return(
+        self, workflow, mock_kanban
+    ):
+        """A clean False on the first attempt (no exception) — exactly
+        the silent-failure mode this bug is about — recovers on retry."""
+        mock_kanban.move_task_to_column = AsyncMock(side_effect=[False, True])
+
+        with patch(
+            "src.workflows.human_gated_workflow.asyncio.sleep", new=AsyncMock()
+        ) as sleep_mock:
+            result = await workflow._move_column_with_retry(
+                "70", "waiting for human"
+            )
+
+        assert result is True
+        assert mock_kanban.move_task_to_column.await_count == 2
+        sleep_mock.assert_awaited_once()
+        mock_kanban.add_comment.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_recovers_after_a_transient_exception(self, workflow, mock_kanban):
+        mock_kanban.move_task_to_column = AsyncMock(
+            side_effect=[RuntimeError("kanboard locked"), True]
+        )
+
+        with patch(
+            "src.workflows.human_gated_workflow.asyncio.sleep", new=AsyncMock()
+        ):
+            result = await workflow._move_column_with_retry(
+                "70", "waiting for human"
+            )
+
+        assert result is True
+        assert mock_kanban.move_task_to_column.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_exhausting_clean_false_retries_posts_warning_comment(
+        self, workflow, mock_kanban
+    ):
+        mock_kanban.move_task_to_column = AsyncMock(return_value=False)
+
+        with patch(
+            "src.workflows.human_gated_workflow.asyncio.sleep", new=AsyncMock()
+        ):
+            result = await workflow._move_column_with_retry(
+                "70", "waiting for human", attempts=3
+            )
+
+        assert result is False
+        assert mock_kanban.move_task_to_column.await_count == 3
+        mock_kanban.add_comment.assert_awaited_once()
+        comment_body = mock_kanban.add_comment.call_args[0][1]
+        assert "could not move this card" in comment_body.lower()
+        assert "Waiting For Human" in comment_body or "waiting for human" in comment_body.lower()
+
+    @pytest.mark.asyncio
+    async def test_exhausting_raised_exception_retries_posts_warning_comment(
+        self, workflow, mock_kanban
+    ):
+        mock_kanban.move_task_to_column = AsyncMock(
+            side_effect=RuntimeError("kanboard unreachable")
+        )
+
+        with patch(
+            "src.workflows.human_gated_workflow.asyncio.sleep", new=AsyncMock()
+        ):
+            result = await workflow._move_column_with_retry(
+                "70", "waiting for human", attempts=3
+            )
+
+        assert result is False
+        assert mock_kanban.move_task_to_column.await_count == 3
+        mock_kanban.add_comment.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_signal_ready_for_review_still_succeeds_when_column_move_fails(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """The column-move is best-effort: signal_ready_for_review must
+        still report success (the ticket really is done from the agent's
+        side, and Marcus's own lifecycle state IS correctly updated) even
+        when Kanboard's visible column never budges — but a human must
+        be told, via a comment on the ticket, rather than left confused."""
+        lifecycle.get_or_create("70", "kanboard")
+        lifecycle.transition("70", "kanboard", TicketState.READY)
+        lifecycle.transition("70", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.set_assignee("70", "kanboard", "alice")
+        lifecycle.claim_ticket("70", "kanboard", workflow._agent_id)
+        mock_kanban.move_task_to_column = AsyncMock(return_value=False)
+
+        with patch(
+            "src.workflows.human_gated_workflow.asyncio.sleep", new=AsyncMock()
+        ):
+            result = await workflow.signal_ready_for_review("70")
+
+        assert result is True
+        rec = lifecycle.get("70", "kanboard")
+        assert rec.state == TicketState.WAITING_FOR_HUMAN
+
+        posted_bodies = [c.args[1] for c in mock_kanban.add_comment.call_args_list]
+        assert any("Ready for Review" in b for b in posted_bodies)
+        assert any("could not move this card" in b.lower() for b in posted_bodies)
+
+
 class TestTestingInstructionsInReadyForReview:
     """The generated instructions actually reach the posted comment when
     a ticket moves to Waiting for Human — the whole point of the feature."""

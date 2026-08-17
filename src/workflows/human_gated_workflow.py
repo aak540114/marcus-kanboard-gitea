@@ -146,6 +146,13 @@ _MAX_TESTING_DIFF_CHARS = 12_000
 #: when it doesn't comply.
 _MAX_TESTING_INSTRUCTIONS_CHARS = 3_000
 
+#: KanboardKanban.move_task_to_column() often fails CLEANLY (returns False,
+#: no exception) rather than raising — e.g. a transient SQLite lock during
+#: the move or its verifying re-fetch. A short retry survives that kind of
+#: one-off blip without adding meaningful latency to a completion signal.
+_COLUMN_MOVE_MAX_ATTEMPTS = 3
+_COLUMN_MOVE_RETRY_DELAY_SECONDS = 1.0
+
 
 def _safe_usage_scalar(value: Any, max_len: int = _USAGE_SCALAR_MAX) -> Any:
     """Coerce an agent-supplied usage value to a safe JSON scalar, or ``None``.
@@ -2959,6 +2966,106 @@ class HumanGatedWorkflow:
         )
         return await self._post_comment(ticket_id, comment)
 
+    async def _move_column_with_retry(
+        self,
+        ticket_id: str,
+        column_name: str,
+        *,
+        attempts: int = _COLUMN_MOVE_MAX_ATTEMPTS,
+        delay: float = _COLUMN_MOVE_RETRY_DELAY_SECONDS,
+    ) -> bool:
+        """Move a ticket's kanban card to *column_name*, retrying and
+        surfacing a persistent failure on the ticket itself.
+
+        ``KanboardKanban.move_task_to_column`` frequently fails CLEANLY —
+        it returns ``False`` with no exception when its own resolve→move→
+        verify sequence doesn't stick (a transient SQLite lock during the
+        move or the verifying re-fetch is the common case; see that
+        method's own docstring). Every existing call site in this file
+        that doesn't already check the return value is exactly the bug
+        this fixes: the caller's ``try/except`` only ever catches a
+        RAISED exception, so a clean ``False`` return is invisible, and
+        even a raised-and-caught exception was previously just logged and
+        forgotten. Either way, Marcus's own lifecycle state moves on (the
+        ticket is correctly marked done/waiting/whatever in Marcus) while
+        the visible Kanboard card silently stays wherever it was — which
+        reads to a human as "the agent never actually finished," when it
+        did.
+
+        A short retry survives the common transient case outright. If
+        every attempt still fails, a warning comment is posted on the
+        ticket so a human isn't left staring at a stale card with no
+        explanation — the alternative (this method's predecessor
+        behaviour) left literally nothing on the ticket to explain the
+        mismatch.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Ticket identifier.
+        column_name : str
+            Target Kanboard column name (case-insensitive).
+        attempts : int
+            Total attempts before giving up.
+        delay : float
+            Seconds to wait between attempts.
+
+        Returns
+        -------
+        bool
+            ``True`` once the move is verified to have taken effect,
+            ``False`` if every attempt failed (a warning comment was
+            posted in that case).
+        """
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, attempts + 1):
+            moved = False
+            try:
+                moved = await self._kanban.move_task_to_column(
+                    ticket_id, column_name
+                )
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                moved = False
+            if moved:
+                return True
+            if attempt < attempts:
+                await asyncio.sleep(delay)
+
+        if last_exc is not None:
+            logger.warning(
+                "Could not move %s to '%s' after %d attempt(s): %s",
+                ticket_id,
+                column_name,
+                attempts,
+                last_exc,
+            )
+        else:
+            logger.warning(
+                "Ticket %s did NOT move to the '%s' column after %d "
+                "attempt(s) (does this project's board have a column "
+                "named %r?). Marcus's own lifecycle state is correct "
+                "regardless — only the visible Kanboard card may be "
+                "stale.",
+                ticket_id,
+                column_name,
+                attempts,
+                column_name,
+            )
+        try:
+            await self._post_comment(
+                ticket_id,
+                f"⚠️ Marcus could not move this card to the "
+                f"**{column_name.title()}** column after {attempts} "
+                "attempts (a Kanboard hiccup). This ticket's actual "
+                "status is correct in Marcus even though the card here "
+                "may look stale — refresh the board, or drag the card "
+                "manually if it still doesn't update.",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
     async def signal_ready_for_review(self, ticket_id: str) -> bool:
         """Signal that the AI agent is done.
 
@@ -3114,10 +3221,7 @@ class HumanGatedWorkflow:
             )
             return False
 
-        try:
-            await self._kanban.move_task_to_column(ticket_id, "waiting for human")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not update kanban column: %s", exc)
+        await self._move_column_with_retry(ticket_id, "waiting for human")
 
         # Reaching WAITING_FOR_HUMAN means the agent just resubmitted its
         # work for review — the actual merge attempt happens LATER, when
@@ -3218,10 +3322,7 @@ class HumanGatedWorkflow:
             logger.error("Cannot set %s to WAITING_FOR_HUMAN: %s", ticket_id, exc)
             return False
 
-        try:
-            await self._kanban.move_task_to_column(ticket_id, "waiting for human")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not update kanban column: %s", exc)
+        await self._move_column_with_retry(ticket_id, "waiting for human")
 
         await self._clear_merge_conflict_flag(ticket_id)
 
@@ -5725,10 +5826,7 @@ class HumanGatedWorkflow:
 
             # Stack still unknown: ask the human and pause.
             await self._post_comment(ticket_id, _WAITING_COMMENT)
-            try:
-                await self._kanban.move_task_to_column(ticket_id, "waiting for human")
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Could not move ticket to waiting for human: %s", exc)
+            await self._move_column_with_retry(ticket_id, "waiting for human")
             await self._clear_merge_conflict_flag(ticket_id)
             logger.info(
                 "Ticket %s paused — project description missing tech-stack info",
