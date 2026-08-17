@@ -129,20 +129,28 @@ services:
       #   WAL lets human UI reads proceed without blocking on Marcus's
       #   writes (and vice versa) instead of every access fighting over
       #   one exclusive file lock.
-      #   DB_TIMEOUT: PDO::ATTR_TIMEOUT — literally SQLite's own
-      #   busy_timeout mechanism, which internally RETRIES (sleeping
-      #   with backoff) for up to this many seconds before giving up and
-      #   throwing — i.e. this is the actual "keep trying until
-      #   successfully written" knob. Kanboard's PicoDb Sqlite driver
-      #   defaults it to 30s; raised well past that so any realistic
-      #   remaining contention (now much rarer with sessions moved off
-      #   this file) resolves inside the window instead of surfacing as
-      #   a crash. Deliberately NOT unbounded: Kanboard runs under
-      #   PHP-FPM with a finite worker pool, so many requests piling up
-      #   waiting on a truly stuck lock for an unbounded time would
-      #   exhaust it and freeze the whole UI — worse than an occasional
-      #   visible error. 300s is generous enough that this should never
-      #   be hit in practice while still bounding the worst case.
+      #   DB_TIMEOUT: PDO::ATTR_TIMEOUT — SQLite's own busy_timeout
+      #   mechanism, which internally RETRIES (sleeping with backoff) for
+      #   up to this many seconds before giving up and throwing. Kept set
+      #   here for when DB_DRIVER is mysql/postgres/mssql (DatabaseProvider
+      #   ::getSqlite/Mysql/Postgres/MssqlInstance() in app/ServiceProvider
+      #   /DatabaseProvider.php), where it IS wired through — but verified
+      #   directly against that file on v1.2.53 (the tag docker-compose.yml
+      #   pins): getSqliteInstance() builds its Database() call with only
+      #   'driver'/'filename'/'wal_mode', never forwarding DB_TIMEOUT at
+      #   all. So on SQLite specifically (this deployment's default and
+      #   only supported DB_DRIVER) this setting is currently a NO-OP —
+      #   PicoDb's Sqlite driver (libs/picodb/lib/PicoDb/Driver/Sqlite.php)
+      #   always falls back to its own hardcoded 30s regardless of what
+      #   this is set to. Not worth patching around: SESSION_HANDLER=file
+      #   above already removes the dominant contention source (every
+      #   human page load/AJAX call previously writing to this same
+      #   file), so the built-in 30s should rarely be tested in practice.
+      #   If "database is locked" crashes recur even after that fix is
+      #   actually applied to a running container (see below), that 30s
+      #   ceiling — not this setting — is the next thing to raise, and
+      #   doing so needs a bind-mounted patch to DatabaseProvider.php
+      #   itself, not an env var.
       SESSION_HANDLER: "file"
       DB_WAL_MODE: "true"
       DB_TIMEOUT: "300"
