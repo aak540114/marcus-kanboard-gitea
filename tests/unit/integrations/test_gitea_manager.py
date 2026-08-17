@@ -5,6 +5,8 @@ Every test mocks httpx.AsyncClient (or a pre-built AsyncMock client) — no
 real network or git calls are made.
 """
 
+import os
+
 import httpx
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -594,7 +596,15 @@ class TestMirrorClone:
         assert working_clone_call[2] == (
             "http://root:tok@localhost:3000/root/cloned-app.git"
         )
-        assert working_clone_call[3] == local_path
+        # The destination argument must be the BASENAME, not the full
+        # local_path — this command's cwd is already local_path's parent
+        # (see the relative-path regression test below for why passing
+        # the full path here is a real bug, not just a style nit).
+        assert working_clone_call[3] == os.path.basename(local_path)
+        working_clone_cwd = next(
+            cwd for (a, cwd) in run_calls if a[:2] == ("git", "clone") and a[2] != "--mirror"
+        )
+        assert working_clone_cwd == os.path.dirname(local_path)
         assert args_only.index(mirror_clone_call) < args_only.index(mirror_push_call)
         assert args_only.index(mirror_push_call) < args_only.index(working_clone_call)
 
@@ -659,3 +669,58 @@ class TestMirrorClone:
                     "http://localhost:3000/root/cloned-app.git",
                     local_path,
                 )
+
+    @pytest.mark.asyncio
+    async def test_working_clone_lands_at_relative_local_path_not_doubled(self):
+        """Regression: a RELATIVE local_path (the real deployment's config
+        — ProjectSyncWorkflow's default local_repos_base is "./repos", and
+        this specific instance was configured with "./data/repos") must
+        resolve to exactly that path, not a doubled-up path under itself.
+
+        Every OTHER test in this class uses pytest's tmp_path fixture,
+        which is always ABSOLUTE — an absolute destination argument to
+        `git clone` is resolved as absolute regardless of the subprocess's
+        own cwd, so those tests could never have caught this. The real bug:
+        the final working-tree clone ran with cwd=dirname(local_path) but
+        passed the FULL local_path (not just its basename) as the clone
+        destination argument. git resolves that argument relative to ITS
+        OWN cwd, so it actually cloned into
+        "<local_repos_base>/<local_repos_base>/<slug>" instead of
+        "<local_repos_base>/<slug>" — leaving the real local_path never
+        created. The very next command (git config, run with
+        cwd=local_path) then failed with exactly the production symptom:
+        FileNotFoundError: [Errno 2] No such file or directory:
+        './data/repos/testtttttt'.
+        """
+        mgr = GiteaManager("http://localhost:3000", "tok")
+        mgr._username = "root"
+
+        run_calls = []
+
+        async def fake_run_git(args, cwd):
+            run_calls.append((tuple(args), cwd))
+
+        local_path = "./data/repos/testtttttt"
+        with patch(
+            "src.integrations.gitea_manager._run_git", side_effect=fake_run_git
+        ):
+            await mgr.mirror_clone(
+                "http://localhost:3000/root/tic-tac-toe.git",
+                "http://localhost:3000/root/testtttttt.git",
+                local_path,
+            )
+
+        args, cwd = next(
+            (a, c) for (a, c) in run_calls if a[:2] == ("git", "clone") and a[2] != "--mirror"
+        )
+        dest_arg = args[3]
+        # This is exactly how git itself resolves a relative destination
+        # argument against the subprocess's cwd.
+        resolved = os.path.normpath(os.path.join(cwd, dest_arg))
+        assert resolved == os.path.normpath(local_path)
+
+        # And every subsequent command in this local_path (git config x2)
+        # must use a cwd that actually got created by the clone above —
+        # i.e. the real local_path, not the doubled one.
+        config_cwds = {c for (a, c) in run_calls if a[:2] == ("git", "config")}
+        assert config_cwds == {local_path}

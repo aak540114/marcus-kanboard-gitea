@@ -1045,8 +1045,13 @@ $cloneProjectStatusUrl = $marcusUrl . '/api/clone-project-status';
                     }
                     if (data.status === 'done') {
                         var warnCount = (data.warnings || []).length;
-                        statusEl.textContent = 'Clone complete (project #' + mEsc(data.new_project_id) + ')'
-                            + (warnCount ? ' — ' + warnCount + ' warning(s), see Marcus logs' : '') + '.';
+                        // Kanboard's own board route is board/<project_id> —
+                        // window.location.origin is always Kanboard's own
+                        // origin here, since this script only ever runs
+                        // inside a Kanboard-served page.
+                        var boardUrl = window.location.origin + '/board/' + encodeURIComponent(data.new_project_id);
+                        statusEl.innerHTML = 'Clone complete — <a href="' + mEsc(boardUrl) + '" target="_blank" rel="noopener noreferrer">open project #' + mEsc(data.new_project_id) + '</a>'
+                            + (warnCount ? ' (' + warnCount + ' warning(s), see Marcus logs)' : '') + '.';
                         return;
                     }
                     statusEl.textContent = 'Clone failed: ' + mEsc(data.error || 'unknown error');

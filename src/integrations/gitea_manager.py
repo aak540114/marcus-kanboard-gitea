@@ -410,10 +410,21 @@ class GiteaManager:
             )
             await _run_git(["git", "push", "--mirror", auth_dest], cwd=mirror_dir)
 
-        os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+        # This command's cwd is already local_path's PARENT (see above), so
+        # git must be given just the basename as the destination argument
+        # — passing the full (possibly relative) local_path here would have
+        # git resolve it AGAIN relative to that same parent, doubling it
+        # (e.g. "./data/repos/./data/repos/x" instead of "./data/repos/x")
+        # and silently cloning into the wrong place. Harmless with the
+        # absolute tmp_path-based paths every unit test uses, but a real
+        # bug with the relative paths this actually runs with in
+        # production (ProjectSyncWorkflow's local_repos_base is a relative
+        # path like "./repos" or "./data/repos").
+        parent_dir = os.path.dirname(local_path) or "."
+        os.makedirs(parent_dir, exist_ok=True)
         await _run_git(
-            ["git", "clone", auth_dest, local_path],
-            cwd=os.path.dirname(local_path) or ".",
+            ["git", "clone", auth_dest, os.path.basename(local_path)],
+            cwd=parent_dir,
         )
         await _run_git(["git", "config", "user.email", "marcus@localhost"], cwd=local_path)
         await _run_git(["git", "config", "user.name", "Marcus"], cwd=local_path)
