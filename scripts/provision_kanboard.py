@@ -246,7 +246,9 @@ def grant_project_membership_to_all_users(
             )
 
 
-def find_or_create_project(base_url: str, token: str, name: str) -> int:
+def find_or_create_project(
+    base_url: str, token: str, name: str, description: Optional[str] = None
+) -> int:
     """Return the id of the project named ``name``, creating it if absent.
 
     Parameters
@@ -257,6 +259,14 @@ def find_or_create_project(base_url: str, token: str, name: str) -> int:
         API_AUTHENTICATION_TOKEN value.
     name : str
         Project name to find or create.
+    description : Optional[str]
+        Description to set ONLY when this call actually creates a new
+        project (``ProjectProcedure::createProject``'s own second
+        parameter — set in the same RPC call as creation, not a separate
+        ``updateProject``). Deliberately never applied when an existing
+        project is found instead: a human may since have rewritten this
+        project's description, and setup.sh's own "safe to re-run"
+        guarantee means a later run must never overwrite that edit.
 
     Returns
     -------
@@ -280,7 +290,8 @@ def find_or_create_project(base_url: str, token: str, name: str) -> int:
     # ProjectModel::create()'s return value directly) — no need for a
     # second getProjectByName round-trip just to re-fetch what we
     # already received.
-    result = call_rpc(base_url, token, "createProject", [name])
+    params: List[Any] = [name, description] if description else [name]
+    result = call_rpc(base_url, token, "createProject", params)
     if not result:
         raise KanboardRPCError(f"createProject({name!r}) returned a falsy result")
     project_id = int(result)
@@ -424,6 +435,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--token", required=True, help="API_AUTHENTICATION_TOKEN value")
     parser.add_argument("--project-name", required=True, help="Project name to find or create")
     parser.add_argument(
+        "--project-description",
+        default=None,
+        help=(
+            "Description to set on the project — ONLY applied when this "
+            "run actually creates it; never touched when an existing "
+            "project by this name is found instead (see "
+            "find_or_create_project's docstring)."
+        ),
+    )
+    parser.add_argument(
         "--secure-admin",
         nargs=2,
         metavar=("USERNAME", "PASSWORD"),
@@ -437,7 +458,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        project_id = find_or_create_project(args.url, args.token, args.project_name)
+        project_id = find_or_create_project(
+            args.url, args.token, args.project_name, args.project_description
+        )
         added = reconcile_columns(args.url, args.token, project_id)
         if args.secure_admin:
             username, password = args.secure_admin

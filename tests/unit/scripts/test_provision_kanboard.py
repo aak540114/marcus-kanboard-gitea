@@ -202,6 +202,88 @@ class TestFindOrCreateProject:
         assert project_id == 3
         assert m.call_count == 3  # getProjectByName + createProject + getAllUsers
 
+    def test_description_included_when_creating(self):
+        """A description is passed straight into the createProject call
+        (its own second parameter) when this run actually creates the
+        project — one RPC call, not a separate updateProject."""
+        calls = []
+
+        def fake_urlopen(req, timeout=None):
+            body = json.loads(req.data)
+            calls.append((body["method"], body["params"]))
+            if body["method"] == "getProjectByName":
+                return _rpc_response(False)
+            if body["method"] == "createProject":
+                return _rpc_response(3)
+            if body["method"] == "getAllUsers":
+                return _rpc_response([])
+            raise AssertionError(f"unexpected RPC call: {body['method']}")
+
+        with patch("provision_kanboard.urllib.request.urlopen", side_effect=fake_urlopen):
+            project_id = pk.find_or_create_project(
+                "http://x/jsonrpc.php",
+                "tok",
+                "Sample Project",
+                "Created automatically by setup.sh.",
+            )
+
+        assert project_id == 3
+        create_call = next(c for c in calls if c[0] == "createProject")
+        assert create_call[1] == ["Sample Project", "Created automatically by setup.sh."]
+
+    def test_no_description_omits_it_from_create_call(self):
+        """Backward compatible: calling with no description still creates
+        the project, sending just the name (matching the pre-existing
+        call shape callers/tests already depend on)."""
+        calls = []
+
+        def fake_urlopen(req, timeout=None):
+            body = json.loads(req.data)
+            calls.append((body["method"], body["params"]))
+            if body["method"] == "getProjectByName":
+                return _rpc_response(False)
+            if body["method"] == "createProject":
+                return _rpc_response(3)
+            if body["method"] == "getAllUsers":
+                return _rpc_response([])
+            raise AssertionError(f"unexpected RPC call: {body['method']}")
+
+        with patch("provision_kanboard.urllib.request.urlopen", side_effect=fake_urlopen):
+            pk.find_or_create_project("http://x/jsonrpc.php", "tok", "Sample Project")
+
+        create_call = next(c for c in calls if c[0] == "createProject")
+        assert create_call[1] == ["Sample Project"]
+
+    def test_description_not_applied_when_project_already_exists(self):
+        """Regression: a description must NEVER be applied to an
+        ALREADY-EXISTING project. setup.sh is documented as safe to
+        re-run — if a human has since rewritten this project's
+        description, a later setup.sh run must never overwrite it. No
+        updateProject (or any description-setting) call may occur on
+        this path at all."""
+        calls = []
+
+        def fake_urlopen(req, timeout=None):
+            body = json.loads(req.data)
+            calls.append(body["method"])
+            if body["method"] == "getProjectByName":
+                return _rpc_response({"id": "7", "name": "Sample Project"})
+            if body["method"] == "getAllUsers":
+                return _rpc_response([])
+            raise AssertionError(f"unexpected RPC call: {body['method']}")
+
+        with patch("provision_kanboard.urllib.request.urlopen", side_effect=fake_urlopen):
+            project_id = pk.find_or_create_project(
+                "http://x/jsonrpc.php",
+                "tok",
+                "Sample Project",
+                "This description must never be applied.",
+            )
+
+        assert project_id == 7
+        assert "createProject" not in calls
+        assert "updateProject" not in calls
+
     def test_raises_if_create_returns_falsy(self):
         """createProject returning a falsy result (Kanboard's own failure
         signal) raises rather than silently returning a bad id."""

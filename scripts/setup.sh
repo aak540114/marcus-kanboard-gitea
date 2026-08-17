@@ -126,7 +126,7 @@ if [ -z "$(env_get GITEA_WEBHOOK_TOKEN)" ]; then
     env_set GITEA_WEBHOOK_TOKEN "$(openssl rand -hex 32)"
 fi
 if [ -z "$(env_get KANBOARD_PROJECT_NAME)" ]; then
-    env_set KANBOARD_PROJECT_NAME "Marcus Project"
+    env_set KANBOARD_PROJECT_NAME "Sample Project"
 fi
 if [ -z "$(env_get GITEA_ADMIN_PASSWORD)" ]; then
     # Randomly generated (unlike Kanboard's admin/admin, which Kanboard's
@@ -459,6 +459,11 @@ provision_args=(
     --url "http://localhost:8080/jsonrpc.php"
     --token "$(env_get KANBOARD_API_TOKEN)"
     --project-name "$(env_get KANBOARD_PROJECT_NAME)"
+    # Only applied when this run actually CREATES the project (see
+    # find_or_create_project's docstring) — a re-run that finds it
+    # already existing never touches its description, so a human's own
+    # edit here is never clobbered.
+    --project-description "Created automatically by ./scripts/setup.sh as a starter project. Not required by Marcus — feel free to rename, reuse, or delete it if you don't need it."
 )
 # Only replace admin/admin when Kanboard is actually being published beyond
 # localhost — for the default local-only deployment this stays as-is, same
