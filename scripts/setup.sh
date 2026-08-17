@@ -403,6 +403,54 @@ if ! docker compose up -d --wait --wait-timeout 120 kanboard gitea; then
 fi
 
 # ---------------------------------------------------------------------
+# 3b. Make Marcus's columns Kanboard's own default for EVERY new project
+#     — not just the one provisioned below. Kanboard's BoardModel::
+#     getUserColumns() reads a global 'board_columns' setting (a CSV of
+#     column titles, defaulting to "Backlog,Ready,Work in
+#     progress,Done") and applies it to any project created from that
+#     point on — via this script, via the clone-project feature, or via
+#     a human just clicking "New project" in Kanboard's own UI (verified
+#     against the v1.2.53 source, the tag docker-compose.yml pins).
+#
+#     Without this, a project a human creates directly in Kanboard's UI
+#     keeps Kanboard's stock columns until something ELSE reconciles
+#     them — and column reconciliation only otherwise happens reactively
+#     (the first time a ticket needs to move to a column that doesn't
+#     exist), which never fires for a project with zero tickets. Setting
+#     this now means every future project is born with the right columns
+#     — no reconciliation needed, no window where it's wrong.
+#
+#     Same "no JSON-RPC method for this" situation as the webhook seed
+#     below (confirmed: Kanboard exposes no config/settings RPC
+#     procedure) — same fix: a direct row in the `settings` table,
+#     read fresh on every project creation with no caching.
+# ---------------------------------------------------------------------
+
+log "Setting Kanboard's default board columns..."
+columns_seeded="false"
+for columns_attempt in 1 2 3 4 5; do
+    if docker compose exec -T kanboard php -r '
+$columns = $argv[1];
+$pdo = new PDO("sqlite:/var/www/app/data/db.sqlite");
+$stmt = $pdo->prepare(
+    "INSERT INTO settings (option, value) VALUES (?, ?) " .
+    "ON CONFLICT(option) DO UPDATE SET value=excluded.value"
+);
+$stmt->execute(["board_columns", $columns]);
+' -- "Todo,Ready,In Progress,Blocked,Waiting for Human,Done"; then
+        columns_seeded="true"
+        break
+    fi
+    log "Default-columns seed attempt $columns_attempt failed (likely a transient SQLite lock) — retrying..."
+    sleep 2
+done
+if [ "$columns_seeded" != "true" ]; then
+    err "Could not set Kanboard's default board columns after 5 attempts."
+    exit 1
+fi
+log "Default board columns set: Todo, Ready, In Progress, Blocked, Waiting for Human, Done"
+
+# ---------------------------------------------------------------------
 # 4. Provision the Kanboard project + columns.
 # ---------------------------------------------------------------------
 

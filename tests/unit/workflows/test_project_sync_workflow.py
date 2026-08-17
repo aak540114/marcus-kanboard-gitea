@@ -111,6 +111,84 @@ class TestOnProjectCreated:
         assert workflow.get_repo_for_project(3) is None
 
 
+class TestOnProjectCreatedColumnReconciliation:
+    """Regression: column reconciliation used to only ever happen
+    REACTIVELY, inside move_task_to_column's escalation, the first time
+    a ticket needed to move to a column that doesn't exist. A brand-new
+    project with zero tickets never triggers that — so a freshly-enabled
+    empty project's columns stayed wrong no matter how long Marcus was
+    enabled or how many agents connected. _on_project_created is the one
+    handler BOTH the instant-enable path and the backstop poll route
+    through (both publish project.created), so reconciling columns here
+    too closes the gap for every provisioning path at once.
+    """
+
+    @pytest.fixture()
+    def kanban(self):
+        client = MagicMock()
+        client.ensure_columns = AsyncMock(return_value=True)
+        return client
+
+    @pytest.fixture()
+    def workflow_with_kanban(self, tmp_path, gitea_mgr, kanban):
+        events = MagicMock()
+        events.subscribe = MagicMock()
+        return ProjectSyncWorkflow(
+            gitea_manager=gitea_mgr,
+            events=events,
+            repos_path=str(tmp_path / "project_repos.json"),
+            local_repos_base=str(tmp_path / "repos"),
+            kanban=kanban,
+        )
+
+    @pytest.mark.asyncio
+    async def test_reconciles_columns_for_newly_seen_project(
+        self, workflow_with_kanban, kanban
+    ):
+        await workflow_with_kanban._on_project_created(
+            _make_event(1, "Shopping Cart")
+        )
+        kanban.ensure_columns.assert_awaited_once_with(1)
+
+    @pytest.mark.asyncio
+    async def test_no_kanban_configured_is_a_silent_noop(self, workflow, gitea_mgr):
+        """The default `workflow` fixture has no kanban client — must not
+        raise, and the repo still gets created normally."""
+        await workflow._on_project_created(_make_event(1, "Shopping Cart"))
+        assert workflow.get_repo_for_project(1) is not None
+
+    @pytest.mark.asyncio
+    async def test_column_reconciliation_failure_does_not_block_repo_mapping(
+        self, workflow_with_kanban, kanban, gitea_mgr
+    ):
+        """A column-reconciliation failure must not undo (or prevent) the
+        repo mapping that already succeeded — repo provisioning and
+        column reconciliation are independent best-effort steps."""
+        kanban.ensure_columns = AsyncMock(side_effect=RuntimeError("kanboard down"))
+
+        await workflow_with_kanban._on_project_created(
+            _make_event(1, "Shopping Cart")
+        )
+
+        assert workflow_with_kanban.get_repo_for_project(1) is not None
+        gitea_mgr.create_repo.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_repo_failure_still_attempts_column_reconciliation(
+        self, workflow_with_kanban, kanban, gitea_mgr
+    ):
+        """The two steps are independent: a Gitea failure must not skip
+        column reconciliation — a human still benefits from correct
+        columns even if the repo isn't ready yet."""
+        gitea_mgr.create_repo = AsyncMock(side_effect=RuntimeError("gitea unreachable"))
+
+        await workflow_with_kanban._on_project_created(
+            _make_event(1, "Shopping Cart")
+        )
+
+        kanban.ensure_columns.assert_awaited_once_with(1)
+
+
 class TestEnsureRepo:
     @pytest.mark.asyncio
     async def test_creates_repo_and_returns_mapping(self, workflow, gitea_mgr):

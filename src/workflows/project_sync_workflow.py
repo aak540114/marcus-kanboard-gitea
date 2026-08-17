@@ -71,6 +71,7 @@ class ProjectSyncWorkflow:
         local_repos_base: str = "./repos",
         webhook_target_url: Optional[str] = None,
         webhook_secret: Optional[str] = None,
+        kanban: Optional[Any] = None,
     ) -> None:
         """Initialise the workflow.
 
@@ -83,6 +84,14 @@ class ProjectSyncWorkflow:
             automatically gets a push webhook — no manual setup required.
         webhook_secret : Optional[str]
             Shared HMAC secret for signing webhook deliveries.
+        kanban : Optional[Any]
+            Connected ``KanboardKanban`` instance (the shared
+            ``server.kanban_client``), used to reconcile a newly-seen
+            project's columns to Marcus's layout the moment it's
+            discovered — see :meth:`_on_project_created`. ``None`` skips
+            that step (e.g. a non-Kanboard provider), leaving columns to
+            reconcile reactively the first time a ticket needs to move to
+            a column that doesn't exist yet.
         """
         self._gitea = gitea_manager
         self._events = events
@@ -90,6 +99,7 @@ class ProjectSyncWorkflow:
         self._local_repos_base = local_repos_base
         self._webhook_target_url = webhook_target_url
         self._webhook_secret = webhook_secret
+        self._kanban = kanban
         self._mapping: Dict[str, Dict[str, Any]] = self._load_mapping()
         # Serializes ensure_repo end-to-end — see that method's docstring
         # for the races this closes (duplicate repo creation for the same
@@ -115,7 +125,22 @@ class ProjectSyncWorkflow:
     # ------------------------------------------------------------------
 
     async def _on_project_created(self, event: Any) -> None:
-        """Handle a new Kanboard project by creating a Gitea repo.
+        """Handle a newly-seen project: create its Gitea repo AND
+        reconcile its board columns to Marcus's layout.
+
+        This is the ONE handler both provisioning paths route through —
+        the instant ``PUT /api/project-enabled`` trigger and the slow
+        ``ProjectWatcher`` backstop poll both publish ``project.created``,
+        never call ``ensure_columns`` directly. Column reconciliation
+        would otherwise only ever happen reactively, inside
+        ``move_task_to_column``'s escalation, the first time Marcus tries
+        to move some ticket to a column that doesn't exist — which never
+        fires for a project with zero tickets, so a freshly-enabled empty
+        project's columns would stay wrong indefinitely no matter how
+        long it's enabled or how many agents connect. Reconciling here
+        too closes that gap: a project gets Marcus's columns the moment
+        it's discovered, before any ticket exists to trigger the reactive
+        path.
 
         Parameters
         ----------
@@ -128,6 +153,34 @@ class ProjectSyncWorkflow:
         name = data.get("project_name", f"project-{pid}")
         description = data.get("project_description", "")
         await self.ensure_repo(pid, name, description)
+        await self._ensure_columns(pid)
+
+    async def _ensure_columns(self, project_id: int) -> None:
+        """Reconcile a newly-seen project's columns, best-effort.
+
+        A failure here (or no ``kanban`` client configured — e.g. a
+        non-Kanboard provider) must never block repo provisioning, which
+        already completed by the time this runs; it just means this
+        project falls back to the reactive, first-ticket-move
+        reconciliation path instead.
+
+        Parameters
+        ----------
+        project_id : int
+            Kanboard project id to reconcile.
+        """
+        if self._kanban is None:
+            return
+        try:
+            await self._kanban.ensure_columns(project_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not reconcile columns for newly-seen project %d: "
+                "%s (will still reconcile reactively on first ticket "
+                "move)",
+                project_id,
+                exc,
+            )
 
     # ------------------------------------------------------------------
     # On-demand provisioning

@@ -4222,6 +4222,7 @@ async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
                 local_repos_base="./data/repos",
                 webhook_target_url=webhook_target,
                 webhook_secret=webhook_secret,
+                kanban=server.kanban_client,
             )
             project_sync.subscribe()
             server._gitea_manager = gitea_mgr  # type: ignore[attr-defined]
