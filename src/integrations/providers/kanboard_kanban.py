@@ -1594,7 +1594,91 @@ class KanboardKanban(KanbanInterface):
         result = await self._rpc("createProject", name=name)
         if not result:
             raise RuntimeError(f"Kanboard createProject({name!r}) returned a falsy result")
-        return int(result)
+        project_id = int(result)
+        await self._grant_project_membership_to_all_users(project_id)
+        return project_id
+
+    async def _grant_project_membership_to_all_users(self, project_id: int) -> None:
+        """Give every active Kanboard user membership on *project_id*.
+
+        Kanboard's own ``createProject`` procedure only auto-adds the
+        creator as a project member when the caller is an interactively
+        logged-in user (``ProjectProcedure::createProject`` passes
+        ``$this->userSession->isLogged()`` straight through as
+        ``ProjectModel::create()``'s ``$addUser`` flag — verified against
+        the v1.2.53 source). Marcus always authenticates as the app-level
+        API token, never a logged-in session, so that flag is permanently
+        ``false`` for every project Marcus creates — no
+        ``project_has_users`` row is ever inserted. That row is exactly
+        what Kanboard's dashboard "My projects" list requires
+        (``ProjectUserRoleModel::getProjectsByUser``, joined strictly on
+        that table): unlike opening a project by its direct board URL,
+        which an admin account can always do
+        (``ProjectPermissionModel::isUserAllowed`` short-circuits true for
+        ``isAdmin()``), the dashboard LISTING query has no such bypass —
+        so a project Marcus creates is technically fully usable by
+        direct link, but invisible on every human's own dashboard, with
+        no error or warning anywhere to explain why.
+
+        Best-effort: a failure here does not fail project creation itself
+        — the project is still fully usable by direct link even if this
+        step can't run (e.g. a Kanboard permissions quirk on a
+        non-default install), matching this module's existing philosophy
+        of not blocking on a degraded-but-recoverable step.
+
+        Parameters
+        ----------
+        project_id : int
+            The newly created project's id.
+        """
+        try:
+            users = await self._rpc("getAllUsers")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not list Kanboard users to grant access to new "
+                "project %d — it will only be reachable by direct link "
+                "for admin accounts: %s",
+                project_id,
+                exc,
+            )
+            return
+
+        if not isinstance(users, list):
+            logger.warning(
+                "Unexpected getAllUsers response (%s) — skipping access "
+                "grants for new project %d; it will only be reachable by "
+                "direct link for admin accounts.",
+                type(users).__name__,
+                project_id,
+            )
+            return
+
+        for user in users:
+            try:
+                user_id = int(user.get("id"))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            # Only skip a user explicitly marked inactive — anything else
+            # (field absent, unexpected type) defaults to including them,
+            # since a missed grant silently hides the project rather than
+            # erroring loudly.
+            is_active = user.get("is_active")
+            if is_active is not None and not int(is_active):
+                continue
+            try:
+                await self._rpc(
+                    "addProjectUser",
+                    project_id=project_id,
+                    user_id=user_id,
+                    role="project-manager",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Could not grant user %d access to new project %d: %s",
+                    user_id,
+                    project_id,
+                    exc,
+                )
 
     async def get_project_name(self, project_id: int) -> Optional[str]:
         """Return a Kanboard project's name by id.

@@ -2421,6 +2421,147 @@ class TestCreateProject:
         with pytest.raises(RuntimeError, match="createProject"):
             await kanban_instance.create_project("Duplicate Name")
 
+    @pytest.mark.asyncio
+    async def test_grants_membership_to_every_active_user(self, kanban):
+        """Regression: Marcus authenticates to Kanboard as the app-level
+        API token, never a logged-in session, so Kanboard's own
+        createProject never adds a project_has_users row for the project
+        it just made (ProjectProcedure::createProject only does that when
+        $this->userSession->isLogged() is true — verified against the
+        v1.2.53 source). Without that row, Kanboard's own dashboard "My
+        projects" list never shows the new project to ANY user, admin
+        included — its listing query has no admin bypass (unlike opening
+        the project by direct URL, which does). create_project() must
+        grant membership itself, for every active user, right after
+        creating the project.
+        """
+        calls = []
+
+        async def fake_rpc(method, **params):
+            calls.append((method, params))
+            if method == "createProject":
+                return 42
+            if method == "getAllUsers":
+                return [
+                    {"id": "1", "username": "admin", "is_active": "1"},
+                    {"id": "2", "username": "marcus_admin", "is_active": 1},
+                ]
+            if method == "addProjectUser":
+                return True
+            raise AssertionError(f"unexpected RPC call: {method}")
+
+        kanban._client = AsyncMock()  # only needs to be non-None
+        kanban._rpc = AsyncMock(side_effect=fake_rpc)
+
+        result = await kanban.create_project("Cloned Project")
+
+        assert result == 42
+        grant_calls = [c for c in calls if c[0] == "addProjectUser"]
+        assert {c[1]["user_id"] for c in grant_calls} == {1, 2}
+        assert all(c[1]["project_id"] == 42 for c in grant_calls)
+        assert all(c[1]["role"] == "project-manager" for c in grant_calls)
+
+    @pytest.mark.asyncio
+    async def test_skips_explicitly_inactive_users(self, kanban):
+        calls = []
+
+        async def fake_rpc(method, **params):
+            calls.append((method, params))
+            if method == "createProject":
+                return 42
+            if method == "getAllUsers":
+                return [
+                    {"id": "1", "is_active": "1"},
+                    {"id": "2", "is_active": "0"},
+                    {"id": "3", "is_active": 0},
+                ]
+            if method == "addProjectUser":
+                return True
+            raise AssertionError(f"unexpected RPC call: {method}")
+
+        kanban._client = AsyncMock()
+        kanban._rpc = AsyncMock(side_effect=fake_rpc)
+
+        await kanban.create_project("Cloned Project")
+
+        granted = {c[1]["user_id"] for c in calls if c[0] == "addProjectUser"}
+        assert granted == {1}
+
+    @pytest.mark.asyncio
+    async def test_missing_is_active_field_defaults_to_included(self, kanban):
+        """A user dict with no is_active field at all must still be
+        granted access — only an EXPLICIT falsy is_active excludes a
+        user, so an unexpected/older Kanboard response shape fails open
+        (project stays visible) rather than closed (project stays
+        hidden)."""
+        calls = []
+
+        async def fake_rpc(method, **params):
+            calls.append((method, params))
+            if method == "createProject":
+                return 42
+            if method == "getAllUsers":
+                return [{"id": "1"}]
+            if method == "addProjectUser":
+                return True
+            raise AssertionError(f"unexpected RPC call: {method}")
+
+        kanban._client = AsyncMock()
+        kanban._rpc = AsyncMock(side_effect=fake_rpc)
+
+        await kanban.create_project("Cloned Project")
+
+        granted = {c[1]["user_id"] for c in calls if c[0] == "addProjectUser"}
+        assert granted == {1}
+
+    @pytest.mark.asyncio
+    async def test_project_creation_survives_getAllUsers_failure(self, kanban):
+        """A failure listing users must not take down project creation
+        itself — the project is still fully usable by direct link even
+        if nobody could be auto-granted dashboard visibility."""
+
+        async def fake_rpc(method, **params):
+            if method == "createProject":
+                return 42
+            if method == "getAllUsers":
+                raise RuntimeError("kanboard unreachable")
+            raise AssertionError(f"unexpected RPC call: {method}")
+
+        kanban._client = AsyncMock()
+        kanban._rpc = AsyncMock(side_effect=fake_rpc)
+
+        result = await kanban.create_project("Cloned Project")
+        assert result == 42
+
+    @pytest.mark.asyncio
+    async def test_project_creation_survives_one_bad_addProjectUser_call(
+        self, kanban
+    ):
+        """One user's grant failing (e.g. a stale/removed account) must
+        not stop the rest of the active users from being granted."""
+        calls = []
+
+        async def fake_rpc(method, **params):
+            calls.append((method, params))
+            if method == "createProject":
+                return 42
+            if method == "getAllUsers":
+                return [{"id": "1", "is_active": "1"}, {"id": "2", "is_active": "1"}]
+            if method == "addProjectUser":
+                if params["user_id"] == 1:
+                    raise RuntimeError("user 1 no longer exists")
+                return True
+            raise AssertionError(f"unexpected RPC call: {method}")
+
+        kanban._client = AsyncMock()
+        kanban._rpc = AsyncMock(side_effect=fake_rpc)
+
+        result = await kanban.create_project("Cloned Project")
+
+        assert result == 42
+        granted = {c[1]["user_id"] for c in calls if c[0] == "addProjectUser"}
+        assert granted == {1, 2}  # both were attempted despite #1 failing
+
 
 # ---------------------------------------------------------------------------
 # get_project_metrics tests

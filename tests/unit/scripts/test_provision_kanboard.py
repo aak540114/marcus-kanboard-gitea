@@ -172,14 +172,20 @@ class TestFindOrCreateProject:
     own return value instead of a redundant re-fetch."""
 
     def test_returns_existing_project_id_without_creating(self):
-        """An existing project is found and returned with a single RPC call."""
-        responses = [_rpc_response({"id": "7", "name": "Marcus Project"})]
+        """An existing project is found and returned — plus a membership
+        self-heal pass (getAllUsers), so a project provisioned before
+        grant_project_membership_to_all_users existed becomes visible on
+        the dashboard again on the next setup.sh re-run."""
+        responses = [
+            _rpc_response({"id": "7", "name": "Marcus Project"}),
+            _rpc_response([]),  # getAllUsers — nobody to grant, kept simple
+        ]
 
         with patch("provision_kanboard.urllib.request.urlopen", side_effect=responses) as m:
             project_id = pk.find_or_create_project("http://x/jsonrpc.php", "tok", "Marcus Project")
 
         assert project_id == 7
-        assert m.call_count == 1  # only getProjectByName — no createProject call
+        assert m.call_count == 2  # getProjectByName + getAllUsers — no createProject call
 
     def test_creates_project_when_missing(self):
         """A missing project is created; the id comes from createProject's
@@ -187,13 +193,14 @@ class TestFindOrCreateProject:
         responses = [
             _rpc_response(False),  # getProjectByName: not found
             _rpc_response(3),  # createProject returns the new int id directly
+            _rpc_response([]),  # getAllUsers — nobody to grant, kept simple
         ]
 
         with patch("provision_kanboard.urllib.request.urlopen", side_effect=responses) as m:
             project_id = pk.find_or_create_project("http://x/jsonrpc.php", "tok", "Marcus Project")
 
         assert project_id == 3
-        assert m.call_count == 2  # getProjectByName + createProject only
+        assert m.call_count == 3  # getProjectByName + createProject + getAllUsers
 
     def test_raises_if_create_returns_falsy(self):
         """createProject returning a falsy result (Kanboard's own failure
@@ -206,6 +213,97 @@ class TestFindOrCreateProject:
         with patch("provision_kanboard.urllib.request.urlopen", side_effect=responses):
             with pytest.raises(pk.KanboardRPCError):
                 pk.find_or_create_project("http://x/jsonrpc.php", "tok", "Marcus Project")
+
+
+class TestGrantProjectMembershipToAllUsers:
+    """grant_project_membership_to_all_users() — self-heal a project
+    Marcus created via the API-token auth path (never a logged-in
+    session), so Kanboard's own createProject never adds it to
+    project_has_users — the exact row Kanboard's dashboard "My projects"
+    list requires, with no admin bypass (unlike opening the project by
+    direct board URL, which admin accounts can always do)."""
+
+    def test_grants_every_active_user(self):
+        calls = []
+
+        def fake_urlopen(req, timeout=None):
+            body = json.loads(req.data)
+            calls.append((body["method"], body["params"]))
+            if body["method"] == "getAllUsers":
+                return _rpc_response(
+                    [
+                        {"id": "1", "username": "admin", "is_active": "1"},
+                        {"id": "2", "username": "marcus_admin", "is_active": 1},
+                    ]
+                )
+            return _rpc_response(True)
+
+        with patch("provision_kanboard.urllib.request.urlopen", side_effect=fake_urlopen):
+            pk.grant_project_membership_to_all_users("http://x/jsonrpc.php", "tok", 7)
+
+        grants = [c for c in calls if c[0] == "addProjectUser"]
+        assert ("addProjectUser", [7, 1, "project-manager"]) in grants
+        assert ("addProjectUser", [7, 2, "project-manager"]) in grants
+        assert len(grants) == 2
+
+    def test_skips_explicitly_inactive_users(self):
+        calls = []
+
+        def fake_urlopen(req, timeout=None):
+            body = json.loads(req.data)
+            calls.append((body["method"], body["params"]))
+            if body["method"] == "getAllUsers":
+                return _rpc_response(
+                    [
+                        {"id": "1", "is_active": "1"},
+                        {"id": "2", "is_active": "0"},
+                    ]
+                )
+            return _rpc_response(True)
+
+        with patch("provision_kanboard.urllib.request.urlopen", side_effect=fake_urlopen):
+            pk.grant_project_membership_to_all_users("http://x/jsonrpc.php", "tok", 7)
+
+        granted_ids = {c[1][1] for c in calls if c[0] == "addProjectUser"}
+        assert granted_ids == {1}
+
+    def test_survives_getAllUsers_failure(self):
+        """A failure listing users must not raise — the project is still
+        fully usable by direct link even without auto-granted access."""
+
+        def fake_urlopen(req, timeout=None):
+            body = json.loads(req.data)
+            if body["method"] == "getAllUsers":
+                raise urllib.error.URLError("kanboard unreachable")
+            return _rpc_response(True)
+
+        with patch("provision_kanboard.urllib.request.urlopen", side_effect=fake_urlopen), patch(
+            "provision_kanboard.time.sleep"  # call_rpc retries URLError — skip the real delay
+        ):
+            pk.grant_project_membership_to_all_users("http://x/jsonrpc.php", "tok", 7)
+        # No exception raised is the assertion.
+
+    def test_survives_one_bad_addProjectUser_call(self):
+        """One user's grant failing must not stop the rest from being
+        attempted."""
+        calls = []
+
+        def fake_urlopen(req, timeout=None):
+            body = json.loads(req.data)
+            calls.append((body["method"], body["params"]))
+            if body["method"] == "getAllUsers":
+                return _rpc_response(
+                    [{"id": "1", "is_active": "1"}, {"id": "2", "is_active": "1"}]
+                )
+            if body["method"] == "addProjectUser" and body["params"][1] == 1:
+                return _rpc_error("user 1 no longer exists")
+            return _rpc_response(True)
+
+        with patch("provision_kanboard.urllib.request.urlopen", side_effect=fake_urlopen):
+            pk.grant_project_membership_to_all_users("http://x/jsonrpc.php", "tok", 7)
+
+        granted_ids = {c[1][1] for c in calls if c[0] == "addProjectUser"}
+        assert granted_ids == {1, 2}  # both attempted despite #1 failing
 
 
 class TestEnsureAdminUser:

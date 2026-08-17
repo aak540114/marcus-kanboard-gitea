@@ -159,6 +159,93 @@ def call_rpc(
     raise KanboardRPCError(f"{method} failed after {retries} attempts: {last_exc}")
 
 
+def grant_project_membership_to_all_users(
+    base_url: str, token: str, project_id: int
+) -> None:
+    """Give every active Kanboard user membership on ``project_id``.
+
+    Kanboard's own ``createProject`` procedure only auto-adds the creator
+    as a project member when the caller is an interactively logged-in
+    user (``ProjectProcedure::createProject`` passes
+    ``$this->userSession->isLogged()`` straight through as
+    ``ProjectModel::create()``'s ``$addUser`` flag — verified against the
+    v1.2.53 source). This script always authenticates as the ``jsonrpc``
+    app-level user, never a logged-in session, so that flag is
+    permanently false for every project it creates — no
+    ``project_has_users`` row is ever inserted. That row is exactly what
+    Kanboard's dashboard "My projects" list requires
+    (``ProjectUserRoleModel::getProjectsByUser``, joined strictly on that
+    table): unlike opening a project by its direct board URL, which an
+    admin account can always do (``ProjectPermissionModel::isUserAllowed``
+    short-circuits true for ``isAdmin()``), the dashboard LISTING query
+    has no such bypass — so the project this script provisions is fully
+    usable by direct link, but invisible on every human's own dashboard,
+    with no error anywhere to explain why.
+
+    Best-effort and safe to re-run: a failure here does not raise — the
+    project is still fully usable by direct link even if this step can't
+    run, matching this script's own "checks live state, never blocks
+    setup on a non-essential step" philosophy. Also safe to call on a
+    project that already has some/all of these grants — Kanboard's
+    ``addProjectUser`` is idempotent (re-adding an existing member is a
+    no-op, not an error), so this can run on every ``setup.sh`` re-run
+    to self-heal a project created before this function existed.
+
+    Parameters
+    ----------
+    base_url : str
+        Kanboard JSON-RPC endpoint.
+    token : str
+        API_AUTHENTICATION_TOKEN value.
+    project_id : int
+        The project to grant access to.
+    """
+    try:
+        users = call_rpc(base_url, token, "getAllUsers")
+    except (KanboardRPCError, KanboardAuthError) as exc:
+        print(
+            f"warning: could not list Kanboard users to grant access to "
+            f"project {project_id} — it will only be reachable by direct "
+            f"link for admin accounts: {exc}",
+            file=sys.stderr,
+        )
+        return
+
+    if not isinstance(users, list):
+        print(
+            f"warning: unexpected getAllUsers response — skipping access "
+            f"grants for project {project_id}",
+            file=sys.stderr,
+        )
+        return
+
+    for user in users:
+        try:
+            user_id = int(user.get("id"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        # Only skip a user explicitly marked inactive — anything else
+        # (field absent, unexpected type) defaults to including them,
+        # since a missed grant silently hides the project rather than
+        # erroring loudly.
+        is_active = user.get("is_active")
+        if is_active is not None and not int(is_active):
+            continue
+        try:
+            call_rpc(
+                base_url,
+                token,
+                "addProjectUser",
+                [project_id, user_id, "project-manager"],
+            )
+        except (KanboardRPCError, KanboardAuthError) as exc:
+            print(
+                f"warning: could not grant user {user_id} access to "
+                f"project {project_id}: {exc}",
+                file=sys.stderr,
+            )
+
+
 def find_or_create_project(base_url: str, token: str, name: str) -> int:
     """Return the id of the project named ``name``, creating it if absent.
 
@@ -184,7 +271,9 @@ def find_or_create_project(base_url: str, token: str, name: str) -> int:
     """
     project = call_rpc(base_url, token, "getProjectByName", [name])
     if project:
-        return int(project["id"])
+        project_id = int(project["id"])
+        grant_project_membership_to_all_users(base_url, token, project_id)
+        return project_id
 
     # createProject's JSON-RPC result IS the new project's int id on
     # success (ProjectProcedure::createProject returns
@@ -194,7 +283,9 @@ def find_or_create_project(base_url: str, token: str, name: str) -> int:
     result = call_rpc(base_url, token, "createProject", [name])
     if not result:
         raise KanboardRPCError(f"createProject({name!r}) returned a falsy result")
-    return int(result)
+    project_id = int(result)
+    grant_project_membership_to_all_users(base_url, token, project_id)
+    return project_id
 
 
 def ensure_admin_user(base_url: str, token: str, username: str, password: str) -> bool:
