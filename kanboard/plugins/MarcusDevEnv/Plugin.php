@@ -81,6 +81,36 @@ class Plugin extends Base
             'MarcusDevEnv:board/header'
         );
 
+        // Dashboard "My projects" list: show a Marcus ON/OFF badge next to
+        // each project so a human doesn't have to open every project's
+        // board just to check whether Marcus is enabled for it.
+        //
+        // 'template:dashboard:project:after-title' is fired once PER
+        // PROJECT ROW, inside app/Template/dashboard/overview.php (the
+        // template DashboardController::show() actually renders for the
+        // bare /dashboard URL — verified directly against that file on
+        // the v1.2.53 release tag actually shipped by the
+        // kanboard/kanboard:latest Docker image; the SEPARATE
+        // dashboard/projects.php template behind the sidebar's "My
+        // projects" link, at /dashboard/projects, has no equivalent hook
+        // and is not covered by this). It receives the row's $project
+        // array, so the badge template gets $project['id'] directly —
+        // no client-side DOM scraping needed.
+        //
+        // 'template:dashboard:show' fires exactly once, at the very end
+        // of the same overview.php template, unconditionally (outside
+        // every isEmpty() branch) — used here to emit ONE shared script
+        // that batch-fetches every collected project's status, rather
+        // than one inline <script> per row.
+        $this->template->hook->attach(
+            'template:dashboard:project:after-title',
+            'MarcusDevEnv:dashboard/project_badge'
+        );
+        $this->template->hook->attach(
+            'template:dashboard:show',
+            'MarcusDevEnv:dashboard/badges_init'
+        );
+
         // Tell Marcus when a task is DELETED.
         //
         // Kanboard has no deletion event to listen for: TaskModel::remove()

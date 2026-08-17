@@ -83,6 +83,18 @@ The plugin ships in `kanboard/plugins/MarcusDevEnv/` and is automatically active
 | **Marcus Dependencies** | Dependency graph: *Depends on*, *Blocks*, *Related* — each with a colour-coded column-status badge. |
 | **Live refresh** | (Invisible.) Same SSE stream as the board: a new comment or state change from Marcus/an agent reloads the task view instantly — never while you're mid-comment. |
 
+### Dashboard page
+
+Kanboard's own `/dashboard` page (the "My projects" list you land on after login, not a Marcus-served page) gets a small badge next to each project's name:
+
+| Badge | Meaning |
+|---|---|
+| 🔓 **Marcus: ON** | Marcus is enabled for this project — see [Scoping Marcus to specific projects](#scoping-marcus-to-specific-projects). |
+| 🔒 **Marcus: OFF** | Marcus is not enabled for this project. Open its board to turn it on. |
+| ⚠ **Marcus: unknown** | The badge couldn't reach Marcus to check (e.g. Marcus is down). Not the same as OFF. |
+
+This means you can tell which of your projects Marcus is working without opening each one individually. Each badge starts as "⏳ Marcus" (checking) and resolves a moment later: the page collects every listed project's id, then makes one `GET /api/project-enabled?project_id=<id>` call per project (the same endpoint the board-header ON/OFF toggle uses) and fills in the badge from the response.
+
 ---
 
 ## Architecture
@@ -257,6 +269,7 @@ A few things worth knowing:
 - **Every `marcus_work` poll re-reads the boards.** A ticket you have just assigned and moved to Ready is handed to a polling agent on its next poll, rather than waiting for the background `BoardWatcher` tick (30 s by default) — which also means this works with webhooks disabled. Near-simultaneous polls from several agents share one board read.
 - **Deleted tickets stop being tracked.** Kanboard fires no event when a task is deleted (`TaskModel::remove()` dispatches nothing, and there is no `EVENT_REMOVE` constant), so the bundled **MarcusDevEnv plugin** supplies one: it overrides Kanboard's task model to POST a `task.remove` webhook to Marcus. Marcus then drops the ticket, releases any claim on it and stops its preview container. A board read catches it too, so deletions are still noticed if the plugin isn't installed — just not instantly. On startup Marcus re-checks every tracked ticket, which is what catches tickets deleted while it was stopped.
 - **It is per project, and project ids are not board names.** Enabling one project never covers another. When Marcus withholds tickets it names the project by id *and* name so you can find the right board.
+- **You can see every project's ON/OFF state at once from Kanboard's own `/dashboard` page**, without opening each board — see [Dashboard page](#dashboard-page).
 - **This is a separate control from the Human/AI Gate toggle.** The access toggle decides *whether* Marcus may touch a project at all; the Gate toggle (next to it) decides *how* it works once it's already allowed to (pause for your review vs. work autonomously to done).
 - **Disabling a project is not a kill switch for work already in flight.** It blocks Marcus from claiming any *new* ticket in that project from that point on; an agent partway through an already-claimed ticket is left to finish rather than being force-interrupted mid-commit.
 - **This upgrade is a breaking change on purpose.** If you're updating an existing deployment, every project you were already using goes to disabled the moment you redeploy — including your "main" project. Re-enable it from its board header before expecting Marcus to keep working there.
