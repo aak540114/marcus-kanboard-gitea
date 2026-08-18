@@ -775,3 +775,74 @@ class TestColumnAutoReconcile:
                 data={"kanboard_project_id": 5},
             )
         kanban.ensure_columns.assert_awaited_once_with(5)
+
+    @pytest.mark.asyncio
+    async def test_false_return_is_retried_on_the_next_event(self, monkeypatch):
+        """ensure_columns can return False WITHOUT raising (Kanboard
+        genuinely refused to add a required column — already logged at
+        ERROR inside ensure_columns itself). That must not be marked
+        "reconciled" — a project.created re-fire must retry it, not
+        silently give up forever on the very first attempt."""
+        monkeypatch.setenv("KANBOARD_URL", "http://kb/jsonrpc.php")
+        monkeypatch.setenv("KANBOARD_API_TOKEN", "t")
+        monkeypatch.delenv("GITEA_URL", raising=False)
+
+        events = Events()
+        kanban = MagicMock()
+        kanban.ensure_columns = AsyncMock(side_effect=[False, True])
+        server = SimpleNamespace(
+            events=events, kanban_client=kanban, provider="kanboard"
+        )
+        with (
+            patch(
+                "src.workflows.human_gated_workflow.HumanGatedWorkflow",
+                return_value=AsyncMock(),
+            ),
+            patch("src.marcus_mcp.tools.human_gated.register_workflow"),
+            patch(
+                "src.core.project_watcher.ProjectWatcher", return_value=AsyncMock()
+            ),
+        ):
+            await _wire_human_gated_workflow(server)
+
+        await events.publish(
+            "project.created", source="test", data={"kanboard_project_id": 5}
+        )
+        await events.publish(
+            "project.created", source="test", data={"kanboard_project_id": 5}
+        )
+
+        assert kanban.ensure_columns.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_true_return_after_a_false_stops_further_retries(self, monkeypatch):
+        """Once a retry succeeds (returns True), the project IS marked
+        reconciled — a third event must not call ensure_columns again."""
+        monkeypatch.setenv("KANBOARD_URL", "http://kb/jsonrpc.php")
+        monkeypatch.setenv("KANBOARD_API_TOKEN", "t")
+        monkeypatch.delenv("GITEA_URL", raising=False)
+
+        events = Events()
+        kanban = MagicMock()
+        kanban.ensure_columns = AsyncMock(side_effect=[False, True])
+        server = SimpleNamespace(
+            events=events, kanban_client=kanban, provider="kanboard"
+        )
+        with (
+            patch(
+                "src.workflows.human_gated_workflow.HumanGatedWorkflow",
+                return_value=AsyncMock(),
+            ),
+            patch("src.marcus_mcp.tools.human_gated.register_workflow"),
+            patch(
+                "src.core.project_watcher.ProjectWatcher", return_value=AsyncMock()
+            ),
+        ):
+            await _wire_human_gated_workflow(server)
+
+        for _ in range(3):
+            await events.publish(
+                "project.created", source="test", data={"kanboard_project_id": 5}
+            )
+
+        assert kanban.ensure_columns.await_count == 2

@@ -3264,6 +3264,71 @@ class TestEnsureColumns:
         methods = [c.args[0] for c in kanban._rpc.call_args_list]
         assert "removeColumn" not in methods
 
+    async def test_case_only_duplicate_title_keeps_first_seen_column(self, kanban):
+        """Regression: Kanboard's columns.title has no COLLATE NOCASE, so
+        two columns differing only by case CAN coexist on the same
+        board. The by_title map must keep the FIRST-seen (position-
+        ordered) column instead of a dict-comprehension's last-write-wins
+        silently discarding Marcus's own canonical "Ready" in favor of a
+        later, stray "ready" duplicate — which would make reposition
+        target the wrong column id."""
+        kanban._client = AsyncMock()
+        existing = [
+            {"id": 1, "title": "Todo", "position": 1},
+            {"id": 2, "title": "Ready", "position": 2},  # Marcus's own
+            {"id": 3, "title": "In Progress", "position": 3},
+            {"id": 4, "title": "Blocked", "position": 4},
+            {"id": 5, "title": "Waiting for Human", "position": 5},
+            {"id": 6, "title": "Done", "position": 6},
+            {"id": 99, "title": "ready", "position": 7},  # stray duplicate
+        ]
+
+        reposition_calls = []
+
+        async def fake_rpc(method, **params):
+            if method == "getColumns":
+                return existing
+            if method == "changeColumnPosition":
+                reposition_calls.append(params)
+            return True
+
+        kanban._rpc = AsyncMock(side_effect=fake_rpc)
+
+        await kanban.ensure_columns(7)
+
+        ready_reposition = next(
+            c for c in reposition_calls if c.get("position") == 2
+        )
+        assert ready_reposition["column_id"] == 2  # the FIRST "Ready", not 99
+
+    async def test_case_only_duplicate_title_does_not_add_a_new_column(
+        self, kanban
+    ):
+        """Since "ready" (lowercased) already satisfies "Ready" as far as
+        the by_title map is concerned, ensure_columns must not ALSO try
+        to addColumn a second "Ready" on top of the two that already
+        exist."""
+        kanban._client = AsyncMock()
+        existing = [
+            {"id": 1, "title": "Todo", "position": 1},
+            {"id": 2, "title": "Ready", "position": 2},
+            {"id": 3, "title": "In Progress", "position": 3},
+            {"id": 4, "title": "Blocked", "position": 4},
+            {"id": 5, "title": "Waiting for Human", "position": 5},
+            {"id": 6, "title": "Done", "position": 6},
+            {"id": 99, "title": "ready", "position": 7},
+        ]
+
+        async def fake_rpc(method, **params):
+            return existing if method == "getColumns" else True
+
+        kanban._rpc = AsyncMock(side_effect=fake_rpc)
+
+        await kanban.ensure_columns(7)
+
+        methods = [c.args[0] for c in kanban._rpc.call_args_list]
+        assert "addColumn" not in methods
+
     @pytest.mark.asyncio
     async def test_refreshes_column_cache_for_configured_project(self, kanban):
         """Reconciling the CONFIGURED project rebuilds the column cache.
@@ -3313,6 +3378,65 @@ class TestEnsureColumns:
     async def test_raises_if_not_connected(self, kanban):
         with pytest.raises(RuntimeError, match="connect()"):
             await kanban.ensure_columns(7)
+
+
+class TestRefreshColumnsCaseCollision:
+    """_refresh_columns() populates the name -> id lookup _resolve_column_id
+    relies on. Regression: Kanboard's columns.title has no COLLATE NOCASE,
+    so two columns differing only by case can coexist on a board — the
+    map must keep the FIRST-seen (position-ordered) id instead of a
+    later duplicate silently overwriting it."""
+
+    @pytest.mark.asyncio
+    async def test_keeps_first_seen_id_on_a_case_collision(self, kanban):
+        kanban._client = AsyncMock()
+        kanban._project_id = 7
+        columns = [
+            {"id": 2, "title": "Ready", "position": 1},  # first
+            {"id": 99, "title": "ready", "position": 2},  # later duplicate
+        ]
+        kanban._rpc = AsyncMock(return_value=columns)
+
+        await kanban._refresh_columns(7)
+
+        assert kanban._column_map["ready"] == 2
+
+    @pytest.mark.asyncio
+    async def test_duplicate_id_still_gets_a_status_map_entry(self, kanban):
+        """The flat, per-id _column_status_map is orthogonal to the
+        name -> id lookup — a card that ends up on the stray duplicate
+        column must still resolve a real status via its id, not silently
+        fall through to TODO just because its name was unreachable."""
+        kanban._client = AsyncMock()
+        kanban._project_id = 7
+        columns = [
+            {"id": 6, "title": "Done", "position": 1},
+            {"id": 99, "title": "done", "position": 2},  # stray duplicate
+        ]
+        kanban._rpc = AsyncMock(return_value=columns)
+
+        await kanban._refresh_columns(7)
+
+        from src.core.models import TaskStatus
+
+        assert kanban._column_status_map[99] == TaskStatus.DONE
+
+    @pytest.mark.asyncio
+    async def test_no_collision_both_distinct_titles_present(self, kanban):
+        """Regression guard the other direction: genuinely different
+        titles must both still resolve normally — the collision guard
+        must not become overly broad."""
+        kanban._client = AsyncMock()
+        kanban._project_id = 7
+        columns = [
+            {"id": 1, "title": "Todo", "position": 1},
+            {"id": 2, "title": "Ready", "position": 2},
+        ]
+        kanban._rpc = AsyncMock(return_value=columns)
+
+        await kanban._refresh_columns(7)
+
+        assert kanban._column_map == {"todo": 1, "ready": 2}
 
 
 # ---------------------------------------------------------------------------

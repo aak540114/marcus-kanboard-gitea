@@ -1289,9 +1289,29 @@ class KanboardKanban(KanbanInterface):
         pid = int(project_id)
 
         columns = await self._rpc("getColumns", project_id=pid) or []
-        by_title: Dict[str, Dict[str, Any]] = {
-            str(c.get("title", "")).strip().lower(): c for c in columns
-        }
+        # Built as a loop (not a dict comprehension) so a case-only
+        # duplicate title — Kanboard's columns.title has no COLLATE
+        # NOCASE, unlike e.g. tasks.title, so "Ready" and "ready" CAN
+        # coexist on the same board — keeps the FIRST-seen column
+        # (getColumns is position-ordered) instead of a comprehension's
+        # last-write-wins silently discarding it. See _refresh_columns
+        # for the identical rationale/fix.
+        by_title: Dict[str, Dict[str, Any]] = {}
+        for c in columns:
+            key = str(c.get("title", "")).strip().lower()
+            if key in by_title and by_title[key].get("id") != c.get("id"):
+                logger.warning(
+                    "Project %d has two columns whose titles differ only "
+                    "by case ('%s') — column id %s is a duplicate of "
+                    "already-cached id %s and will be unreachable by "
+                    "name; rename or remove it to resolve the ambiguity.",
+                    pid,
+                    c.get("title", ""),
+                    c.get("id"),
+                    by_title[key].get("id"),
+                )
+                continue
+            by_title[key] = c
         wanted_lower = {w.lower() for w in wanted}
 
         # 1. Rename Kanboard defaults onto their Marcus names (preserves
@@ -2248,7 +2268,35 @@ class KanboardKanban(KanbanInterface):
                 logger.warning("Kanboard returned column with null id; skipping: %s", col)
                 continue
             cid = int(raw_id)
-            col_map[name.lower()] = cid
+            lower_name = name.lower()
+            if lower_name in col_map and col_map[lower_name] != cid:
+                # Kanboard's columns.title has no COLLATE NOCASE (verified
+                # against its real schema, unlike e.g. tasks.title) — two
+                # columns differing only by case (e.g. "Ready" and
+                # "ready") CAN coexist on the same board. getColumns
+                # returns them position-ordered, and Marcus's own
+                # canonical columns are created first (ensure_columns
+                # runs at project-creation time), so a later, human-added
+                # duplicate is normally the LAST one seen here — keeping
+                # the FIRST-seen id instead of silently letting a later
+                # one overwrite it favors Marcus's own column over a
+                # stray duplicate. Logged because either way this is a
+                # genuinely ambiguous board state worth a human's
+                # attention. The status map below is still updated for
+                # this id (it's flat, per-id, not per-name) — only the
+                # name -> id lookup is skipped.
+                logger.warning(
+                    "Project %d has two columns whose titles differ only "
+                    "by case ('%s') — column id %d is a duplicate of "
+                    "already-cached id %d and will be unreachable by "
+                    "name; rename or remove it to resolve the ambiguity.",
+                    pid,
+                    name,
+                    cid,
+                    col_map[lower_name],
+                )
+            else:
+                col_map[lower_name] = cid
             # Flat and shared across every project (see
             # self._column_status_map's docstring) — updated incrementally,
             # never reset here, so refreshing one project's columns can

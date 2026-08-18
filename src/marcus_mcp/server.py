@@ -4284,11 +4284,28 @@ async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
             if ensure_cols is None:
                 return
             try:
-                await ensure_cols(pid)
-                reconciled_cols.add(pid)
+                ok = await ensure_cols(pid)
             except Exception as exc:  # noqa: BLE001 - never break the poll
                 logger.warning(
                     "Could not reconcile columns for project %d: %s", pid, exc
+                )
+                return
+            if ok:
+                reconciled_cols.add(pid)
+            else:
+                # ensure_columns returns False (without raising) when
+                # Kanboard genuinely refused to add a required column —
+                # already logged at ERROR inside ensure_columns itself.
+                # Leaving pid OUT of reconciled_cols means the next
+                # project.created re-fire (or a future run of this
+                # process) retries it, instead of marking a real,
+                # persistent failure "done" on the very first attempt
+                # and never trying again for the life of this process.
+                logger.warning(
+                    "Column reconciliation for project %d did not fully "
+                    "succeed — will retry on the next project.created "
+                    "event instead of giving up permanently",
+                    pid,
                 )
 
         server.events.subscribe("project.created", _reconcile_project_columns)
