@@ -24,14 +24,16 @@ Schema::
           "waiting_for_human": {"2026-08-13T15:00": 2}
         }
       },
-      "last_status": {"42": "done", "43": "in_progress"},
+      "last_status": {"7:42": "done", "7:43": "in_progress"},
       "loc": {"7": 4820}
     }
 
-``last_status`` is a GLOBAL ticket_id -> last-seen-status map, used only
-to deduplicate repeated delivery of the same real-world transition (see
-:meth:`ProjectStatsManager.record_status_change`'s docstring) — it is
-never displayed.
+``last_status`` is a ``"<project_id>:<ticket_id>"`` -> last-seen-status
+map, used only to deduplicate repeated delivery of the same real-world
+transition (see :meth:`ProjectStatsManager.record_status_change`'s
+docstring) — it is never displayed. Keyed by project as well as ticket
+so a ticket relocated to a different project via Kanboard's native
+"move to another project" action is tracked as a fresh transition there.
 
 ``loc`` is each project's most recently computed total line count on its
 ``main`` branch (see :meth:`ProjectStatsManager.refresh_loc_count`), kept
@@ -114,9 +116,20 @@ class ProjectStatsManager:
         webhook-signalled move re-fires once on the next BoardWatcher
         poll (both publish ``ticket.status_changed``), which would
         otherwise double-count every real move. Detected via
-        ``last_status`` — the ticket's previously recorded status — NOT
+        ``last_status`` — the ticket's previously recorded status, keyed
+        by ``"<project_id>:<ticket_id>"`` (NOT bare ``ticket_id``) — NOT
         via the event's own ``old_status`` field, which the webhook path
         never populates.
+
+        The project_id is part of the key so that Kanboard's native "move
+        task to another project" action (which keeps the same numeric
+        task id) is correctly counted as a genuinely NEW transition for
+        the destination project, rather than being swallowed as a
+        duplicate because the ticket's last recorded status anywhere
+        already happened to match. Without this, a ticket moved to Done
+        in project A, then later relocated into project B and dropped
+        straight into ITS Done column, would silently never be counted
+        for project B (its last_status entry already said "done").
 
         Parameters
         ----------
@@ -140,10 +153,11 @@ class ProjectStatsManager:
         """
         async with self._lock:
             last_status = self._data.setdefault("last_status", {})
-            if last_status.get(ticket_id) == new_status:
+            key = f"{project_id}:{ticket_id}"
+            if last_status.get(key) == new_status:
                 return False
 
-            last_status[ticket_id] = new_status
+            last_status[key] = new_status
 
             if new_status not in TRACKED_STATUSES:
                 self._save()

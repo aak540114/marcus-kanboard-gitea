@@ -115,6 +115,41 @@ class TestPollEchoDedup:
         counted = await mgr.record_status_change(7, "42", "done", _dt(14))
         assert counted is True
 
+    @pytest.mark.asyncio
+    async def test_ticket_moved_to_another_project_still_counts_there(self, mgr):
+        """Regression: the dedup key must include project_id, not just
+        ticket_id. Kanboard's native "move task to another project"
+        action keeps the same numeric task id — a ticket counted Done in
+        project 7, then relocated and dropped straight into project 8's
+        Done column, is a genuinely NEW transition for project 8 and must
+        be counted there, not silently swallowed because ticket "42"'s
+        last recorded status anywhere already said "done"."""
+        first = await mgr.record_status_change(7, "42", "done", _dt(14))
+        assert first is True
+
+        second = await mgr.record_status_change(8, "42", "done", _dt(16))
+
+        assert second is True
+        assert mgr.get_hourly_stats(7, "done") == [
+            {"hour": "2026-08-13T14:00", "count": 1}
+        ]
+        assert mgr.get_hourly_stats(8, "done") == [
+            {"hour": "2026-08-13T16:00", "count": 1}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_same_project_and_ticket_still_dedups_correctly(self, mgr):
+        """Regression guard the other direction: the composite key must
+        not accidentally break the ORIGINAL same-project dedup case."""
+        first = await mgr.record_status_change(7, "42", "done", _dt(14))
+        second = await mgr.record_status_change(7, "42", "done", _dt(14, 30))
+
+        assert first is True
+        assert second is False
+        assert mgr.get_hourly_stats(7, "done") == [
+            {"hour": "2026-08-13T14:00", "count": 1}
+        ]
+
 
 class TestGetHourlyStats:
     def test_empty_when_never_recorded(self, mgr):
