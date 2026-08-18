@@ -311,6 +311,13 @@ class HumanGatedWorkflow:
         # Lost on Marcus restart, which is acceptable since verify cycles are
         # short-lived (minutes) and the round counter resets naturally.
         self._ticket_verify_rounds: Dict[str, int] = {}
+        # Whether the MOST RECENTLY completed round actually passed —
+        # tracked separately from the round count above so a mid-flight
+        # verify_count decrease (via the live gate-setting API) can never
+        # make _autocomplete_ticket treat "N rounds have been ATTEMPTED"
+        # as "safe to merge" when the last attempt genuinely failed. Both
+        # dicts are cleared together — see every call site.
+        self._ticket_verify_last_passed: Dict[str, bool] = {}
         # Background sweep task for _reconcile_blocked_parents — see
         # _PARENT_RECONCILE_INTERVAL_SECONDS.
         self._parent_reconcile_task: Optional[asyncio.Task[None]] = None
@@ -3665,7 +3672,21 @@ class HumanGatedWorkflow:
         for why the event-driven path alone isn't sufficient). No-op if
         the parent doesn't exist, is already DONE/WAITING_FOR_HUMAN, has
         no children, or any child isn't DONE yet.
+
+        Unlike :meth:`_on_ticket_closed` (this method's sibling entry
+        point into :meth:`_complete_parent_ticket`), neither of this
+        method's own callers gate on project enablement first — a
+        completed CHILD ticket can trigger this for a parent whose
+        project a human disabled in the meantime (in-progress work is
+        deliberately not force-interrupted, per
+        ``ProjectAccessSettingManager.set_project_enabled``'s docstring),
+        and the periodic sweep in :meth:`_reconcile_blocked_parents` has
+        no per-event trigger to gate at all. So the check happens here
+        instead — see :meth:`_may_touch`'s own docstring: "seeing a
+        project must never turn into touching it".
         """
+        if not await self._may_touch(parent_id):
+            return
         parent = self._lifecycle.get(parent_id, self._provider)
         if parent is None or parent.state in (
             TicketState.DONE,
@@ -4656,6 +4677,31 @@ class HumanGatedWorkflow:
             )
             return
 
+        # Any AI-verify round bookkeeping left over from an EARLIER,
+        # abandoned verification episode is stale and must not be reused.
+        # A ticket reaching here with record.state already IN_PROGRESS is
+        # the ordinary "picked back up mid-episode to fix issues from the
+        # last verify round" resume (see _pickup_next_ticket, called right
+        # after _autocomplete_ticket releases a ticket whose round failed
+        # or whose gate/state was never actually left) — that case must
+        # NOT be cleared, or multi-round verify would never get past round
+        # 1. Any OTHER state here (TODO/READY/BLOCKED/WAITING_FOR_HUMAN)
+        # means the ticket had to LEAVE IN_PROGRESS to get there, so any
+        # verify-round data still keyed on its id belongs to a DIFFERENT,
+        # already-over episode — e.g. the gate flipped to human mid-round
+        # (leaving self._ticket_verify_rounds[ticket_id] set from the AI
+        # path), the ticket went through human review/close instead, and
+        # is now being reopened or re-assigned with the gate back on AI.
+        # Reusing that stale count would silently run FEWER verification
+        # rounds than configured for code that was never actually
+        # verified under the new episode. Harmless no-op when there is
+        # nothing to clear (the overwhelmingly common case, since most
+        # tickets never touch AI-verify at all).
+        if record.state != TicketState.IN_PROGRESS:
+            self._ticket_verify_rounds.pop(ticket_id, None)
+            self._ticket_verify_last_passed.pop(ticket_id, None)
+            await self._set_verify_round_tag(ticket_id, None)
+
         # A ticket with recognized children is a decomposed PARENT — a
         # tracking shell with no branch of its own (see
         # _complete_parent_ticket's docstring). Its lifecycle is owned
@@ -5437,11 +5483,21 @@ class HumanGatedWorkflow:
         verify_count = await self._get_effective_verify_count(ticket_id)
         if verify_count > 0:
             rounds_done = self._ticket_verify_rounds.get(ticket_id, 0)
+            # Whether the LAST completed round actually passed — checked
+            # alongside rounds_done below so a verify_count DECREASE via
+            # the live gate-setting API (e.g. a human watching round 1
+            # fail and deciding 3 rounds was overkill) can never make the
+            # "already satisfied" fast path merge code whose most recent
+            # verification attempt genuinely FAILED. See
+            # TestVerifyCountLoweredMidFlight.
+            last_passed = self._ticket_verify_last_passed.get(ticket_id, False)
 
-            if rounds_done >= verify_count:
-                # All N rounds completed and the agent made the final fix.
-                # Clear the counter and fall through to merge.
+            if rounds_done >= verify_count and last_passed:
+                # All N (now possibly fewer than originally configured)
+                # rounds are done and the last one genuinely passed —
+                # clear the bookkeeping and fall through to merge.
                 self._ticket_verify_rounds.pop(ticket_id, None)
+                self._ticket_verify_last_passed.pop(ticket_id, None)
                 # Defensive: the "Verify N" card tag should already be gone
                 # (cleared when the final round passed), but a prior crash
                 # between that clear and the merge could leave it stale.
@@ -5456,11 +5512,20 @@ class HumanGatedWorkflow:
                 await self._set_verify_round_tag(ticket_id, current_round)
                 result = await self._run_verification_round(ticket_id, record, branch_name)
                 self._ticket_verify_rounds[ticket_id] = current_round
+                self._ticket_verify_last_passed[ticket_id] = result.passed
 
-                if result.passed and current_round == verify_count:
+                # >= rather than == : verify_count may have been lowered
+                # since rounds_done was last recorded (the branch above
+                # only skips straight to merge when the last attempt
+                # already passed — otherwise a round always runs here,
+                # which can make current_round exceed a since-lowered
+                # verify_count). This round is still the first to confirm
+                # a pass against the CURRENT threshold, so it's final.
+                if result.passed and current_round >= verify_count:
                     # Last round passed → all verification is done. Clear the
                     # card tag before falling through to merge/Done.
                     self._ticket_verify_rounds.pop(ticket_id, None)
+                    self._ticket_verify_last_passed.pop(ticket_id, None)
                     await self._set_verify_round_tag(ticket_id, None)
                     comment = CommentFormatter.verification_round_result(
                         ticket_id, current_round, verify_count, result
@@ -5493,13 +5558,14 @@ class HumanGatedWorkflow:
         merged = await branch_mgr.merge_to_main(branch_name, commit_message=merge_msg)
 
         if not merged:
-            # Clean up the verify-round counter so a retry starts fresh.
+            # Clean up the verify-round bookkeeping so a retry starts fresh.
             # (No "Verify N" card tag to clear here: every path that
             # reaches this merge attempt already cleared it — either the
             # final-round-passed branch above, or the defensive
             # rounds_done>=verify_count branch. verify_count==0 never sets
             # it in the first place.)
             self._ticket_verify_rounds.pop(ticket_id, None)
+            self._ticket_verify_last_passed.pop(ticket_id, None)
             comment = CommentFormatter.merge_conflict(
                 ticket_id=ticket_id,
                 branch_name=branch_name,

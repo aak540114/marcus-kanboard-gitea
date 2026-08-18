@@ -6,10 +6,11 @@ hitting any real kanban or git services.  Every external dependency is mocked.
 """
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from src.ai.verification.ai_verifier import VerificationResult
 from src.core.gate_settings import GateSettingManager
+from src.core.project_access_settings import ProjectAccessSettingManager
 from src.core.ticket_lifecycle import TicketLifecycleManager, TicketRecord, TicketState
 from src.workflows.human_gated_workflow import HumanGatedWorkflow
 
@@ -60,12 +61,22 @@ def workflow(tmp_path):
     events.subscribe = MagicMock()
 
     gate_settings = GateSettingManager(data_dir=tmp_path)
+    project_access = ProjectAccessSettingManager(data_dir=tmp_path)
 
-    lifecycle = TicketLifecycleManager()
+    # Isolated per-test: TicketLifecycleManager() with no arg defaults to
+    # the real ./data/ticket_lifecycle.json — every prior test in this
+    # file worked around that by writing directly into ._records instead
+    # of going through get_or_create()'s persisted-load path, but that's
+    # incidental, not a real guarantee. Point it at tmp_path so it's
+    # actually isolated (unit tests must mock/isolate ALL external state).
+    lifecycle = TicketLifecycleManager(
+        state_file=str(tmp_path / "ticket_lifecycle.json")
+    )
 
     branch_mgr = MagicMock()
     branch_mgr.config = MagicMock()
     branch_mgr.config.main_branch = "main"
+    branch_mgr.create_branch = AsyncMock(return_value=True)
     branch_mgr.get_branch_diff = AsyncMock(return_value="diff content")
     branch_mgr.merge_to_main = AsyncMock(return_value=True)
     branch_mgr.get_branch_commits = AsyncMock(return_value=[])
@@ -78,6 +89,7 @@ def workflow(tmp_path):
         provider_name="kanboard",
         lifecycle=lifecycle,
         gate_settings=gate_settings,
+        project_access=project_access,
         ai_verifier=verifier,
     )
     wf._branch = branch_mgr
@@ -154,11 +166,22 @@ class TestVerifyCountOne:
         assert workflow._ticket_verify_rounds.get("42") == 1
 
     @pytest.mark.asyncio
-    async def test_second_call_after_fail_merges_without_verify(self, workflow):
-        """After a round-1 failure, the next signal_ready merges (no re-verify)."""
+    async def test_second_call_after_fail_reverifies_before_merging(self, workflow):
+        """After a round-1 failure, the next signal_ready re-verifies the
+        fix rather than merging blindly.
+
+        Regression: this used to merge with NO re-verification the moment
+        rounds_done reached verify_count, regardless of whether that last
+        round actually passed — with verify_count=1 (a common config),
+        that meant AI-verify effectively only ever ran ONCE per ticket:
+        the agent's follow-up fix after a failure was never checked at
+        all. Fixed by tracking whether the last completed round passed
+        (self._ticket_verify_last_passed) alongside the round count."""
         workflow._gate.set_project_gate(1, "ai")
         workflow._gate.set_project_verify_count(1, 1)
-        workflow._verifier.verify = AsyncMock(return_value=_fail_result())
+        workflow._verifier.verify = AsyncMock(
+            side_effect=[_fail_result(), _pass_result()]
+        )
 
         record = _make_record()
         workflow._lifecycle.get_or_create("42", "kanboard")
@@ -168,8 +191,6 @@ class TestVerifyCountOne:
         await workflow._autocomplete_ticket("42", record)
         assert workflow._ticket_verify_rounds.get("42") == 1
 
-        # Reset mock counts for second call
-        workflow._verifier.verify.reset_mock()
         workflow._branch.merge_to_main.reset_mock()
         workflow._kanban.add_comment.reset_mock()
 
@@ -177,10 +198,33 @@ class TestVerifyCountOne:
         result = await workflow._autocomplete_ticket("42", record)
 
         assert result is True
-        # rounds_done (1) >= verify_count (1) → no re-verify
-        workflow._verifier.verify.assert_not_called()
+        # The fix WAS re-verified (round 2), not blindly merged.
+        assert workflow._verifier.verify.await_count == 2
         workflow._branch.merge_to_main.assert_called_once()
         assert "42" not in workflow._ticket_verify_rounds
+        assert "42" not in workflow._ticket_verify_last_passed
+
+    @pytest.mark.asyncio
+    async def test_second_call_after_fail_still_fails_releases_again(
+        self, workflow
+    ):
+        """If the resubmitted "fix" ALSO fails verification, it must be
+        released again for another attempt — not merged."""
+        workflow._gate.set_project_gate(1, "ai")
+        workflow._gate.set_project_verify_count(1, 1)
+        workflow._verifier.verify = AsyncMock(return_value=_fail_result(["Still broken"]))
+
+        record = _make_record()
+        workflow._lifecycle.get_or_create("42", "kanboard")
+        workflow._lifecycle._records[("42", "kanboard")] = record
+
+        await workflow._autocomplete_ticket("42", record)
+        result = await workflow._autocomplete_ticket("42", record)
+
+        assert result is False
+        assert workflow._verifier.verify.await_count == 2
+        workflow._branch.merge_to_main.assert_not_called()
+        assert workflow._ticket_verify_last_passed.get("42") is False
 
 
 class TestVerifyCountThree:
@@ -264,12 +308,18 @@ class TestVerifyCountThree:
         workflow._branch.merge_to_main.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_last_round_fails_releases_for_final_fix(self, workflow):
-        """Last round (N) fails → ticket released; next call merges with no verify."""
+    async def test_last_round_fails_final_fix_is_still_reverified(self, workflow):
+        """Last round (N) fails → ticket released; the next call re-verifies
+        the fix (round N+1, exceeding the configured count) rather than
+        merging blindly. Regression: this used to skip straight to merge
+        with NO re-verification the moment rounds_done reached
+        verify_count, even though the round that got it there had FAILED
+        — silently merging code whose most recent verification attempt
+        found "Final bug" and was never actually fixed-and-confirmed."""
         workflow._gate.set_project_gate(1, "ai")
         workflow._gate.set_project_verify_count(1, 2)
         workflow._verifier.verify = AsyncMock(
-            side_effect=[_pass_result(), _fail_result(["Final bug"])]
+            side_effect=[_pass_result(), _fail_result(["Final bug"]), _pass_result()]
         )
 
         record = _make_record()
@@ -292,15 +342,16 @@ class TestVerifyCountThree:
         assert "final verification round" in comment_body.lower()
 
         workflow._kanban.add_comment.reset_mock()
-        workflow._verifier.verify.reset_mock()
         workflow._branch.merge_to_main.reset_mock()
 
-        # Agent fixes, calls signal_ready one last time → merge with no verify
+        # Agent fixes, calls signal_ready again → round 3 actually runs
+        # and confirms the fix before merging.
         result3 = await workflow._autocomplete_ticket("42", record)
         assert result3 is True
-        workflow._verifier.verify.assert_not_called()
+        assert workflow._verifier.verify.await_count == 3
         workflow._branch.merge_to_main.assert_called_once()
         assert "42" not in workflow._ticket_verify_rounds
+        assert "42" not in workflow._ticket_verify_last_passed
 
 
 class TestFinalRoundPassComment:
@@ -686,3 +737,158 @@ class TestVerifyCountRoundTrackerIsolation:
         assert result is True
         assert "10" not in workflow._ticket_verify_rounds
         assert workflow._ticket_verify_rounds.get("20") == 1
+
+
+class TestVerifyCountLoweredMidFlight:
+    """A human can lower a ticket's/project's AI-verify round count live,
+    via the gate-setting API, while a ticket sits IN_PROGRESS between
+    rounds. Lowering it must never let an attempt that already FAILED
+    slip through unverified just because the new, lower count happens to
+    already be "met" by the failed attempt's round number."""
+
+    @pytest.mark.asyncio
+    async def test_lowered_count_after_a_failure_still_reverifies(self, workflow):
+        """verify_count starts at 3, round 1 fails (rounds_done=1), then
+        a human lowers verify_count to 1 before the agent resubmits — the
+        resubmission must still be re-verified, not merged blindly just
+        because rounds_done(1) >= the new verify_count(1)."""
+        workflow._gate.set_project_gate(1, "ai")
+        workflow._gate.set_project_verify_count(1, 3)
+        workflow._verifier.verify = AsyncMock(
+            side_effect=[_fail_result(["Bug"]), _pass_result()]
+        )
+
+        record = _make_record()
+        workflow._lifecycle.get_or_create("42", "kanboard")
+        workflow._lifecycle._records[("42", "kanboard")] = record
+
+        # Round 1 (of the originally-configured 3): fails.
+        await workflow._autocomplete_ticket("42", record)
+        assert workflow._ticket_verify_rounds["42"] == 1
+        assert workflow._ticket_verify_last_passed["42"] is False
+
+        # Human lowers verify_count to 1 before the agent resubmits.
+        workflow._gate.set_project_verify_count(1, 1)
+
+        result = await workflow._autocomplete_ticket("42", record)
+
+        assert result is True
+        assert workflow._verifier.verify.await_count == 2  # re-verified
+        workflow._branch.merge_to_main.assert_called_once()
+        assert "42" not in workflow._ticket_verify_rounds
+        assert "42" not in workflow._ticket_verify_last_passed
+
+    @pytest.mark.asyncio
+    async def test_lowered_count_after_a_pass_merges_without_extra_verify(
+        self, workflow
+    ):
+        """The inverse: if the LAST completed round genuinely passed,
+        lowering verify_count to that same round number is safe to trust
+        — merges immediately without wasting another verification call."""
+        workflow._gate.set_project_gate(1, "ai")
+        workflow._gate.set_project_verify_count(1, 3)
+        workflow._verifier.verify = AsyncMock(return_value=_pass_result())
+
+        record = _make_record()
+        workflow._lifecycle.get_or_create("42", "kanboard")
+        workflow._lifecycle._records[("42", "kanboard")] = record
+
+        # Round 1 (of 3): passes, not final.
+        await workflow._autocomplete_ticket("42", record)
+        assert workflow._ticket_verify_rounds["42"] == 1
+        assert workflow._ticket_verify_last_passed["42"] is True
+
+        workflow._gate.set_project_verify_count(1, 1)
+        workflow._verifier.verify.reset_mock()
+        workflow._branch.merge_to_main.reset_mock()
+
+        result = await workflow._autocomplete_ticket("42", record)
+
+        assert result is True
+        workflow._verifier.verify.assert_not_called()
+        workflow._branch.merge_to_main.assert_called_once()
+
+
+class TestStaleVerifyRoundsClearedOnFreshStart:
+    """self._ticket_verify_rounds/_ticket_verify_last_passed must not
+    survive a ticket LEAVING and later RE-ENTERING an AI-gate verify
+    episode via a different route (gate flip to human then back, a
+    reopen, a stuck-ticket re-assignment) — but must NOT be touched by an
+    ordinary same-episode resume (an agent picking a still-IN_PROGRESS
+    ticket back up to fix issues from the last verify round)."""
+
+    async def _start(self, workflow, ticket_id, record):
+        with patch(
+            "src.core.project_description.ProjectDescriptionManager.get_stack",
+            return_value={"language": "python"},
+        ):
+            await workflow._start_ai_work(ticket_id, record)
+
+    @pytest.mark.asyncio
+    async def test_resume_while_already_in_progress_preserves_round_data(
+        self, workflow
+    ):
+        """The ordinary multi-round-verify resume path: ticket stays
+        IN_PROGRESS the whole time between rounds — _start_ai_work must
+        NOT clear the round counter here, or multi-round verify would
+        never get past round 1 (see _pickup_next_ticket, which calls
+        _start_ai_work for a released-but-still-IN_PROGRESS ticket)."""
+        workflow._project_access.set_project_enabled(1, True)
+        workflow._ticket_verify_rounds["42"] = 1
+        workflow._ticket_verify_last_passed["42"] = False
+
+        workflow._lifecycle.get_or_create("42", "kanboard")
+        workflow._lifecycle.transition("42", "kanboard", TicketState.READY)
+        workflow._lifecycle.transition("42", "kanboard", TicketState.IN_PROGRESS)
+        workflow._lifecycle.set_assignee("42", "kanboard", "alice")
+        record = workflow._lifecycle.get("42", "kanboard")
+
+        await self._start(workflow, "42", record)
+
+        assert workflow._ticket_verify_rounds.get("42") == 1
+        assert workflow._ticket_verify_last_passed.get("42") is False
+
+    @pytest.mark.asyncio
+    async def test_fresh_start_from_ready_clears_stale_round_data(self, workflow):
+        """A ticket starting fresh from READY must never inherit leftover
+        round bookkeeping from some earlier, unrelated episode under the
+        same ticket id."""
+        workflow._project_access.set_project_enabled(1, True)
+        workflow._ticket_verify_rounds["43"] = 2
+        workflow._ticket_verify_last_passed["43"] = False
+
+        workflow._lifecycle.get_or_create("43", "kanboard")
+        workflow._lifecycle.transition("43", "kanboard", TicketState.READY)
+        workflow._lifecycle.set_assignee("43", "kanboard", "alice")
+        record = workflow._lifecycle.get("43", "kanboard")
+
+        await self._start(workflow, "43", record)
+
+        assert "43" not in workflow._ticket_verify_rounds
+        assert "43" not in workflow._ticket_verify_last_passed
+
+    @pytest.mark.asyncio
+    async def test_resume_from_waiting_for_human_clears_stale_round_data(
+        self, workflow
+    ):
+        """The exact scenario this fix targets: gate flipped to human
+        mid-round (leaving stale round data from the AI path), ticket
+        went through human review to Waiting for Human, and is now being
+        resumed (e.g. re-assigned) with the gate back on AI — the stale
+        count from the ABANDONED episode must not be reused."""
+        workflow._project_access.set_project_enabled(1, True)
+        workflow._ticket_verify_rounds["44"] = 1
+        workflow._ticket_verify_last_passed["44"] = True
+
+        workflow._lifecycle.get_or_create("44", "kanboard")
+        workflow._lifecycle.transition("44", "kanboard", TicketState.READY)
+        workflow._lifecycle.transition("44", "kanboard", TicketState.IN_PROGRESS)
+        workflow._lifecycle.transition("44", "kanboard", TicketState.WAITING_FOR_HUMAN)
+        workflow._lifecycle.set_assignee("44", "kanboard", "alice")
+        record = workflow._lifecycle.get("44", "kanboard")
+
+        await self._start(workflow, "44", record)
+
+        assert "44" not in workflow._ticket_verify_rounds
+        assert "44" not in workflow._ticket_verify_last_passed
+        workflow._kanban.set_verify_round_tag.assert_any_call("44", None)

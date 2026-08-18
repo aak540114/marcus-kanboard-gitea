@@ -5345,6 +5345,122 @@ class TestParentAutoComplete:
         assert workflow._parent_of(rec) == "310"
 
 
+class TestParentCompletionRespectsProjectAccess:
+    """A parent ticket's project must be enabled for Marcus before its
+    completion sweep writes anything to the board — same invariant as
+    every other board-writing path (_on_ticket_closed, _next_worker_ticket,
+    _withheld_ticket_reasons): "seeing a project must never turn into
+    touching it" (_may_touch's own docstring). A project a human disables
+    while a decomposed ticket's last child is still IN_PROGRESS (allowed
+    by design — in-progress work is not force-interrupted) must not have
+    its parent silently auto-completed once that child finishes."""
+
+    def _child(self, lifecycle, tid, parent):
+        lifecycle.get_or_create(
+            tid, "kanboard",
+            acceptance_criteria=f"- [ ] x\n<!-- Sub-ticket of #{parent} -->",
+        )
+
+    def _wire_task_project(self, mock_kanban, project_id):
+        """Make get_task_by_id resolve to a task in *project_id* — same
+        helper as TestProjectAccessGate."""
+        task = MagicMock()
+        task.source_context = {"kanboard_task": {"project_id": project_id}}
+        mock_kanban.get_task_by_id = AsyncMock(return_value=task)
+
+    @pytest.mark.asyncio
+    async def test_disabled_project_blocks_event_driven_completion(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """_maybe_complete_parent (triggered when the last child closes)
+        must not move/comment/complete a parent whose project is disabled."""
+        self._wire_task_project(mock_kanban, 9)
+        mock_project_access.is_enabled = MagicMock(return_value=False)
+        lifecycle.get_or_create("250", "kanboard")  # parent
+        lifecycle.human_transition("250", "kanboard", TicketState.BLOCKED)
+        self._child(lifecycle, "251", "250")
+        lifecycle.transition("251", "kanboard", TicketState.READY)
+        lifecycle.transition("251", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("251", "kanboard", TicketState.DONE)
+
+        await workflow._maybe_complete_parent("251")
+
+        rec = lifecycle.get("250", "kanboard")
+        assert rec.state == TicketState.BLOCKED
+        moved_to = [c.args for c in mock_kanban.move_task_to_column.await_args_list]
+        assert ("250", "waiting for human") not in moved_to
+        assert ("250", "done") not in moved_to
+
+    @pytest.mark.asyncio
+    async def test_disabled_project_blocks_reconcile_sweep_completion(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """The periodic safety-net sweep (_reconcile_blocked_parents) is
+        just as subject to the gate — it has no per-event trigger to
+        check enablement at, so the check must live in the shared
+        _check_parent_completion chokepoint both callers funnel through."""
+        self._wire_task_project(mock_kanban, 9)
+        mock_project_access.is_enabled = MagicMock(return_value=False)
+        lifecycle.get_or_create("252", "kanboard")  # parent
+        lifecycle.human_transition("252", "kanboard", TicketState.BLOCKED)
+        self._child(lifecycle, "253", "252")
+        lifecycle.transition("253", "kanboard", TicketState.READY)
+        lifecycle.transition("253", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("253", "kanboard", TicketState.DONE)
+
+        await workflow._reconcile_blocked_parents()
+
+        rec = lifecycle.get("252", "kanboard")
+        assert rec.state == TicketState.BLOCKED
+        moved_to = [c.args for c in mock_kanban.move_task_to_column.await_args_list]
+        assert ("252", "waiting for human") not in moved_to
+        assert ("252", "done") not in moved_to
+
+    @pytest.mark.asyncio
+    async def test_enabled_project_still_completes_normally(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """Regression guard: an explicitly ENABLED project's parent still
+        completes exactly as before — the gate must not block the normal
+        case."""
+        self._wire_task_project(mock_kanban, 9)
+        mock_project_access.is_enabled = MagicMock(return_value=True)
+        lifecycle.get_or_create("254", "kanboard")  # parent
+        lifecycle.human_transition("254", "kanboard", TicketState.BLOCKED)
+        self._child(lifecycle, "255", "254")
+        lifecycle.transition("255", "kanboard", TicketState.READY)
+        lifecycle.transition("255", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("255", "kanboard", TicketState.DONE)
+
+        await workflow._maybe_complete_parent("255")
+
+        rec = lifecycle.get("254", "kanboard")
+        assert rec.state == TicketState.WAITING_FOR_HUMAN
+        mock_kanban.move_task_to_column.assert_any_call("254", "waiting for human")
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_project_does_not_block_completion(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """When the parent's project can't be determined (get_task_by_id
+        returns None — the mock_kanban default), the gate does not apply,
+        matching _may_touch's own "only applies where it can actually be
+        evaluated" behavior — existing single-project deployments are
+        unaffected by this fix."""
+        mock_project_access.is_enabled = MagicMock(return_value=False)
+        lifecycle.get_or_create("256", "kanboard")  # parent
+        lifecycle.human_transition("256", "kanboard", TicketState.BLOCKED)
+        self._child(lifecycle, "257", "256")
+        lifecycle.transition("257", "kanboard", TicketState.READY)
+        lifecycle.transition("257", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("257", "kanboard", TicketState.DONE)
+
+        await workflow._maybe_complete_parent("257")
+
+        rec = lifecycle.get("256", "kanboard")
+        assert rec.state == TicketState.WAITING_FOR_HUMAN
+
+
 class TestReconcileBlockedParents:
     """Safety-net sweep: a BLOCKED parent whose children are ALL Done
     must be caught even when the event-driven _maybe_complete_parent
