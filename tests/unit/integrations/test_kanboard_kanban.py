@@ -2256,6 +2256,126 @@ class TestSetMergeConflictFlag:
         assert result is False
 
 
+# ---------------------------------------------------------------------------
+# set_verify_round_tag tests
+# ---------------------------------------------------------------------------
+
+
+class TestSetVerifyRoundTag:
+    """Test set_verify_round_tag() — a visible "Verify N" board-card tag
+    so a human can tell, from the board itself, which AI-gate
+    verification round a ticket sitting in "in progress" is on."""
+
+    @pytest.mark.asyncio
+    async def test_adds_tag_when_absent(self, kanban):
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response({"id": 10, "project_id": 1, "tags": []}),
+                _rpc_response(True),
+            ]
+        )
+        result = await kanban.set_verify_round_tag("10", 1)
+        assert result is True
+        second_call = kanban._client.post.await_args_list[1]
+        assert second_call.kwargs["json"]["params"]["tags"] == ["Verify 1"]
+
+    @pytest.mark.asyncio
+    async def test_preserves_existing_unrelated_tags_when_adding(self, kanban):
+        """Regression: setTaskTags REPLACES all tags — a human's own tag
+        on the ticket must survive."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response(
+                    {"id": 10, "project_id": 1, "tags": [{"name": "urgent"}]}
+                ),
+                _rpc_response(True),
+            ]
+        )
+        result = await kanban.set_verify_round_tag("10", 1)
+        assert result is True
+        sent_tags = kanban._client.post.await_args_list[1].kwargs["json"]["params"]["tags"]
+        assert set(sent_tags) == {"urgent", "Verify 1"}
+
+    @pytest.mark.asyncio
+    async def test_updates_round_number_replacing_the_old_one(self, kanban):
+        """Regression: exactly one "Verify N" tag may exist at a time —
+        moving from round 1 to round 2 must replace, not stack, the tag."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response(
+                    {
+                        "id": 10,
+                        "project_id": 1,
+                        "tags": [{"name": "urgent"}, {"name": "Verify 1"}],
+                    }
+                ),
+                _rpc_response(True),
+            ]
+        )
+        result = await kanban.set_verify_round_tag("10", 2)
+        assert result is True
+        sent_tags = kanban._client.post.await_args_list[1].kwargs["json"]["params"]["tags"]
+        assert set(sent_tags) == {"urgent", "Verify 2"}
+        assert "Verify 1" not in sent_tags
+
+    @pytest.mark.asyncio
+    async def test_noop_when_round_already_set(self, kanban):
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            return_value=_rpc_response(
+                {"id": 10, "project_id": 1, "tags": [{"name": "Verify 3"}]}
+            )
+        )
+        result = await kanban.set_verify_round_tag("10", 3)
+        assert result is True
+        assert kanban._client.post.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_removes_tag_when_round_number_is_none(self, kanban):
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response(
+                    {
+                        "id": 10,
+                        "project_id": 1,
+                        "tags": [{"name": "urgent"}, {"name": "Verify 2"}],
+                    }
+                ),
+                _rpc_response(True),
+            ]
+        )
+        result = await kanban.set_verify_round_tag("10", None)
+        assert result is True
+        sent_tags = kanban._client.post.await_args_list[1].kwargs["json"]["params"]["tags"]
+        assert sent_tags == ["urgent"]
+
+    @pytest.mark.asyncio
+    async def test_noop_when_round_number_is_none_and_no_tag_present(self, kanban):
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            return_value=_rpc_response({"id": 10, "project_id": 1, "tags": []})
+        )
+        result = await kanban.set_verify_round_tag("10", None)
+        assert result is True
+        assert kanban._client.post.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_returns_false_on_rpc_failure(self, kanban):
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(side_effect=RuntimeError("API error"))
+        result = await kanban.set_verify_round_tag("10", 1)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_raises_if_not_connected(self, kanban):
+        with pytest.raises(RuntimeError, match="connect()"):
+            await kanban.set_verify_round_tag("10", 1)
+
+
 class TestSetTaskTags:
     """Test set_task_tags() — a standalone public wrapper over Kanboard's
     setTaskTags RPC, used by the clone-project feature to recreate a

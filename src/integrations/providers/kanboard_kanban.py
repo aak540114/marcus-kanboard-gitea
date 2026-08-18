@@ -123,6 +123,12 @@ _RPC_RETRY_BASE_DELAY = 0.3
 #: comment buried inside the ticket.
 _MERGE_CONFLICT_TAG = "merge-conflict"
 
+#: Matches the "Verify N" tag applied while a ticket is going through
+#: AI-gate multi-round verification (see set_verify_round_tag). Used to
+#: find and drop any existing round tag before applying the current one —
+#: there is at most one on a card at a time.
+_VERIFY_TAG_RE = re.compile(r"^Verify \d+$")
+
 # Kanboard seeds a fresh project with these columns
 # (app/Model/BoardModel.php::getDefaultColumns). Rename the two that have a
 # Marcus equivalent — rather than delete+recreate — so their position and
@@ -842,6 +848,72 @@ class KanboardKanban(KanbanInterface):
             logger.warning(
                 "set_merge_conflict_flag(%s) failed for task %s: %s",
                 present,
+                task_id,
+                exc,
+            )
+            return False
+
+    async def set_verify_round_tag(
+        self, task_id: str, round_number: Optional[int]
+    ) -> bool:
+        """Add, update, or remove the "Verify N" tag on a task's card.
+
+        AI-gate multi-round verification (``verify_count`` > 0) runs
+        entirely inside a ticket's "in progress" column — there is no
+        board-visible sign of which round is active, or that a ticket
+        cycling back to "in progress" after a review comment is actually
+        mid-verification rather than freshly picked up. Kanboard renders
+        tags as colored pills directly on the card face in every view, so
+        stamping the current round there (``present`` isn't a boolean
+        here the way :meth:`set_merge_conflict_flag`'s is, since the tag's
+        *value* changes each round) makes that visible without opening
+        the ticket.
+
+        Same fetch-current-tags-then-replace-the-whole-list approach as
+        :meth:`set_merge_conflict_flag`, for the same reason: Kanboard's
+        ``setTaskTags`` replaces the full tag set rather than adding to
+        it. At most one "Verify N" tag is ever on a card at once, so any
+        existing one is dropped before the new one (if any) is added.
+
+        Parameters
+        ----------
+        task_id : str
+            Kanboard task ID.
+        round_number : Optional[int]
+            The verification round now active (1-indexed) — sets the tag
+            to ``f"Verify {round_number}"``. ``None`` removes the tag
+            entirely (all rounds finished, or verification was reset).
+
+        Returns
+        -------
+        bool
+            ``True`` on success (including a no-op when the tag was
+            already in the desired state); ``False`` only on an RPC
+            failure.
+        """
+        if self._client is None:
+            raise RuntimeError("Call connect() before set_verify_round_tag()")
+        try:
+            raw = await self._rpc("getTask", task_id=int(task_id))
+            if not raw:
+                return False
+            project_id = int(raw.get("project_id") or self._project_id)
+            current = [
+                t.get("name", "") for t in (raw.get("tags") or []) if t.get("name")
+            ]
+            without_round_tag = [t for t in current if not _VERIFY_TAG_RE.match(t)]
+            updated = (
+                without_round_tag
+                if round_number is None
+                else without_round_tag + [f"Verify {round_number}"]
+            )
+            if updated == current:
+                return True  # already in the desired state, no RPC needed
+            return await self.set_task_tags(task_id, project_id=project_id, tags=updated)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "set_verify_round_tag(%s) failed for task %s: %s",
+                round_number,
                 task_id,
                 exc,
             )

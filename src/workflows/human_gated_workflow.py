@@ -4579,6 +4579,33 @@ class HumanGatedWorkflow:
                 "Could not clear merge-conflict flag for %s: %s", ticket_id, exc
             )
 
+    async def _set_verify_round_tag(
+        self, ticket_id: str, round_number: Optional[int]
+    ) -> None:
+        """Set (or clear) the visible ``Verify N`` card tag, best-effort.
+
+        Called from :meth:`_autocomplete_ticket` so a ticket cycling
+        through AI-gate multi-round verification shows which round is
+        active directly on the board, not just in a buried comment — see
+        :meth:`KanboardKanban.set_verify_round_tag` for the full
+        rationale. ``round_number=None`` removes the tag (all rounds
+        finished, or a merge failure reset verification for a retry).
+
+        Best-effort: only a KanboardKanban-specific capability, and a
+        failure here must never block whatever workflow step called it.
+        """
+        if not hasattr(self._kanban, "set_verify_round_tag"):
+            return
+        try:
+            await self._kanban.set_verify_round_tag(ticket_id, round_number)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not set verify-round tag (%s) for %s: %s",
+                round_number,
+                ticket_id,
+                exc,
+            )
+
     async def _start_ai_work(
         self,
         ticket_id: str,
@@ -5415,15 +5442,26 @@ class HumanGatedWorkflow:
                 # All N rounds completed and the agent made the final fix.
                 # Clear the counter and fall through to merge.
                 self._ticket_verify_rounds.pop(ticket_id, None)
+                # Defensive: the "Verify N" card tag should already be gone
+                # (cleared when the final round passed), but a prior crash
+                # between that clear and the merge could leave it stale.
+                await self._set_verify_round_tag(ticket_id, None)
 
             else:
                 current_round = rounds_done + 1
+                # Stamp the round on the card BEFORE running it, so "Verify N"
+                # is what a human sees on the board for the whole time this
+                # ticket sits in "in progress" going through round N — not
+                # just a comment they'd have to open the ticket to find.
+                await self._set_verify_round_tag(ticket_id, current_round)
                 result = await self._run_verification_round(ticket_id, record, branch_name)
                 self._ticket_verify_rounds[ticket_id] = current_round
 
                 if result.passed and current_round == verify_count:
-                    # Last round passed → post the final round comment then merge.
+                    # Last round passed → all verification is done. Clear the
+                    # card tag before falling through to merge/Done.
                     self._ticket_verify_rounds.pop(ticket_id, None)
+                    await self._set_verify_round_tag(ticket_id, None)
                     comment = CommentFormatter.verification_round_result(
                         ticket_id, current_round, verify_count, result
                     )
@@ -5456,6 +5494,11 @@ class HumanGatedWorkflow:
 
         if not merged:
             # Clean up the verify-round counter so a retry starts fresh.
+            # (No "Verify N" card tag to clear here: every path that
+            # reaches this merge attempt already cleared it — either the
+            # final-round-passed branch above, or the defensive
+            # rounds_done>=verify_count branch. verify_count==0 never sets
+            # it in the first place.)
             self._ticket_verify_rounds.pop(ticket_id, None)
             comment = CommentFormatter.merge_conflict(
                 ticket_id=ticket_id,

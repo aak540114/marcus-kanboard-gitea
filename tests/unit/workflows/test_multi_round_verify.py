@@ -6,7 +6,7 @@ hitting any real kanban or git services.  Every external dependency is mocked.
 """
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 from src.ai.verification.ai_verifier import VerificationResult
 from src.core.gate_settings import GateSettingManager
@@ -54,6 +54,7 @@ def workflow(tmp_path):
     kanban.add_comment = AsyncMock(return_value=True)
     kanban.move_task_to_column = AsyncMock(return_value=True)
     kanban.set_merge_conflict_flag = AsyncMock(return_value=True)
+    kanban.set_verify_round_tag = AsyncMock(return_value=True)
 
     events = MagicMock()
     events.subscribe = MagicMock()
@@ -514,6 +515,141 @@ class TestVerifierErrorFailsOpen:
         assert result is True
         workflow._branch.merge_to_main.assert_called_once()
         assert "42" not in workflow._ticket_verify_rounds
+
+
+class TestVerifyRoundCardTag:
+    """The "Verify N" board-card tag (KanboardKanban.set_verify_round_tag)
+    must track the round counter exactly: set to the round about to run,
+    left in place while the ticket sits in "in progress" awaiting a fix,
+    and cleared the moment verification is fully done (all rounds passed,
+    or a merge failure resets it for a rebase retry)."""
+
+    @pytest.mark.asyncio
+    async def test_verify_count_zero_never_touches_the_tag(self, workflow):
+        workflow._gate.set_project_gate(1, "ai")
+        # verify_count defaults to 0
+
+        record = _make_record()
+        workflow._lifecycle.get_or_create("42", "kanboard")
+        workflow._lifecycle._records[("42", "kanboard")] = record
+
+        await workflow._autocomplete_ticket("42", record)
+
+        workflow._kanban.set_verify_round_tag.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_first_round_tags_verify_1_before_running_verification(
+        self, workflow
+    ):
+        workflow._gate.set_project_gate(1, "ai")
+        workflow._gate.set_project_verify_count(1, 3)
+        workflow._verifier.verify = AsyncMock(return_value=_pass_result())
+
+        record = _make_record()
+        workflow._lifecycle.get_or_create("42", "kanboard")
+        workflow._lifecycle._records[("42", "kanboard")] = record
+
+        await workflow._autocomplete_ticket("42", record)  # round 1, not last
+
+        workflow._kanban.set_verify_round_tag.assert_any_call("42", 1)
+        # Verification hasn't finished (2 more rounds remain) — the tag
+        # must NOT have been cleared.
+        assert (
+            call("42", None)
+            not in workflow._kanban.set_verify_round_tag.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_tag_advances_to_2_on_the_second_round(self, workflow):
+        workflow._gate.set_project_gate(1, "ai")
+        workflow._gate.set_project_verify_count(1, 3)
+        workflow._verifier.verify = AsyncMock(
+            side_effect=[_fail_result(["Bug"]), _pass_result(), _pass_result()]
+        )
+
+        record = _make_record()
+        workflow._lifecycle.get_or_create("42", "kanboard")
+        workflow._lifecycle._records[("42", "kanboard")] = record
+
+        await workflow._autocomplete_ticket("42", record)  # round 1: fails
+        workflow._kanban.set_verify_round_tag.reset_mock()
+
+        await workflow._autocomplete_ticket("42", record)  # round 2
+
+        workflow._kanban.set_verify_round_tag.assert_any_call("42", 2)
+
+    @pytest.mark.asyncio
+    async def test_final_passing_round_clears_the_tag_before_merging(
+        self, workflow
+    ):
+        workflow._gate.set_project_gate(1, "ai")
+        workflow._gate.set_project_verify_count(1, 1)
+        workflow._verifier.verify = AsyncMock(return_value=_pass_result())
+
+        record = _make_record()
+        workflow._lifecycle.get_or_create("42", "kanboard")
+        workflow._lifecycle._records[("42", "kanboard")] = record
+
+        result = await workflow._autocomplete_ticket("42", record)
+
+        assert result is True
+        workflow._kanban.set_verify_round_tag.assert_any_call("42", 1)
+        # The clear (None) must be the LAST tag call — set to round 1,
+        # then cleared once that round passes and is the final one.
+        calls = [c.args for c in workflow._kanban.set_verify_round_tag.call_args_list]
+        assert calls[-1] == ("42", None)
+        workflow._branch.merge_to_main.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_failed_round_leaves_the_tag_in_place_not_cleared(self, workflow):
+        """Issues found → ticket bounces back to "in progress" — the tag
+        must keep showing the round just attempted, not disappear."""
+        workflow._gate.set_project_gate(1, "ai")
+        workflow._gate.set_project_verify_count(1, 1)
+        workflow._verifier.verify = AsyncMock(return_value=_fail_result(["Bug"]))
+
+        record = _make_record()
+        workflow._lifecycle.get_or_create("42", "kanboard")
+        workflow._lifecycle._records[("42", "kanboard")] = record
+
+        result = await workflow._autocomplete_ticket("42", record)
+
+        assert result is False
+        workflow._kanban.set_verify_round_tag.assert_any_call("42", 1)
+        assert (
+            call("42", None)
+            not in workflow._kanban.set_verify_round_tag.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_merge_failure_does_not_re_clear_an_already_cleared_tag(
+        self, workflow
+    ):
+        """By the time a merge is even attempted, the tag has always
+        already been cleared (either by the final-round-passed branch, or
+        the defensive rounds_done>=verify_count branch — verify_count=0
+        never sets it at all) — a merge failure needs no clear of its
+        own. Regression guard against re-adding one: that would cost an
+        extra Kanboard RPC on every merge conflict, including ordinary
+        verify_count=0 tickets that never had a tag to begin with."""
+        workflow._gate.set_project_gate(1, "ai")
+        workflow._gate.set_project_verify_count(1, 1)
+        workflow._verifier.verify = AsyncMock(return_value=_pass_result())
+        workflow._branch.merge_to_main = AsyncMock(return_value=False)
+
+        record = _make_record()
+        workflow._lifecycle.get_or_create("42", "kanboard")
+        workflow._lifecycle._records[("42", "kanboard")] = record
+
+        result = await workflow._autocomplete_ticket("42", record)
+
+        assert result is False
+        # Set for round 1, then cleared once (final round passed) — never
+        # called a third time after the merge fails.
+        assert workflow._kanban.set_verify_round_tag.call_args_list == [
+            call("42", 1),
+            call("42", None),
+        ]
 
 
 class TestVerifyCountRoundTrackerIsolation:
