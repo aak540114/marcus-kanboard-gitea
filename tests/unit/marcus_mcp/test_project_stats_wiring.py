@@ -11,6 +11,7 @@ passed to events.subscribe("ticket.status_changed", ...), and invoking it
 directly with fake Event objects.
 """
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -190,7 +191,15 @@ class TestLocRefreshOnDone:
     """Every genuinely-counted move to Done must refresh the project's
     line-of-code count — per the explicit "always up to date" requirement
     — but a duplicate delivery or a non-Done move must not trigger a git
-    fetch at all."""
+    fetch at all.
+
+    refresh_loc_count is fired as a background task (asyncio.create_task),
+    not awaited inline — see TestLocRefreshDoesNotBlockTheHandler for why
+    (it runs under BoardWatcher's shared poll_lock; awaiting a slow git
+    remote there would stall every agent's task assignment, not just the
+    triggering project). Every test below that expects refresh_loc_count
+    to have run yields once (asyncio.sleep(0)) after calling the handler
+    so the scheduled task actually gets to execute before asserting."""
 
     async def _wired(self, monkeypatch):
         monkeypatch.delenv("GITEA_URL", raising=False)
@@ -217,6 +226,7 @@ class TestLocRefreshOnDone:
         server, handler, stats_mgr, project_sync = await self._wired(monkeypatch)
 
         await handler(_make_event(new_status="done", project_id=7))
+        await asyncio.sleep(0)  # let the background refresh task run
 
         project_sync.get_repo_for_project.assert_called_once_with(7)
         stats_mgr.refresh_loc_count.assert_awaited_once_with(7, "/repos/my-app")
@@ -260,8 +270,70 @@ class TestLocRefreshOnDone:
     async def test_loc_refresh_failure_does_not_propagate(self, monkeypatch):
         """A git failure inside refresh_loc_count must not crash the
         status-changed handler (which would otherwise be caught by
-        Events.publish's isolation, but should never even need it)."""
+        Events.publish's isolation, but should never even need it) — nor
+        surface as an "exception was never retrieved" warning from the
+        background task itself."""
         server, handler, stats_mgr, project_sync = await self._wired(monkeypatch)
         stats_mgr.refresh_loc_count = AsyncMock(side_effect=RuntimeError("git boom"))
 
         await handler(_make_event(new_status="done", project_id=7))  # must not raise
+        await asyncio.sleep(0)  # let the background task actually run and fail
+        stats_mgr.refresh_loc_count.assert_awaited_once()
+
+
+class TestLocRefreshDoesNotBlockTheHandler:
+    """The whole point of firing refresh_loc_count as a background task:
+    the ticket.status_changed handler must return WITHOUT waiting for a
+    slow/unreachable git remote. This handler runs inside
+    BoardWatcher._process_task -> _emit -> Events.publish (default
+    wait_for_handlers=True, awaited via asyncio.gather) while poll_once()
+    still holds self._poll_lock — a lock shared across every agent's
+    on-demand marcus_work poll (see board_watcher.py's own docstring).
+    Awaiting a stuck git fetch there would stall task assignment for the
+    whole multi-agent system, not just the project whose ticket moved."""
+
+    @pytest.mark.asyncio
+    async def test_handler_returns_before_a_slow_refresh_completes(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("GITEA_URL", raising=False)
+        monkeypatch.delenv("GITEA_TOKEN", raising=False)
+        monkeypatch.delenv("KANBOARD_URL", raising=False)
+        server = _make_server()
+        handler = await _get_subscribed_handler(server)
+
+        release_refresh = asyncio.Event()
+        refresh_started = asyncio.Event()
+
+        async def slow_refresh(project_id, repo_path):
+            refresh_started.set()
+            await release_refresh.wait()
+            return 123
+
+        stats_mgr = MagicMock()
+        stats_mgr.record_status_change = AsyncMock(return_value=True)
+        stats_mgr.refresh_loc_count = AsyncMock(side_effect=slow_refresh)
+        server._project_stats_mgr = stats_mgr
+
+        project_sync = MagicMock()
+        project_sync.get_repo_for_project = MagicMock(
+            return_value={"local_repo_path": "/repos/my-app"}
+        )
+        server._project_sync = project_sync
+
+        # The handler itself must complete even though the refresh it
+        # kicked off is still blocked — proving it isn't awaited inline.
+        await asyncio.wait_for(
+            handler(_make_event(new_status="done", project_id=7)), timeout=0.2
+        )
+
+        # The background task did get a chance to start (proving the fix
+        # isn't just "never call it")...
+        await asyncio.wait_for(refresh_started.wait(), timeout=0.2)
+        # ...but is still genuinely stuck, confirming the handler above
+        # really did NOT wait for it.
+        assert not release_refresh.is_set()
+        assert stats_mgr.refresh_loc_count.await_count == 1
+
+        release_refresh.set()
+        await asyncio.sleep(0)  # let the background task finish cleanly

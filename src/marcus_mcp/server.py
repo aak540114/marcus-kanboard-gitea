@@ -4168,6 +4168,18 @@ async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
         # per the user's explicit requirement, not just refreshed
         # periodically. Best-effort: refresh_loc_count already logs and
         # returns None on any git failure rather than raising.
+        #
+        # Fired as a background task, NEVER awaited inline: this handler
+        # runs inside BoardWatcher._process_task -> _emit ->
+        # Events.publish (default wait_for_handlers=True, awaiting every
+        # subscriber via asyncio.gather) while poll_once() still holds
+        # self._poll_lock — a lock BoardWatcher's own docstring describes
+        # as shared across every agent's on-demand marcus_work poll.
+        # refresh_loc_count runs `git fetch` then `git diff --shortstat`,
+        # each bounded to _GIT_CMD_TIMEOUT (30s) — worst case ~60s. Await-
+        # ing that here would hold poll_lock for the same ~60s, stalling
+        # task assignment for every agent in the whole system on a single
+        # slow/unreachable git remote, not just the triggering project.
         if counted and new_status == "done":
             project_sync = getattr(server, "_project_sync", None)
             mapping = (
@@ -4177,14 +4189,21 @@ async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
             )
             repo_path = mapping.get("local_repo_path") if mapping else None
             if repo_path:
-                try:
-                    await stats_mgr.refresh_loc_count(project_id, repo_path)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "Could not refresh LOC count for project %d: %s",
-                        project_id,
-                        exc,
-                    )
+                loc_repo_path = str(repo_path)
+
+                async def _refresh_loc(
+                    pid: int = project_id, path: str = loc_repo_path
+                ) -> None:
+                    try:
+                        await stats_mgr.refresh_loc_count(pid, path)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "Could not refresh LOC count for project %d: %s",
+                            pid,
+                            exc,
+                        )
+
+                asyncio.create_task(_refresh_loc())
 
     server.events.subscribe("ticket.status_changed", _track_project_stats)
 
