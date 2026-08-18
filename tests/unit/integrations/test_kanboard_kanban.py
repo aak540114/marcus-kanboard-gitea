@@ -6,6 +6,7 @@ Tests follow the Arrange-Act-Assert pattern and use pytest-asyncio for
 async test support.
 """
 
+import asyncio
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -2374,6 +2375,102 @@ class TestSetVerifyRoundTag:
     async def test_raises_if_not_connected(self, kanban):
         with pytest.raises(RuntimeError, match="connect()"):
             await kanban.set_verify_round_tag("10", 1)
+
+
+class TestTagWriteConcurrency:
+    """set_merge_conflict_flag and set_verify_round_tag each do an
+    unprotected getTask-then-setTaskTags read-modify-write. Called for
+    the SAME ticket close together (e.g. a merge conflict is detected in
+    roughly the same window an AI-verify round tag is being set), the
+    second call's getTask snapshot could otherwise predate the first
+    call's setTaskTags write and silently clobber it. Both must be
+    serialized per-ticket via KanboardKanban._tag_lock_for()."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_calls_for_the_same_ticket_are_serialized(
+        self, kanban
+    ):
+        """Start set_merge_conflict_flag and block it right after its
+        getTask call returns (before it issues setTaskTags). While it's
+        blocked, start set_verify_round_tag for the SAME ticket
+        concurrently — if the two aren't actually serialized, the second
+        call's OWN getTask would race in immediately; if they ARE
+        serialized, the second call must not even attempt its getTask
+        until the first has fully finished (released the lock)."""
+        kanban._client = AsyncMock()
+        release_first = asyncio.Event()
+        call_order: list = []
+
+        async def fake_post(*args, **kwargs):
+            body = kwargs.get("json") or {}
+            method = body.get("method")
+            call_order.append(method)
+            if method == "getTask" and call_order.count("getTask") == 1:
+                # The FIRST call's getTask (set_merge_conflict_flag) —
+                # hold here so a concurrent second call has every
+                # opportunity to race in if the lock isn't working.
+                await release_first.wait()
+                return _rpc_response({"id": 10, "project_id": 1, "tags": []})
+            if method == "getTask":
+                return _rpc_response({"id": 10, "project_id": 1, "tags": []})
+            return _rpc_response(True)
+
+        kanban._client.post = AsyncMock(side_effect=fake_post)
+
+        first_task = asyncio.ensure_future(
+            kanban.set_merge_conflict_flag("10", present=True)
+        )
+        # Let the first call actually reach and block inside getTask.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert call_order == ["getTask"]
+
+        second_task = asyncio.ensure_future(
+            kanban.set_verify_round_tag("10", 1)
+        )
+        # Give the second call every chance to run if it isn't blocked
+        # on the lock — it must NOT have issued its own getTask yet.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert call_order == ["getTask"], (
+            "set_verify_round_tag started its own RPC before "
+            "set_merge_conflict_flag finished — the two are not "
+            "serialized"
+        )
+
+        release_first.set()
+        await first_task
+        await second_task
+
+        # Fully sequential: the first call's getTask+setTaskTags form a
+        # contiguous block before the second call's getTask+setTaskTags —
+        # never interleaved.
+        assert call_order == [
+            "getTask", "setTaskTags", "getTask", "setTaskTags"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_concurrent_calls_for_different_tickets_do_not_block(
+        self, kanban
+    ):
+        """The lock is per-ticket — two DIFFERENT tickets' tag writes
+        must not serialize against each other."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response({"id": 10, "project_id": 1, "tags": []}),
+                _rpc_response(True),
+                _rpc_response({"id": 20, "project_id": 1, "tags": []}),
+                _rpc_response(True),
+            ]
+        )
+
+        results = await asyncio.gather(
+            kanban.set_merge_conflict_flag("10", present=True),
+            kanban.set_verify_round_tag("20", 1),
+        )
+
+        assert results == [True, True]
 
 
 class TestSetTaskTags:

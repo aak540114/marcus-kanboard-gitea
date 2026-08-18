@@ -211,6 +211,10 @@ class KanboardKanban(KanbanInterface):
         # Which Kanboard projects Marcus may read. None → just the
         # configured one; see set_project_scope().
         self._project_scope: Optional[Callable[[], List[int]]] = None
+        # Per-ticket locks serializing set_merge_conflict_flag and
+        # set_verify_round_tag — see _tag_lock_for()'s docstring for the
+        # race this closes.
+        self._tag_locks: Dict[str, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -789,6 +793,33 @@ class KanboardKanban(KanbanInterface):
             logger.warning("set_task_started_if_unset failed for task %s: %s", task_id, exc)
             return False
 
+    def _tag_lock_for(self, task_id: str) -> "asyncio.Lock":
+        """Return (creating on first use) the per-ticket tag lock.
+
+        :meth:`set_merge_conflict_flag` and :meth:`set_verify_round_tag`
+        each independently fetch a task's CURRENT tags (``getTask``) then
+        write back a full replacement list (``setTaskTags``) — a
+        read-modify-write cycle with no atomicity of its own. Both can be
+        called for the SAME ticket close together in practice: a merge
+        conflict is detected in roughly the same window an AI-verify
+        round tag is being set (e.g. a confused human drags a
+        mid-verification card to Done, racing
+        :meth:`~src.workflows.human_gated_workflow.HumanGatedWorkflow.
+        _merge_ticket_to_main` against the agent's own re-signal). Without
+        serializing them, whichever call's ``getTask`` snapshot predates
+        the other's ``setTaskTags`` write silently loses that write when
+        it commits — same shape of TOCTOU race
+        :class:`~src.workflows.project_sync_workflow.ProjectSyncWorkflow`
+        closes with its own instance-wide lock (see that class's
+        ``ensure_repo`` docstring), scoped per-ticket here instead since
+        tag writes for DIFFERENT tickets never conflict.
+        """
+        lock = self._tag_locks.get(task_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._tag_locks[task_id] = lock
+        return lock
+
     async def set_merge_conflict_flag(self, task_id: str, present: bool) -> bool:
         """Add or remove a visible ``merge-conflict`` tag on a task's card.
 
@@ -828,22 +859,25 @@ class KanboardKanban(KanbanInterface):
         if self._client is None:
             raise RuntimeError("Call connect() before set_merge_conflict_flag()")
         try:
-            raw = await self._rpc("getTask", task_id=int(task_id))
-            if not raw:
-                return False
-            project_id = int(raw.get("project_id") or self._project_id)
-            current = [
-                t.get("name", "") for t in (raw.get("tags") or []) if t.get("name")
-            ]
-            has_tag = _MERGE_CONFLICT_TAG in current
-            if present == has_tag:
-                return True  # already in the desired state, no RPC needed
-            updated = (
-                current + [_MERGE_CONFLICT_TAG]
-                if present
-                else [t for t in current if t != _MERGE_CONFLICT_TAG]
-            )
-            return await self.set_task_tags(task_id, project_id=project_id, tags=updated)
+            async with self._tag_lock_for(task_id):
+                raw = await self._rpc("getTask", task_id=int(task_id))
+                if not raw:
+                    return False
+                project_id = int(raw.get("project_id") or self._project_id)
+                current = [
+                    t.get("name", "") for t in (raw.get("tags") or []) if t.get("name")
+                ]
+                has_tag = _MERGE_CONFLICT_TAG in current
+                if present == has_tag:
+                    return True  # already in the desired state, no RPC needed
+                updated = (
+                    current + [_MERGE_CONFLICT_TAG]
+                    if present
+                    else [t for t in current if t != _MERGE_CONFLICT_TAG]
+                )
+                return await self.set_task_tags(
+                    task_id, project_id=project_id, tags=updated
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "set_merge_conflict_flag(%s) failed for task %s: %s",
@@ -894,22 +928,27 @@ class KanboardKanban(KanbanInterface):
         if self._client is None:
             raise RuntimeError("Call connect() before set_verify_round_tag()")
         try:
-            raw = await self._rpc("getTask", task_id=int(task_id))
-            if not raw:
-                return False
-            project_id = int(raw.get("project_id") or self._project_id)
-            current = [
-                t.get("name", "") for t in (raw.get("tags") or []) if t.get("name")
-            ]
-            without_round_tag = [t for t in current if not _VERIFY_TAG_RE.match(t)]
-            updated = (
-                without_round_tag
-                if round_number is None
-                else without_round_tag + [f"Verify {round_number}"]
-            )
-            if updated == current:
-                return True  # already in the desired state, no RPC needed
-            return await self.set_task_tags(task_id, project_id=project_id, tags=updated)
+            async with self._tag_lock_for(task_id):
+                raw = await self._rpc("getTask", task_id=int(task_id))
+                if not raw:
+                    return False
+                project_id = int(raw.get("project_id") or self._project_id)
+                current = [
+                    t.get("name", "") for t in (raw.get("tags") or []) if t.get("name")
+                ]
+                without_round_tag = [
+                    t for t in current if not _VERIFY_TAG_RE.match(t)
+                ]
+                updated = (
+                    without_round_tag
+                    if round_number is None
+                    else without_round_tag + [f"Verify {round_number}"]
+                )
+                if updated == current:
+                    return True  # already in the desired state, no RPC needed
+                return await self.set_task_tags(
+                    task_id, project_id=project_id, tags=updated
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "set_verify_round_tag(%s) failed for task %s: %s",
