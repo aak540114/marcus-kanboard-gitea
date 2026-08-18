@@ -68,6 +68,30 @@ class Plugin extends Base
             'template:task:sidebar:information',
             'MarcusDevEnv:task/sidebar'
         );
+
+        // Hide the Swimlane/Priority/Position/Started rows from the task
+        // page's #task-summary section — Marcus tickets don't use those
+        // Kanboard concepts and they're just clutter. Fired at the very
+        // end of app/Template/task/details.php (after all four target
+        // rows have rendered), verified against the v1.2.53 release tag
+        // actually shipped by the kanboard/kanboard:latest Docker image.
+        // See Template/task/hidden_fields.php for the full rationale.
+        $this->template->hook->attach(
+            'template:task:details:bottom',
+            'MarcusDevEnv:task/hidden_fields'
+        );
+
+        // Strip the visible "<!-- MARCUS_AC_START -->" / "<!-- MARCUS_AC_END -->"
+        // sentinel text Kanboard's Markdown renderer leaves behind in the
+        // task description (src/core/acceptance_criteria.py needs those
+        // markers to stay in the STORED description — this only cleans up
+        // what's rendered in the browser). Fired immediately after
+        // app/Template/task/description.php renders, before subtasks.
+        // See Template/task/description_cleanup.php for the full rationale.
+        $this->template->hook->attach(
+            'template:task:show:before-subtasks',
+            'MarcusDevEnv:task/description_cleanup'
+        );
         // 'template:board:private:header' does not exist in Kanboard (verified
         // against app/Template/board/view_private.php and table_container.php,
         // both on master and the v1.2.52 release tag actually shipped by the
