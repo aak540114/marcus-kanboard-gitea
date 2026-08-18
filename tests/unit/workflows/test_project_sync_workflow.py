@@ -322,6 +322,83 @@ class TestEnsureRepoFromSource:
         second = workflow.get_repo_for_project(2)
         assert first["local_repo_path"] != second["local_repo_path"]
 
+    @pytest.mark.asyncio
+    async def test_successful_mirror_clone_is_marked_as_such(
+        self, workflow, gitea_mgr
+    ):
+        mapping = await workflow.ensure_repo_from_source(
+            2, "Cloned App", "http://localhost:3000/root/orig-app.git"
+        )
+
+        assert mapping["mirror_cloned"] is True
+
+    @pytest.mark.asyncio
+    async def test_refuses_to_trust_a_readme_only_mapping_for_the_same_id(
+        self, workflow, gitea_mgr
+    ):
+        """Regression: if project id 2 already has a mapping from the
+        plain ensure_repo (README) path — e.g. Marcus restarted mid-clone
+        and the new project's own auto-provisioning won the race before
+        the clone workflow's own ensure_repo_from_source call reached it
+        — that mapping must NEVER be silently accepted as "the clone,
+        already done." A mirror clone whose whole point is replicating
+        the baseline's real git history must not silently ship an empty
+        README-only repo instead, with no warning anywhere."""
+        gitea_mgr.create_webhook = AsyncMock(return_value=True)
+        await workflow.ensure_repo(2, "Cloned App")  # README path wins first
+        gitea_mgr.create_repo.reset_mock()
+        gitea_mgr.mirror_clone.reset_mock()
+
+        result = await workflow.ensure_repo_from_source(
+            2, "Cloned App", "http://localhost:3000/root/orig-app.git"
+        )
+
+        assert result is None
+        # Must not have tried to mirror-clone into (or create a second
+        # repo alongside) the wrongly-provisioned one.
+        gitea_mgr.mirror_clone.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_readme_mapping_is_left_untouched_after_the_refusal(
+        self, workflow, gitea_mgr
+    ):
+        """The refusal must not corrupt or silently 'fix' the existing
+        (wrong) mapping — it's left exactly as it was, for a human to
+        resolve manually."""
+        gitea_mgr.create_webhook = AsyncMock(return_value=True)
+        await workflow.ensure_repo(2, "Cloned App")
+        before = workflow.get_repo_for_project(2)
+
+        await workflow.ensure_repo_from_source(
+            2, "Cloned App", "http://localhost:3000/root/orig-app.git"
+        )
+
+        after = workflow.get_repo_for_project(2)
+        assert after == before
+        assert after["mirror_cloned"] is False
+
+    @pytest.mark.asyncio
+    async def test_second_call_after_a_real_mirror_clone_stays_idempotent(
+        self, workflow, gitea_mgr
+    ):
+        """Regression guard the other direction: a mapping that WAS
+        created via a real mirror clone must still short-circuit
+        normally on a second call — the provenance check must not make
+        every re-call re-clone."""
+        first = await workflow.ensure_repo_from_source(
+            2, "Cloned App", "http://localhost:3000/root/orig-app.git"
+        )
+        gitea_mgr.create_repo.reset_mock()
+        gitea_mgr.mirror_clone.reset_mock()
+
+        second = await workflow.ensure_repo_from_source(
+            2, "Cloned App", "http://localhost:3000/root/orig-app.git"
+        )
+
+        gitea_mgr.create_repo.assert_not_called()
+        gitea_mgr.mirror_clone.assert_not_called()
+        assert second == first
+
 
 class TestSlugDisambiguation:
     """Slug collisions and empty slugs must not cross-wire projects.

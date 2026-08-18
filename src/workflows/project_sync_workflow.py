@@ -31,9 +31,20 @@ Mapping file format (``project_repos.json``)
         "kanboard_project_id": 1,
         "kanboard_project_name": "Shopping Cart",
         "gitea_repo_url": "http://localhost:3000/root/shopping-cart.git",
-        "local_repo_path": "./repos/shopping-cart"
+        "local_repo_path": "./repos/shopping-cart",
+        "mirror_cloned": false
       }
     }
+
+``mirror_cloned`` distinguishes HOW a mapping was provisioned: ``false``
+for the plain README/fresh-project path (:meth:`ProjectSyncWorkflow.
+ensure_repo`), ``true`` for a full mirror clone of another project's
+history (:meth:`ProjectSyncWorkflow.ensure_repo_from_source`, backing
+the "clone this project" feature). :meth:`ensure_repo_from_source`
+checks this on its own idempotency fast path — a ``false`` mapping means
+some OTHER path provisioned this project id first (see that method's
+docstring), and must never be silently accepted as "the clone, already
+done."
 """
 
 import asyncio
@@ -288,6 +299,10 @@ class ProjectSyncWorkflow:
                 "gitea_repo_url": clone_url,
                 "local_repo_path": local_path,
                 "webhook_created": webhook_created,
+                # False here, True in ensure_repo_from_source's own
+                # mapping — see that method's docstring for why this
+                # provenance matters.
+                "mirror_cloned": False,
             }
             self._save_mapping()
             logger.info(
@@ -337,15 +352,57 @@ class ProjectSyncWorkflow:
         -------
         Optional[Dict[str, Any]]
             The new project's repo mapping, or None if creation/mirroring
-            failed.
+            failed (or a same-id mapping already exists but was NOT
+            created by an actual mirror clone — see below).
         """
         async with self._lock:
             key = f"kanboard:{project_id}"
-            if key in self._mapping:
-                logger.debug(
-                    "Project %d already mapped — skipping clone", project_id
+            cached = self._mapping.get(key)
+            if cached is not None:
+                if cached.get("mirror_cloned"):
+                    logger.debug(
+                        "Project %d already mapped via a mirror clone — "
+                        "skipping",
+                        project_id,
+                    )
+                    return dict(cached)
+                # A mapping exists but was created by the plain README
+                # path (ensure_repo), not this method — most plausibly
+                # because clone_project() created this NEW project, and
+                # before this call reached the lock, Marcus restarted and
+                # the project's OWN project.created auto-provisioning
+                # (triggered independently the moment a human enables or
+                # even just opens the new project — see ensure_repo's own
+                # docstring) ran first and won the race, seeding a bare
+                # README-only repo under this project id. Silently
+                # trusting that mapping as "the clone, done" (the
+                # original bug here) would ship an empty git history for
+                # a feature whose entire point is replicating the
+                # baseline's real one — with no warning anywhere.
+                #
+                # Repairing it in place isn't safe to do automatically:
+                # GiteaManager.mirror_clone's own docstring requires
+                # local_path to not already exist, and it already does
+                # (ensure_repo's earlier init_with_readme created it) —
+                # deleting a human-visible working tree without
+                # confirmation is exactly the class of destructive action
+                # this codebase avoids (see CLAUDE.md's DATABASE_SAFETY
+                # section). So this is treated as a failure: the caller
+                # (ProjectCloneWorkflow._clone_repo) already has a
+                # warning for exactly this "result is None" case, which
+                # surfaces on the clone job's status for a human to
+                # investigate and resolve manually.
+                logger.error(
+                    "Project %d has an existing repo mapping that was "
+                    "NOT created via a mirror clone (likely: Marcus "
+                    "restarted mid-clone and the project's own "
+                    "README-provisioning ran first) — refusing to treat "
+                    "it as this clone's result. Manual cleanup needed: "
+                    "%s",
+                    project_id,
+                    cached.get("gitea_repo_url"),
                 )
-                return dict(self._mapping[key])
+                return None
 
             slug, local_path = self._resolve_slug_and_path(project_id, project_name)
 
@@ -371,6 +428,7 @@ class ProjectSyncWorkflow:
                 "gitea_repo_url": clone_url,
                 "local_repo_path": local_path,
                 "webhook_created": webhook_created,
+                "mirror_cloned": True,
             }
             self._save_mapping()
             logger.info(

@@ -300,9 +300,36 @@ class ProjectCloneWorkflow:
         Dict[str, str]
             Baseline ticket id -> new ticket id, in baseline order (by
             numeric id ascending) — later steps (link recreation,
-            lifecycle seeding) rely on this map.
+            lifecycle seeding) rely on this map. Empty if the initial
+            baseline fetch itself fails (see below) — later steps are
+            correctly no-ops on an empty map.
         """
-        baseline_tasks = await self._kanban.get_tasks_for_project(baseline_project_id)
+        try:
+            baseline_tasks = await self._kanban.get_tasks_for_project(
+                baseline_project_id
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Unlike every per-ticket failure below, a failure HERE means
+            # no tickets were even listed — nothing to clone this call.
+            # Caught explicitly (not left to propagate) because
+            # clone_project()'s own docstring promises "Raises: Exception
+            # — Only if the new project itself cannot be created — every
+            # step after that is best-effort": by the time this method
+            # runs, create_project/_clone_repo/_clone_description/
+            # _clone_settings have already run and potentially mutated
+            # real state (a new Kanboard project, possibly an already
+            # fully mirror-cloned git repo). Letting a transient RPC
+            # failure here propagate uncaught would abort clone_project()
+            # entirely, and server.py's _run_clone() records only
+            # job.error/job.status on that path — job.new_project_id is
+            # NEVER set, leaving the client with no way to discover the
+            # already-created (and possibly already git-mirrored)
+            # project it left behind.
+            warnings.append(
+                f"Failed to list baseline project {baseline_project_id}'s "
+                f"tickets — no tickets were cloned: {exc}"
+            )
+            return {}
         baseline_tasks.sort(key=lambda t: int(t.id))
 
         id_map: Dict[str, str] = {}

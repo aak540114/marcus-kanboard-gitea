@@ -217,6 +217,39 @@ class TestCloneTickets:
         mock_kanban.assign_task.assert_awaited_once_with("105", "42")
 
     @pytest.mark.asyncio
+    async def test_baseline_fetch_failure_does_not_propagate(
+        self, workflow, mock_kanban
+    ):
+        """Regression: clone_project()'s own docstring promises it raises
+        ONLY if the new project itself can't be created — every step
+        after that is best-effort. get_tasks_for_project failing (a
+        transient Kanboard RPC error, unlike per-ticket create_task
+        failures a few lines below, which were already individually
+        caught) must not propagate uncaught: by the time this runs,
+        create_project/_clone_repo/_clone_description/_clone_settings
+        have already run and potentially created real state (the new
+        Kanboard project, possibly an already-mirrored git repo) — an
+        uncaught exception here would abort clone_project() entirely and
+        leave the caller with no way to discover any of that."""
+        mock_kanban.get_tasks_for_project = AsyncMock(
+            side_effect=RuntimeError("Kanboard RPC timed out")
+        )
+
+        result = await workflow.clone_project(1, "Cloned App")
+
+        assert result.new_project_id == 99
+        assert result.ticket_id_map == {}
+        assert any(
+            "Kanboard RPC timed out" in w or "list baseline" in w.lower()
+            for w in result.warnings
+        )
+        # The failure did not merely get swallowed silently — the caller
+        # (server.py's _run_clone) still gets a usable, non-raised result
+        # with the real new_project_id it needs to discover the
+        # already-created project. (An uncaught exception here would
+        # have made this whole `await` raise instead of returning.)
+
+    @pytest.mark.asyncio
     async def test_no_assign_call_when_unassigned(self, workflow, mock_kanban):
         mock_kanban.get_tasks_for_project = AsyncMock(
             return_value=[_make_task(task_id="5", assigned_to=None)]
