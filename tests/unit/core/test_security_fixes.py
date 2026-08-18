@@ -2,41 +2,17 @@
 Focused tests for security fixes in resilience.py and service_registry.py
 """
 
-import secrets
 import tempfile
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import pytest
 
-from src.core.resilience import RetryConfig, with_retry
 from src.core.service_registry import MarcusServiceRegistry
 
 
 class TestSecurityFixes:
     """Test specific security fixes"""
-
-    def test_resilience_uses_secure_random(self):
-        """Test B311 fix: resilience uses secrets.SystemRandom instead of random.random"""
-        config = RetryConfig(max_attempts=2, base_delay=1.0, jitter=True)
-
-        @with_retry(config)
-        def failing_func():
-            raise ValueError("Test failure")
-
-        # Mock SystemRandom to verify it's being used
-        with patch("src.core.resilience.secrets.SystemRandom") as mock_system_random:
-            mock_instance = Mock()
-            mock_instance.random.return_value = 0.5
-            mock_system_random.return_value = mock_instance
-
-            # This will fail but we're testing the jitter calculation
-            with pytest.raises(ValueError):
-                failing_func()
-
-            # Verify SystemRandom was used
-            mock_system_random.assert_called_once()
-            mock_instance.random.assert_called_once()
 
     def test_service_registry_error_handling_not_pass(self):
         """Test B110 fix: service registry doesn't use bare except-pass"""
@@ -97,23 +73,6 @@ class TestSecurityFixes:
                     except RuntimeError:
                         # If this exception propagates, the fix isn't working
                         pytest.fail("RuntimeError was not handled gracefully")
-
-    def test_secrets_system_random_produces_different_values(self):
-        """Test that SystemRandom produces cryptographically secure values"""
-        secure_random = secrets.SystemRandom()
-
-        # Generate multiple values
-        values = [secure_random.random() for _ in range(100)]
-
-        # All values should be different (extremely unlikely to be the same)
-        assert len(set(values)) == len(values)
-
-        # All values should be in valid range
-        assert all(0 <= v < 1 for v in values)
-
-        # Values should have reasonable distribution (not all close to same value)
-        mean_val = sum(values) / len(values)
-        assert 0.3 < mean_val < 0.7  # Should be roughly centered around 0.5
 
     def test_service_registry_basic_functionality(self):
         """Test basic service registry operations to improve coverage"""

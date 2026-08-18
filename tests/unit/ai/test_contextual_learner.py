@@ -307,25 +307,6 @@ class TestContextualLearningSystem:
         # Verify context tracking initialization
         assert isinstance(learning_system.context_performance, defaultdict)
 
-    def test_initialization_with_custom_params(self):
-        """
-        Test system can be initialized with custom parameters.
-
-        What's being tested:
-        1. System accepts parameter overrides during initialization
-        2. Custom parameters are properly stored
-        3. System remains functional with different settings
-        """
-        # Create system with custom parameters by modifying after init
-        system = ContextualLearningSystem()
-        system.min_samples_for_learning = 5
-        system.learning_decay_days = 120
-        system.confidence_threshold = 0.8
-
-        assert system.min_samples_for_learning == 5
-        assert system.learning_decay_days == 120
-        assert system.confidence_threshold == 0.8
-
     # Test 2: Team Pattern Learning
     @pytest.mark.asyncio
     async def test_learn_team_patterns_sufficient_data(

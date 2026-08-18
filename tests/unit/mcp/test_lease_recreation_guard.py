@@ -54,86 +54,6 @@ def _make_lease_manager_no_active_lease() -> MagicMock:
 # ---------------------------------------------------------------------------
 
 
-class TestLeaseRecreationGuardOnDoneTask:
-    """Lease must NOT be recreated when the task is already DONE."""
-
-    @pytest.mark.asyncio
-    async def test_no_lease_created_when_task_is_done(self) -> None:
-        """
-        Stale agent progress on a DONE task must not recreate a lease.
-
-        Arrange: task status = "done", renew_lease returns None.
-        Act:     call the lease-recreation branch directly.
-        Assert:  create_lease is never called.
-        """
-        task_id = "task-done-001"
-        lm = _make_lease_manager_no_active_lease()
-
-        task_obj = _make_task(task_id, "done")
-        # Simulate the guard logic isolated from the full tool call
-        if task_obj is not None and task_obj.status in {"done", "completed"}:
-            pass  # guard fires → no create_lease
-        else:
-            await lm.create_lease(task_id, "agent-x", task_obj)
-
-        lm.create_lease.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_no_lease_created_when_task_status_is_completed(self) -> None:
-        """
-        'completed' is the agent-facing alias for done — also guarded.
-        """
-        task_id = "task-done-002"
-        lm = _make_lease_manager_no_active_lease()
-
-        task_obj = _make_task(task_id, "completed")
-        if task_obj is not None and task_obj.status in {"done", "completed"}:
-            pass
-        else:
-            await lm.create_lease(task_id, "agent-x", task_obj)
-
-        lm.create_lease.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_lease_created_when_task_is_in_progress(self) -> None:
-        """
-        When the task is still in_progress, the lease SHOULD be recreated.
-        """
-        task_id = "task-active-001"
-        lm = _make_lease_manager_no_active_lease()
-        fake_lease = MagicMock()
-        fake_lease.lease_expires.isoformat.return_value = "2099-01-01T00:00:00"
-        lm.create_lease.return_value = fake_lease
-
-        task_obj = _make_task(task_id, "in_progress")
-        if task_obj is not None and task_obj.status in {"done", "completed"}:
-            pass
-        else:
-            await lm.create_lease(task_id, "agent-x", task_obj)
-
-        lm.create_lease.assert_called_once_with(task_id, "agent-x", task_obj)
-
-    @pytest.mark.asyncio
-    async def test_lease_created_when_task_obj_is_none(self) -> None:
-        """
-        If the task is not found in project_tasks, recreate as before
-        (defensive: better to have a watchdog than to silently drop).
-        """
-        task_id = "task-missing"
-        lm = _make_lease_manager_no_active_lease()
-        fake_lease = MagicMock()
-        fake_lease.lease_expires.isoformat.return_value = "2099-01-01T00:00:00"
-        lm.create_lease.return_value = fake_lease
-
-        task_obj = None
-        if task_obj is not None and task_obj.status in {"done", "completed"}:
-            pass
-        else:
-            await lm.create_lease(task_id, "agent-x", task_obj)
-
-        lm.create_lease.assert_called_once_with(task_id, "agent-x", None)
-
-
 # ---------------------------------------------------------------------------
 # Tests: integration with report_task_progress internals
 # We patch the minimal collaborators to exercise the guard path in the actual
@@ -166,11 +86,3 @@ class TestLeaseGuardIntegration:
         from src.core.models import TaskStatus
 
         assert TaskStatus.DONE.value == "done"
-
-    def test_guard_values_cover_done_and_completed(self) -> None:
-        """The sentinel set used in the guard must include both spellings."""
-        _DONE_STATUSES = {"done", "completed"}
-        assert "done" in _DONE_STATUSES
-        assert "completed" in _DONE_STATUSES
-        assert "in_progress" not in _DONE_STATUSES
-        assert "todo" not in _DONE_STATUSES

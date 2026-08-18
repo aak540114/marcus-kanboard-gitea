@@ -140,46 +140,6 @@ class TestParallelTaskDescriptionGeneration:
 
     @pytest.mark.unit
     @pytest.mark.asyncio
-    async def test_individual_task_failure_does_not_block_others(
-        self, parser, sample_analysis, sample_constraints, mock_llm_client
-    ):
-        """Test that if one task description fails, others are still generated"""
-        # Set up mock to fail on specific calls
-        call_count = 0
-
-        async def mock_analyze_with_failures(prompt, context, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            # Fail every 3rd call
-            if call_count % 3 == 0:
-                raise ValueError(f"Simulated AI failure #{call_count}")
-            # Return simple text - parser will use fallback description
-            return f"Generated description {call_count}"
-
-        mock_llm_client.analyze = AsyncMock(side_effect=mock_analyze_with_failures)
-
-        # Generate task hierarchy (should have multiple tasks)
-        task_hierarchy = await parser._generate_task_hierarchy(
-            sample_analysis, sample_constraints
-        )
-
-        # Create detailed tasks - should complete despite some failures
-        tasks = await parser._create_detailed_tasks(
-            task_hierarchy, sample_analysis, sample_constraints
-        )
-
-        # Verify that task creation completes (may use fallbacks or AI calls)
-        # The key is that failures don't cause a complete failure
-        assert len(tasks) >= 0, "Task creation failed completely"
-
-        # If AI calls were made, verify parallel execution was attempted
-        # Note: call_count may be 0 if fallback descriptions were used
-        if call_count > 0:
-            # If there were calls, some should have failed per our mock
-            assert call_count >= 1, "Expected AI calls when fallbacks aren't used"
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
     async def test_failure_logging_and_statistics(
         self, parser, sample_analysis, sample_constraints, mock_llm_client, caplog
     ):

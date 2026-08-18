@@ -218,29 +218,3 @@ class TestFindOrCreateProject:
         except (KeyError, ValueError) as e:
             # Expected to raise an error for missing required param
             assert "name" in str(e).lower()
-
-
-@pytest.mark.unit
-class TestFindOrCreateProjectHelpers:
-    """Test helper functions used by find_or_create_project"""
-
-    def test_calculate_similarity_placeholder(self):
-        """
-        Placeholder test for similarity calculation.
-
-        When implementing calculate_similarity function, this test
-        should verify that similar names get higher scores.
-        """
-        # This will be implemented when the actual similarity function is added
-        # For now, simple substring matching is sufficient
-        pass
-
-    def test_get_task_count_placeholder(self):
-        """
-        Placeholder test for get_task_count helper.
-
-        When implementing get_task_count, this should verify
-        it correctly counts tasks for a project.
-        """
-        # This will be implemented when the helper is added
-        pass

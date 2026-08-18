@@ -187,18 +187,3 @@ class TestProjectAutoSetup:
             )
 
         assert "Unsupported provider" in str(exc_info.value)
-
-
-@pytest.mark.unit
-class TestProjectAutoSetupHelpers:
-    """Test helper methods for project auto-setup"""
-
-    def test_extract_planka_options(self):
-        """Test extracting Planka-specific options from general options dict"""
-        # This will be implemented when we add option extraction logic
-        pass
-
-    def test_validate_project_config(self):
-        """Test validation of created ProjectConfig"""
-        # This will be implemented if we add validation logic
-        pass

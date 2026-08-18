@@ -37,41 +37,6 @@ class TestProgressEvent:
         assert event.message == "Analyzing task 45/100"
         assert event.timestamp.tzinfo == timezone.utc
 
-    def test_progress_event_percentage(self):
-        """Test calculating percentage from progress event."""
-        # Arrange
-        event = ProgressEvent(
-            operation="test_op",
-            current=45,
-            total=100,
-            message="Progress",
-            timestamp=datetime.now(timezone.utc),
-        )
-
-        # Act
-        percentage = (event.current / event.total) * 100
-
-        # Assert
-        assert percentage == 45.0
-
-    def test_progress_event_completion(self):
-        """Test detecting completion from progress event."""
-        # Arrange
-        event = ProgressEvent(
-            operation="test_op",
-            current=100,
-            total=100,
-            message="Complete",
-            timestamp=datetime.now(timezone.utc),
-        )
-
-        # Act
-        is_complete = event.current == event.total
-
-        # Assert
-        assert is_complete is True
-
-
 class TestProgressReporter:
     """Test suite for ProgressReporter."""
 

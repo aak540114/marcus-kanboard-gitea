@@ -774,39 +774,6 @@ class TestKanbanClientWithCreate:
         assert task.name == "Test task"
 
     @pytest.mark.asyncio
-    async def test_card_to_task_conversion(self, client):
-        """Test conversion of card data to Task object."""
-        # Mock the parent's _card_to_task method
-        card_data = {
-            "id": "card-999",
-            "name": "Test Card",
-            "description": "Test Description",
-            "listName": "TODO",
-        }
-
-        with patch.object(client, "_card_to_task") as mock_convert:
-            expected_task = Task(
-                id="card-999",
-                name="Test Card",
-                description="Test Description",
-                status=TaskStatus.TODO,
-                priority=Priority.MEDIUM,
-                assigned_to=None,
-                created_at=datetime.now(timezone.utc),
-                updated_at=datetime.now(timezone.utc),
-                due_date=None,
-                estimated_hours=0.0,
-            )
-            mock_convert.return_value = expected_task
-
-            # Call the method
-            result = client._card_to_task(card_data)
-
-            # Verify
-            assert result == expected_task
-            mock_convert.assert_called_once_with(card_data)
-
-    @pytest.mark.asyncio
     @patch("src.integrations.kanban_client_with_create.stdio_client")
     @patch("src.integrations.kanban_client_with_create.ClientSession")
     async def test_create_task_with_empty_description(
@@ -866,34 +833,3 @@ class TestKanbanClientWithCreate:
             assert os.environ["PLANKA_AGENT_EMAIL"] == "demo@demo.demo"
             assert os.environ["PLANKA_AGENT_PASSWORD"] == "demo"
 
-    @pytest.mark.asyncio
-    async def test_create_task_with_no_checklist_or_labels(self, client):
-        """Test task creation without labels or checklist items."""
-        with patch.object(client, "create_task", new_callable=AsyncMock) as mock_create:
-            # Mock a successful task creation
-            expected_task = Task(
-                id="card-simple",
-                name="Simple Task",
-                description="No extras",
-                status=TaskStatus.TODO,
-                priority=Priority.LOW,
-                assigned_to=None,
-                created_at=datetime.now(timezone.utc),
-                updated_at=datetime.now(timezone.utc),
-                due_date=None,
-                estimated_hours=1.0,
-            )
-            mock_create.return_value = expected_task
-
-            # Create task with no labels or checklist
-            task_data = {
-                "name": "Simple Task",
-                "description": "No extras",
-                "priority": "low",
-                "estimated_hours": 1.0,
-            }
-
-            result = await client.create_task(task_data)
-
-            assert result == expected_task
-            mock_create.assert_called_once_with(task_data)

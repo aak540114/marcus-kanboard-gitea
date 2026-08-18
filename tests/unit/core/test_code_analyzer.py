@@ -205,38 +205,6 @@ class TestCodeAnalyzer:
         assert result["implementations"][0]["implementation"] == "get_user"
 
     @pytest.mark.asyncio
-    async def test_get_implementation_details_models(self, analyzer, mock_mcp_caller):
-        """Test getting model implementation details."""
-        # The _find_models method is not implemented in the code
-        # This test verifies the behavior when method doesn't exist
-        try:
-            result = await analyzer.get_implementation_details(
-                "owner", "repo", "models"
-            )
-            # If it doesn't raise an error, check the result
-            assert result["feature_type"] == "models"
-            assert result["implementations"] == []
-        except AttributeError:
-            # This is expected since _find_models is not implemented
-            pass
-
-    @pytest.mark.asyncio
-    async def test_get_implementation_details_schemas(self, analyzer, mock_mcp_caller):
-        """Test getting schema implementation details."""
-        # The _find_schemas method is not implemented in the code
-        # This test verifies the behavior when method doesn't exist
-        try:
-            result = await analyzer.get_implementation_details(
-                "owner", "repo", "schemas"
-            )
-            # If it doesn't raise an error, check the result
-            assert result["feature_type"] == "schemas"
-            assert result["implementations"] == []
-        except AttributeError:
-            # This is expected since _find_schemas is not implemented
-            pass
-
-    @pytest.mark.asyncio
     async def test_get_recent_commits_filters_by_author(
         self, analyzer, mock_mcp_caller
     ):

@@ -134,33 +134,6 @@ class TestMarcusConfigEnvOverrides:
         # Note: Port is string in JSON, gets converted to int during parsing
         assert config.transport.http_port == 8080
 
-    def test_env_var_substitution_in_lists(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Test environment variable substitution in list values."""
-        monkeypatch.setenv("TAG1", "production")
-        monkeypatch.setenv("TAG2", "critical")
-
-        config_file = tmp_path / "test_config.json"
-        config_data = {
-            "ai": {"provider": "anthropic", "anthropic_api_key": "sk-ant-test"},
-            "kanban": {
-                "provider": "planka",
-                "planka_base_url": "http://localhost:3333",
-                "planka_email": "test@test.com",
-                "planka_password": "testpass",  # pragma: allowlist secret
-            },
-            "test_tags": ["${TAG1}", "${TAG2}", "static"],
-        }
-
-        with open(config_file, "w") as f:
-            json.dump(config_data, f)
-
-        config = MarcusConfig.from_file(str(config_file))
-
-        # The config should have processed the list
-        # (though test_tags isn't a real field, this tests the mechanism)
-
     def test_mixed_env_and_literal_values(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

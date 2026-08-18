@@ -296,31 +296,6 @@ class TestTaskRedundancyAnalyzer:
         assert result.over_decomposition_detected is False
         assert result.recommended_complexity == "enterprise"
 
-    @pytest.mark.asyncio
-    @pytest.mark.unit
-    async def test_analyze_project_with_progress_callback(
-        self, mock_ai_engine, sample_tasks
-    ):
-        """Test that progress callback is invoked during analysis."""
-        # Arrange
-        analyzer = TaskRedundancyAnalyzer(ai_engine=mock_ai_engine)
-        progress_events = []
-
-        async def progress_callback(event):
-            progress_events.append(event)
-
-        # Act
-        await analyzer.analyze_project(
-            tasks=sample_tasks,
-            conversations=[],
-            progress_callback=progress_callback,
-        )
-
-        # Assert - Progress callback should have been called
-        # Note: Actual progress reporting depends on implementation
-        # This test verifies callback mechanism works
-        assert True  # If no exception, callback was accepted
-
     @pytest.mark.unit
     def test_find_quick_completions(self, mock_ai_engine, quick_completion_tasks):
         """Test identifying tasks completed in < 30 seconds."""

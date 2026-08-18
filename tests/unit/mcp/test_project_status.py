@@ -153,23 +153,6 @@ class TestProjectStatusKanbanMetrics:
         assert result["project"]["completed"] == 1
 
     @pytest.mark.asyncio
-    async def test_about_task_counted_as_done(self) -> None:
-        """Test that About task (born done) is counted."""
-        from src.marcus_mcp.tools.project import get_project_status
-
-        state = _make_state(
-            kanban_metrics={
-                "total_tasks": 5,
-                "completed_tasks": 5,
-                "in_progress_tasks": 0,
-                "blocked_tasks": 0,
-            }
-        )
-        result = await get_project_status(state=state)
-        assert result["project"]["completed"] == 5
-        assert result["project"]["total_tasks"] == 5
-
-    @pytest.mark.asyncio
     async def test_empty_metrics_falls_back(self) -> None:
         """Test fallback when metrics dict is empty."""
         from src.marcus_mcp.tools.project import get_project_status

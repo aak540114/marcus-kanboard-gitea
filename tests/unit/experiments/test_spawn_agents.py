@@ -226,34 +226,6 @@ class TestKanbanConnectionResilience:
         """Test that the Planka client module is importable."""
         from src.marcus_mcp import handlers  # noqa: F401
 
-    @pytest.mark.asyncio
-    async def test_kanban_client_raises_on_connection_error(
-        self,
-    ) -> None:
-        """Test that Kanban client operations raise on connection failure."""
-        from unittest.mock import AsyncMock
-
-        mock_client = AsyncMock()
-        mock_client.get_boards = AsyncMock(
-            side_effect=ConnectionError("Connection refused")
-        )
-
-        with pytest.raises(ConnectionError):
-            await mock_client.get_boards()
-
-    @pytest.mark.asyncio
-    async def test_kanban_client_raises_on_timeout(self) -> None:
-        """Test that Kanban client operations raise on timeout."""
-        import asyncio
-        from unittest.mock import AsyncMock
-
-        mock_client = AsyncMock()
-        mock_client.get_boards = AsyncMock(side_effect=asyncio.TimeoutError())
-
-        with pytest.raises(asyncio.TimeoutError):
-            await mock_client.get_boards()
-
-
 class TestMCPHealthCheck:
     """Test suite for MCP server health verification."""
 

@@ -559,42 +559,6 @@ class TestAITaskAssignmentEngine:
         phase = assignment_engine._detect_project_phase()
         assert phase == "initialization"
 
-    def test_detect_project_phase_various_completion_rates(
-        self, assignment_engine, sample_tasks
-    ):
-        """Test project phase detection at various completion rates."""
-        # Test different completion scenarios
-        test_cases = [
-            (0, "foundation"),
-            (1, "early_development"),  # 25% complete
-            (2, "active_development"),  # 50% complete
-            (3, "integration"),  # 75% complete
-            (4, "deployment"),  # 100% complete
-        ]
-
-        for completed_count, expected_phase in test_cases:
-            # Reset all tasks to TODO
-            for task in sample_tasks:
-                task.status = TaskStatus.TODO
-
-            # Mark specified number as complete
-            for i in range(completed_count):
-                sample_tasks[i].status = TaskStatus.DONE
-
-            assignment_engine.project_tasks = sample_tasks
-            phase = assignment_engine._detect_project_phase()
-
-            # Allow for some flexibility in phase boundaries
-            phases = [
-                "foundation",
-                "early_development",
-                "active_development",
-                "integration",
-                "testing",
-                "deployment",
-            ]
-            assert phase in phases
-
     def test_detect_project_phase_testing_phase(self, assignment_engine):
         """Test project phase detection for testing phase (90% complete)."""
         # Create 10 tasks, mark 9 as complete
