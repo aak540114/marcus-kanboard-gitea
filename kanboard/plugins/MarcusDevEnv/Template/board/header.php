@@ -662,7 +662,22 @@ $cloneProjectStatusUrl = $marcusUrl . '/api/clone-project-status';
             var el = document.activeElement;
             if (el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT'
                        || el.isContentEditable)) { return true; }
-            if (document.querySelector('#popover-container, .modal-box')) {
+            // Regression: this used to check "#popover-container, .modal-box"
+            // — #popover-container matches nothing anywhere in Kanboard (zero
+            // occurrences of "popover" in its whole compiled assets/js/app.min.js,
+            // verified directly against the v1.2.53 tag docker-compose.yml
+            // pins), and .modal-box is a CLASS selector when Kanboard's own
+            // modal system (KB.modal, same file) actually builds an ID:
+            // create()/destroy() append/remove #modal-overlay (wrapping
+            // #modal-box) around EVERY modal — "Add a new task", editing a
+            // ticket, bulk actions, confirm dialogs, all of it. Neither old
+            // selector could ever match, so a live refresh only got deferred
+            // when focus happened to be literally inside a text field at that
+            // exact instant — an open "new task" dialog with focus anywhere
+            // else (a dropdown just clicked, a pause between keystrokes) got
+            // silently wiped by the reload below. #modal-overlay is present
+            // for the modal's entire lifetime, so this now actually holds.
+            if (document.querySelector('#modal-overlay')) {
                 return true;
             }
             return false;
