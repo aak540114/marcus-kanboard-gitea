@@ -800,6 +800,151 @@ class TestAcChangedOnDecomposeParent:
         mock_kanban.add_comment.assert_called_once()
 
 
+class TestStartAiWorkRefusesDecomposedParent:
+    """Regression: a decomposed parent whose children all finish must end
+    up in Waiting for Human, never Ready/In Progress.
+
+    Root cause: decompose_ticket links each child to the parent via
+    create_task_link(parent, child, 3) ("parent is blocked by child") —
+    a real Kanboard depends_on-style link, structurally indistinguishable
+    from an ordinary dependency link. _dependencies_satisfied() treats a
+    BLOCKED ticket's own children (surfaced through that link) exactly
+    like genuine dependencies, so once every child reaches DONE it
+    reports the PARENT's "dependencies" as satisfied too. _start_ai_work
+    is also deliberately reachable for a BLOCKED/WAITING_FOR_HUMAN ticket
+    (a human re-assigning a stuck ticket resumes it — see
+    TestDeadEndStateRecovery), which a decomposed parent sits in for
+    exactly the same shape of reason. Without an explicit guard, that
+    combination lets the parent be claimed and started like an ordinary
+    ticket — moving its card to Ready/In Progress instead of
+    _check_parent_completion's correct Waiting for Human — which is
+    exactly the reported bug.
+    """
+
+    def _child(self, lifecycle, tid, parent, state=TicketState.DONE):
+        lifecycle.get_or_create(
+            tid, "kanboard",
+            acceptance_criteria=f"- [ ] x\n<!-- Sub-ticket of #{parent} -->",
+        )
+        if state != TicketState.TODO:
+            lifecycle.transition(tid, "kanboard", TicketState.READY)
+        if state in (TicketState.IN_PROGRESS, TicketState.DONE):
+            lifecycle.transition(tid, "kanboard", TicketState.IN_PROGRESS)
+        if state == TicketState.DONE:
+            lifecycle.transition(tid, "kanboard", TicketState.DONE)
+
+    def _blocked_parent_all_children_done(self, lifecycle, parent="230"):
+        lifecycle.get_or_create(parent, "kanboard")
+        lifecycle.human_transition(parent, "kanboard", TicketState.BLOCKED)
+        lifecycle.set_assignee(parent, "kanboard", "alice")
+        self._child(lifecycle, "231", parent)
+        self._child(lifecycle, "232", parent)
+        return lifecycle.get(parent, "kanboard")
+
+    @pytest.mark.asyncio
+    async def test_direct_call_is_refused(self, workflow, lifecycle, mock_kanban):
+        """_start_ai_work itself refuses a parent with recognized
+        children, regardless of who calls it or why."""
+        rec = self._blocked_parent_all_children_done(lifecycle, "230")
+        mock_kanban.move_task_to_column.reset_mock()
+
+        await workflow._start_ai_work("230", rec)
+
+        after = lifecycle.get("230", "kanboard")
+        assert after.state == TicketState.BLOCKED  # untouched — still BLOCKED
+        assert after.ai_agent_id is None  # never claimed
+        assert not any(
+            call.args[1] in ("ready", "in progress")
+            for call in mock_kanban.move_task_to_column.call_args_list
+            if call.args[0] == "230"
+        )
+
+    @pytest.mark.asyncio
+    async def test_reassigning_a_stuck_parent_does_not_start_it(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """The exact real-world trigger this guards against: a human
+        re-assigning a BLOCKED ticket is _on_ticket_assigned's own
+        documented "resume a stuck ticket" recovery path (see
+        TestDeadEndStateRecovery) — deliberately reachable for BLOCKED,
+        since that's how a genuinely stuck ordinary ticket gets
+        un-stuck. A decomposed parent sits in that exact same state for
+        an entirely different reason and must not be swept up by it."""
+        self._blocked_parent_all_children_done(lifecycle, "230")
+
+        event = _make_event(
+            {"ticket_id": "230", "assignee": "bob", "provider": "kanboard"}
+        )
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            return_value="ticket/kanboard/230",
+        ):
+            await workflow._on_ticket_assigned(event)
+
+        rec = lifecycle.get("230", "kanboard")
+        assert rec.state == TicketState.BLOCKED
+        assert rec.ai_agent_id is None
+
+    @pytest.mark.asyncio
+    async def test_check_parent_completion_still_reaches_waiting_for_human(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """End-to-end: the actual intended mechanism still works — a
+        parent whose last child finishes lands in WAITING_FOR_HUMAN, with
+        its board card moved there too."""
+        self._blocked_parent_all_children_done(lifecycle, "230")
+        mock_kanban.move_task_to_column.reset_mock()
+
+        await workflow._check_parent_completion("230")
+
+        rec = lifecycle.get("230", "kanboard")
+        assert rec.state == TicketState.WAITING_FOR_HUMAN
+        mock_kanban.move_task_to_column.assert_any_call("230", "waiting for human")
+
+    @pytest.mark.asyncio
+    async def test_start_ai_work_race_after_parking_does_not_undo_it(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Even if something calls _start_ai_work on the parent AFTER
+        _check_parent_completion already parked it in Waiting for Human
+        (a plausible race), the parent must stay there — not get bounced
+        to Ready/In Progress."""
+        self._blocked_parent_all_children_done(lifecycle, "230")
+        await workflow._check_parent_completion("230")
+        assert lifecycle.get("230", "kanboard").state == TicketState.WAITING_FOR_HUMAN
+
+        rec = lifecycle.get("230", "kanboard")
+        await workflow._start_ai_work("230", rec)
+
+        after = lifecycle.get("230", "kanboard")
+        assert after.state == TicketState.WAITING_FOR_HUMAN
+        assert after.ai_agent_id is None
+
+    @pytest.mark.asyncio
+    async def test_normal_blocked_ticket_still_resumable(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Sanity check: an ORDINARY ticket (no children) genuinely
+        dependency-blocked still resumes via _start_ai_work as before —
+        this fix must not touch that path."""
+        lifecycle.get_or_create("240", "kanboard")
+        lifecycle.transition("240", "kanboard", TicketState.READY)
+        lifecycle.transition("240", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("240", "kanboard", TicketState.BLOCKED)
+        lifecycle.set_assignee("240", "kanboard", "alice")
+        rec = lifecycle.get("240", "kanboard")
+
+        with patch(
+            "src.workflows.human_gated_workflow.BranchManager.make_branch_name",
+            return_value="ticket/kanboard/240",
+        ):
+            await workflow._start_ai_work("240", rec)
+
+        after = lifecycle.get("240", "kanboard")
+        assert after.state == TicketState.IN_PROGRESS
+        assert after.ai_agent_id is not None
+
+
 # ---------------------------------------------------------------------------
 # Webhook/poll echo: WFH resume re-claims, no duplicate "Started"
 # ---------------------------------------------------------------------------

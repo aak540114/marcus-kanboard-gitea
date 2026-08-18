@@ -571,6 +571,12 @@ class HumanGatedWorkflow:
         record = self._lifecycle.get(ticket_id, self._provider) or record
 
         # If the kanban column is already past todo, start AI work now.
+        # Deliberately not narrowed to READY/IN_PROGRESS only: reassigning
+        # a BLOCKED or WAITING_FOR_HUMAN ticket is exactly how a human
+        # resumes one that got stuck (see TestDeadEndStateRecovery) —
+        # _start_ai_work itself now guards against the one case that
+        # resumption must NOT apply to (a decomposed parent; see its own
+        # docstring).
         if record.state != TicketState.TODO:
             await self._start_ai_work(ticket_id, record)
 
@@ -4588,11 +4594,15 @@ class HumanGatedWorkflow:
         ticket. When ``None`` (the human-gated path), the next free parallel
         slot is used as before.
 
-        Called whenever both conditions are met: the ticket IS assigned to
-        a human (the assignment is the "please work on this" signal — see
-        ``_on_ticket_assigned``) **and** the kanban column is ``READY`` or
-        ``IN_PROGRESS`` (or just changed to one of those states). Callers
-        enforce both conditions; this method assumes them.
+        Called whenever the ticket IS assigned to a human (the assignment
+        is the "please work on this" signal — see ``_on_ticket_assigned``)
+        and its column suggests work should happen: normally ``READY`` or
+        ``IN_PROGRESS``, but also ``BLOCKED``/``WAITING_FOR_HUMAN`` when a
+        human re-assigns a stuck ticket to resume it (see
+        ``TestDeadEndStateRecovery``) — this method itself walks the
+        record forward from wherever it currently sits. The one state it
+        must never be called for is a decomposed PARENT ticket (one with
+        recognized children), guarded below.
 
         The claim gate ensures at most one Marcus instance starts work on
         the same ticket concurrently.
@@ -4615,6 +4625,38 @@ class HumanGatedWorkflow:
             logger.debug(
                 "Ticket %s record is DONE — leaving restart to the "
                 "reopen handler",
+                ticket_id,
+            )
+            return
+
+        # A ticket with recognized children is a decomposed PARENT — a
+        # tracking shell with no branch of its own (see
+        # _complete_parent_ticket's docstring). Its lifecycle is owned
+        # entirely by _check_parent_completion / _reconcile_blocked_parents,
+        # never by this generic "start AI work" path. Without this guard, a
+        # parent sitting BLOCKED with all its children already DONE passes
+        # the dependency gate below exactly like an ordinary
+        # dependency-blocked ticket would: decompose_ticket's own
+        # create_task_link(parent, child, 3) ("parent is blocked by
+        # child") links are structurally indistinguishable from a real
+        # dependency link at the Kanboard API level, so _dependencies_
+        # satisfied() reports the parent's "dependencies" (its children)
+        # as met the moment they're all Done. _on_ticket_assigned's own
+        # "resume a stuck ticket by re-assigning it" recovery path (see
+        # TestDeadEndStateRecovery) deliberately calls this method for
+        # BLOCKED/WAITING_FOR_HUMAN tickets too — exactly the states a
+        # decomposed parent sits in — so without this guard a stray
+        # re-assignment (or any other future caller) would claim and
+        # start the parent like a normal ticket, moving its card to
+        # Ready/In Progress instead of Waiting for Human. Regression:
+        # this is exactly the bug where a fully-completed decomposed
+        # parent's card showed up in "Ready" instead of "Waiting for
+        # Human".
+        if self._children_of(ticket_id):
+            logger.debug(
+                "Ticket %s has recognized children — refusing to start it "
+                "directly (it's a decomposed parent; "
+                "_check_parent_completion owns its lifecycle)",
                 ticket_id,
             )
             return
