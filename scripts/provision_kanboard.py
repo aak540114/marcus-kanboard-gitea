@@ -247,7 +247,11 @@ def grant_project_membership_to_all_users(
 
 
 def find_or_create_project(
-    base_url: str, token: str, name: str, description: Optional[str] = None
+    base_url: str,
+    token: str,
+    name: str,
+    description: Optional[str] = None,
+    project_id: Optional[int] = None,
 ) -> int:
     """Return the id of the project named ``name``, creating it if absent.
 
@@ -267,6 +271,19 @@ def find_or_create_project(
         project is found instead: a human may since have rewritten this
         project's description, and setup.sh's own "safe to re-run"
         guarantee means a later run must never overwrite that edit.
+    project_id : Optional[int]
+        A previously-provisioned project id to look up FIRST — typically
+        ``KANBOARD_PROJECT_ID`` already persisted to ``.env`` by an
+        earlier run. Kanboard project ids are stable across renames,
+        unlike ``name``: this project's own auto-generated description
+        explicitly invites a human to rename it ("feel free to rename,
+        reuse, or delete it"), and without this parameter a later
+        ``setup.sh`` re-run — advertised throughout as always safe —
+        would fail to find the renamed project by its now-stale
+        ``KANBOARD_PROJECT_NAME`` and silently create a SECOND, empty
+        duplicate instead. Ignored (falls through to the name-based
+        lookup below) if ``None``, or if the id no longer resolves to a
+        real project (e.g. it was deleted).
 
     Returns
     -------
@@ -279,11 +296,17 @@ def find_or_create_project(
         If ``createProject`` returns a falsy result (Kanboard's own
         ``ProjectModel::create`` returns ``false`` on any failure step).
     """
+    if project_id is not None:
+        existing_by_id = call_rpc(base_url, token, "getProjectById", [project_id])
+        if existing_by_id:
+            grant_project_membership_to_all_users(base_url, token, project_id)
+            return project_id
+
     project = call_rpc(base_url, token, "getProjectByName", [name])
     if project:
-        project_id = int(project["id"])
-        grant_project_membership_to_all_users(base_url, token, project_id)
-        return project_id
+        found_id = int(project["id"])
+        grant_project_membership_to_all_users(base_url, token, found_id)
+        return found_id
 
     # createProject's JSON-RPC result IS the new project's int id on
     # success (ProjectProcedure::createProject returns
@@ -435,6 +458,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--token", required=True, help="API_AUTHENTICATION_TOKEN value")
     parser.add_argument("--project-name", required=True, help="Project name to find or create")
     parser.add_argument(
+        "--project-id",
+        type=int,
+        default=None,
+        help=(
+            "A previously-provisioned project id (e.g. this script's own "
+            "prior-run output, persisted by setup.sh as KANBOARD_PROJECT_ID) "
+            "to look up FIRST, before falling back to --project-name. "
+            "Project ids survive a rename; --project-name alone does not "
+            "— see find_or_create_project's docstring."
+        ),
+    )
+    parser.add_argument(
         "--project-description",
         default=None,
         help=(
@@ -459,7 +494,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         project_id = find_or_create_project(
-            args.url, args.token, args.project_name, args.project_description
+            args.url,
+            args.token,
+            args.project_name,
+            args.project_description,
+            project_id=args.project_id,
         )
         added = reconcile_columns(args.url, args.token, project_id)
         if args.secure_admin:

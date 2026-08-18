@@ -465,6 +465,16 @@ provision_args=(
     # edit here is never clobbered.
     --project-description "Created automatically by ./scripts/setup.sh as a starter project. Not required by Marcus — feel free to rename, reuse, or delete it if you don't need it."
 )
+# A prior run's project id (if any) is looked up FIRST, before falling
+# back to --project-name — project ids survive a rename, and the
+# description above explicitly invites renaming this project. Without
+# this, renaming it and re-running setup.sh (advertised throughout this
+# script as always safe) would fail to find it by its now-stale
+# KANBOARD_PROJECT_NAME and silently create a second, empty duplicate.
+existing_project_id="$(env_get KANBOARD_PROJECT_ID)"
+if [ -n "$existing_project_id" ]; then
+    provision_args+=(--project-id "$existing_project_id")
+fi
 # Only replace admin/admin when Kanboard is actually being published beyond
 # localhost — for the default local-only deployment this stays as-is, same
 # as every other "local/demo use" default in this stack.

@@ -284,6 +284,85 @@ class TestFindOrCreateProject:
         assert "createProject" not in calls
         assert "updateProject" not in calls
 
+    def test_project_id_found_by_id_skips_name_lookup_and_create(self):
+        """Regression: passing project_id (e.g. a prior run's persisted
+        KANBOARD_PROJECT_ID) must look it up via getProjectById FIRST —
+        if it still resolves, that's the answer, with no getProjectByName
+        or createProject call at all. This is what lets a re-run find a
+        project a human has since RENAMED (its own auto-generated
+        description explicitly invites that)."""
+        calls = []
+
+        def fake_urlopen(req, timeout=None):
+            body = json.loads(req.data)
+            calls.append((body["method"], body["params"]))
+            if body["method"] == "getProjectById":
+                return _rpc_response({"id": "7", "name": "Marcus Dev Board"})
+            if body["method"] == "getAllUsers":
+                return _rpc_response([])
+            raise AssertionError(f"unexpected RPC call: {body['method']}")
+
+        with patch("provision_kanboard.urllib.request.urlopen", side_effect=fake_urlopen):
+            project_id = pk.find_or_create_project(
+                "http://x/jsonrpc.php",
+                "tok",
+                "Sample Project",  # stale — the project was renamed
+                project_id=7,
+            )
+
+        assert project_id == 7
+        methods = [c[0] for c in calls]
+        assert methods[0] == "getProjectById"
+        assert "getProjectByName" not in methods
+        assert "createProject" not in methods
+
+    def test_project_id_not_found_falls_back_to_name_lookup(self):
+        """A project_id that no longer resolves (e.g. deleted) must fall
+        through to the ordinary name-based lookup/create path, not raise
+        or silently fail."""
+        calls = []
+
+        def fake_urlopen(req, timeout=None):
+            body = json.loads(req.data)
+            calls.append(body["method"])
+            if body["method"] == "getProjectById":
+                return _rpc_response(False)
+            if body["method"] == "getProjectByName":
+                return _rpc_response({"id": "9", "name": "Sample Project"})
+            if body["method"] == "getAllUsers":
+                return _rpc_response([])
+            raise AssertionError(f"unexpected RPC call: {body['method']}")
+
+        with patch("provision_kanboard.urllib.request.urlopen", side_effect=fake_urlopen):
+            project_id = pk.find_or_create_project(
+                "http://x/jsonrpc.php",
+                "tok",
+                "Sample Project",
+                project_id=999,
+            )
+
+        assert project_id == 9
+        assert calls[:2] == ["getProjectById", "getProjectByName"]
+
+    def test_no_project_id_skips_the_id_lookup_entirely(self):
+        """Backward compatible: omitting project_id (the pre-existing call
+        shape) never issues a getProjectById call at all."""
+        calls = []
+
+        def fake_urlopen(req, timeout=None):
+            body = json.loads(req.data)
+            calls.append(body["method"])
+            if body["method"] == "getProjectByName":
+                return _rpc_response({"id": "7", "name": "Sample Project"})
+            if body["method"] == "getAllUsers":
+                return _rpc_response([])
+            raise AssertionError(f"unexpected RPC call: {body['method']}")
+
+        with patch("provision_kanboard.urllib.request.urlopen", side_effect=fake_urlopen):
+            pk.find_or_create_project("http://x/jsonrpc.php", "tok", "Sample Project")
+
+        assert "getProjectById" not in calls
+
     def test_raises_if_create_returns_falsy(self):
         """createProject returning a falsy result (Kanboard's own failure
         signal) raises rather than silently returning a bad id."""
@@ -579,6 +658,43 @@ class TestMain:
 
         assert rc == 0
         assert capsys.readouterr().out.strip() == "5"
+
+    def test_project_id_flag_threaded_through_to_find_or_create_project(self):
+        """--project-id must reach find_or_create_project's project_id
+        keyword arg — this is the whole point: a re-run passing the
+        prior run's persisted KANBOARD_PROJECT_ID must look it up by id
+        first, not just by (possibly now-stale) --project-name."""
+        with patch(
+            "provision_kanboard.find_or_create_project", return_value=5
+        ) as mock_find, patch("provision_kanboard.reconcile_columns", return_value=[]):
+            pk.main(
+                [
+                    "--url", "http://x/jsonrpc.php",
+                    "--token", "tok",
+                    "--project-name", "Sample Project",
+                    "--project-id", "7",
+                ]
+            )
+
+        mock_find.assert_called_once_with(
+            "http://x/jsonrpc.php", "tok", "Sample Project", None, project_id=7
+        )
+
+    def test_no_project_id_flag_passes_none(self):
+        """Omitting --project-id (the pre-existing invocation shape) must
+        still pass project_id=None explicitly, not silently drop the
+        keyword — find_or_create_project's default already handles None
+        correctly, this just confirms main() doesn't diverge from it."""
+        with patch(
+            "provision_kanboard.find_or_create_project", return_value=5
+        ) as mock_find, patch("provision_kanboard.reconcile_columns", return_value=[]):
+            pk.main(
+                ["--url", "http://x/jsonrpc.php", "--token", "tok", "--project-name", "P"]
+            )
+
+        mock_find.assert_called_once_with(
+            "http://x/jsonrpc.php", "tok", "P", None, project_id=None
+        )
 
     def test_returns_one_on_auth_error(self, capsys):
         """An auth error exits 1 with the message on stderr, not stdout."""
