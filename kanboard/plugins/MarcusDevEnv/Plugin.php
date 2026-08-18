@@ -110,29 +110,26 @@ class Plugin extends Base
         // board just to check whether Marcus is enabled for it.
         //
         // 'template:dashboard:project:after-title' is fired once PER
-        // PROJECT ROW, inside app/Template/dashboard/overview.php (the
-        // template DashboardController::show() actually renders for the
-        // bare /dashboard URL — verified directly against that file on
-        // the v1.2.53 release tag actually shipped by the
-        // kanboard/kanboard:latest Docker image; the SEPARATE
-        // dashboard/projects.php template behind the sidebar's "My
-        // projects" link, at /dashboard/projects, has no equivalent hook
-        // and is not covered by this). It receives the row's $project
-        // array, so the badge template gets $project['id'] directly —
-        // no client-side DOM scraping needed.
-        //
-        // 'template:dashboard:show' fires exactly once, at the very end
-        // of the same overview.php template, unconditionally (outside
-        // every isEmpty() branch) — used here to emit ONE shared script
-        // that batch-fetches every collected project's status, rather
-        // than one inline <script> per row.
+        // PROJECT ROW, with the row's own $project array — and fires from
+        // BOTH app/Template/dashboard/overview.php (DashboardController::
+        // show(), the bare /dashboard URL) AND
+        // app/Template/project_list/project_title.php (rendered by
+        // app/Template/dashboard/projects.php, the sidebar's "My
+        // projects" link at /dashboard/projects) — verified directly
+        // against all three files on the v1.2.53 release tag actually
+        // shipped by the kanboard/kanboard:latest Docker image. The badge
+        // template is fully self-contained (fetches and fills in its own
+        // status immediately) specifically so it works identically on
+        // both pages — see Template/dashboard/project_badge.php for why
+        // a previous, page-level-batch-fetch version of this feature
+        // silently never resolved on /dashboard/projects (that page has
+        // no equivalent of overview.php's 'template:dashboard:show',
+        // fired once at the very end of the template — this plugin used
+        // to rely on that hook for a shared batch-fetch script, which is
+        // why it no longer does).
         $this->template->hook->attach(
             'template:dashboard:project:after-title',
             'MarcusDevEnv:dashboard/project_badge'
-        );
-        $this->template->hook->attach(
-            'template:dashboard:show',
-            'MarcusDevEnv:dashboard/badges_init'
         );
 
         // Tell Marcus when a task is DELETED.
