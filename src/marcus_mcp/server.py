@@ -5046,7 +5046,7 @@ function renderChart(containerId, buckets, barClass) {{
         el.innerHTML = '<div class="empty">No tickets moved here yet.</div>';
         return;
     }}
-    var barWidth = 46, gap = 14, chartHeight = 160, labelHeight = 46;
+    var barWidth = 46, gap = 20, chartHeight = 160, labelHeight = 70;
     var maxCount = Math.max.apply(null, buckets.map(function (b) {{ return b.count; }}));
     var width = buckets.length * (barWidth + gap) + gap;
     var height = chartHeight + labelHeight;
@@ -5082,16 +5082,26 @@ function renderChart(containerId, buckets, barClass) {{
         countText.textContent = String(b.count);
         svg.appendChild(countText);
 
+        // X-axis hour label. Anchored at 'end' and rotated -45deg around
+        // its own tick point (just below the bars), so the label reads
+        // diagonally down-and-to-the-left of that point — it can only
+        // grow AWAY from the bars, never back up over them.
+        //
+        // The previous version anchored at 'middle' and rotated +45deg:
+        // for a middle-anchored string, half its glyphs sit before the
+        // anchor and half after, and a positive rotation swings the
+        // "before" half UP past the tick — straight into the bar sitting
+        // right above it. 'end' + rotate(-45) is the standard D3/Chart.js
+        // convention for rotated axis labels for exactly this reason.
+        var tickX = x + barWidth / 2;
+        var tickY = chartHeight + 10;
         var hourText = document.createElementNS(svgNs, 'text');
-        hourText.setAttribute('x', x + barWidth / 2);
-        hourText.setAttribute('y', chartHeight + 16);
-        hourText.setAttribute('text-anchor', 'middle');
-        hourText.setAttribute('font-size', '10');
+        hourText.setAttribute('x', tickX);
+        hourText.setAttribute('y', tickY);
+        hourText.setAttribute('text-anchor', 'end');
+        hourText.setAttribute('font-size', '11');
         hourText.setAttribute('fill', '#64748b');
-        hourText.setAttribute(
-            'transform',
-            'rotate(45 ' + (x + barWidth / 2) + ' ' + (chartHeight + 16) + ')'
-        );
+        hourText.setAttribute('transform', 'rotate(-45 ' + tickX + ' ' + tickY + ')');
         hourText.textContent = label;
         svg.appendChild(hourText);
     }});
