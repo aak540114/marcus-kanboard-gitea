@@ -195,7 +195,7 @@ async def add_project(server: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
         MarcusServer instance
     arguments : Dict[str, Any]
         - name: Project name
-        - provider: Provider type (planka, linear, github)
+        - provider: Provider type (kanboard, sqlite)
         - config: Provider-specific configuration
         - tags: Optional list of tags
         - make_active: Whether to switch to this project (default: True)
@@ -215,8 +215,13 @@ async def add_project(server: Any, arguments: Dict[str, Any]) -> Dict[str, Any]:
     if not name or not provider:
         return {"success": False, "error": "name and provider are required"}
 
-    # Validate provider
-    if provider not in ["planka", "linear", "github"]:
+    # Validate provider. Must match KanbanFactory's supported providers
+    # (src/integrations/kanban_factory.py) — ProjectContextManager routes
+    # every project it activates through KanbanFactory.create(provider,
+    # ...), so accepting any other value here lets add_project succeed
+    # for a project that then fails with "Unsupported kanban provider"
+    # the moment someone switches to it.
+    if provider not in ["kanboard", "sqlite"]:
         return {"success": False, "error": f"Invalid provider: {provider}"}
 
     # Create project config
