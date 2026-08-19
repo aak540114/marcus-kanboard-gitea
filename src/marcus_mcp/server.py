@@ -4860,7 +4860,12 @@ if __name__ == "__main__":
             Query params:
                 project_id  (required)
             """
-            from src.core.project_description import ProjectDescriptionManager
+            from src.core.project_description import (
+                SOURCE_AGENT,
+                SOURCE_INFERRED,
+                ProjectDescriptionManager,
+                format_provenance_badge,
+            )
 
             project_id_str = request.query_params.get("project_id", "")
             try:
@@ -4874,9 +4879,22 @@ if __name__ == "__main__":
                 server._project_desc_mgr = desc_mgr  # type: ignore[attr-defined]
 
             raw = desc_mgr.get_description(pid) or ""
+            provenance = desc_mgr.get_provenance(pid)
+            badge_text = format_provenance_badge(provenance)
             # Escape for display in textarea / pre
             import html as _html
             escaped = _html.escape(raw)
+
+            badge_html = ""
+            if badge_text:
+                badge_class = (
+                    "badge badge-ai"
+                    if provenance.get("source") in (SOURCE_AGENT, SOURCE_INFERRED)
+                    else "badge"
+                )
+                badge_html = (
+                    f'<p class="{badge_class}">{_html.escape(badge_text)}</p>'
+                )
 
             api_url = f"/api/project-description?project_id={pid}"
             page = f"""<!doctype html>
@@ -4894,10 +4912,14 @@ if __name__ == "__main__":
   .btn:hover {{ background: #1d4ed8; }}
   #saved-msg {{ color: #16a34a; margin-left: 12px; display: none; font-size: 13px; }}
   .hint {{ font-size: 12px; color: #64748b; margin-top: 6px; }}
+  .badge {{ display: inline-block; background: #f1f5f9; color: #475569; padding: 4px 12px;
+            border-radius: 999px; font-size: 12px; margin: 0 0 14px; }}
+  .badge-ai {{ background: #eef2ff; color: #3730a3; }}
 </style>
 </head>
 <body>
 <h1>&#128203; Project Description — Project #{pid}</h1>
+{badge_html}
 <p class="hint">This document is the source of truth for the tech stack and project context.
 AI agents read and update it automatically. Humans can edit it here.</p>
 <textarea id="desc-text">{escaped}</textarea><br>

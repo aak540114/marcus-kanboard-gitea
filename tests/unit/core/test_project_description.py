@@ -7,6 +7,8 @@ Tests cover:
 - ProjectDescriptionManager: read/write, seed_if_missing, get_stack
 """
 
+from datetime import datetime
+
 import pytest
 from pathlib import Path
 
@@ -15,11 +17,13 @@ from src.core.project_description import (
     ProjectDescriptionManager,
     ProjectStack,
     SOURCE_ABSENT,
+    SOURCE_AGENT,
     SOURCE_HUMAN,
     SOURCE_INFERRED,
     SOURCE_TEMPLATE,
     _TEMPLATE,
     _WAITING_COMMENT,
+    format_provenance_badge,
     parse_stack_from_text,
 )
 
@@ -402,6 +406,138 @@ class TestProvenance:
         (tmp_path / "9.md").write_text("# Legacy\n", encoding="utf-8")
         assert mgr.get_source(9) == SOURCE_TEMPLATE
         assert mgr.can_auto_update(9) is True
+
+
+# ---------------------------------------------------------------------------
+# Provenance: ticket_id + timestamp tracking (get_provenance)
+# ---------------------------------------------------------------------------
+
+
+class TestGetProvenance:
+    """get_provenance records who/what/when, on top of the plain source."""
+
+    def _mgr(self, tmp_path):
+        return ProjectDescriptionManager(data_dir=tmp_path)
+
+    def test_absent_project_has_no_ticket_or_timestamp(self, tmp_path):
+        mgr = self._mgr(tmp_path)
+        info = mgr.get_provenance(7)
+        assert info == {"source": SOURCE_ABSENT, "ticket_id": None, "updated_at": None}
+
+    def test_agent_update_records_ticket_id_and_timestamp(self, tmp_path):
+        mgr = self._mgr(tmp_path)
+        mgr.update_description(7, "# X\n", source=SOURCE_AGENT, ticket_id="42")
+        info = mgr.get_provenance(7)
+        assert info["source"] == SOURCE_AGENT
+        assert info["ticket_id"] == "42"
+        assert info["updated_at"] is not None
+        # Must be a real, parseable ISO-8601 timestamp.
+        datetime.fromisoformat(info["updated_at"])
+
+    def test_get_source_stays_a_thin_wrapper(self, tmp_path):
+        """get_source keeps returning just the plain string as before."""
+        mgr = self._mgr(tmp_path)
+        mgr.update_description(7, "# X\n", source=SOURCE_AGENT, ticket_id="42")
+        assert mgr.get_source(7) == SOURCE_AGENT
+
+    def test_human_edit_has_no_ticket_id(self, tmp_path):
+        """Human edits (via the web UI) are never tied to a specific ticket."""
+        mgr = self._mgr(tmp_path)
+        mgr.update_description(7, "# Human wrote this\n")  # default = human
+        info = mgr.get_provenance(7)
+        assert info["source"] == SOURCE_HUMAN
+        assert info["ticket_id"] is None
+        assert info["updated_at"] is not None
+
+    def test_legacy_bare_string_sidecar_still_parses(self, tmp_path):
+        """A sidecar written by the pre-JSON format still parses correctly."""
+        mgr = self._mgr(tmp_path)
+        (tmp_path / "9.md").write_text("# Legacy\n", encoding="utf-8")
+        (tmp_path / "9.source").write_text("human", encoding="utf-8")
+        info = mgr.get_provenance(9)
+        assert info == {"source": SOURCE_HUMAN, "ticket_id": None, "updated_at": None}
+        assert mgr.get_source(9) == SOURCE_HUMAN
+
+    def test_second_update_replaces_ticket_id_and_timestamp(self, tmp_path):
+        """A later update's provenance replaces the earlier one entirely."""
+        mgr = self._mgr(tmp_path)
+        mgr.update_description(7, "# v1\n", source=SOURCE_AGENT, ticket_id="1")
+        mgr.update_description(7, "# v2\n", source=SOURCE_AGENT, ticket_id="2")
+        info = mgr.get_provenance(7)
+        assert info["ticket_id"] == "2"
+
+
+# ---------------------------------------------------------------------------
+# format_provenance_badge
+# ---------------------------------------------------------------------------
+
+
+class TestFormatProvenanceBadge:
+    """Human-readable 'last updated by ...' text for the description page."""
+
+    def test_agent_update_with_ticket_id(self):
+        text = format_provenance_badge(
+            {
+                "source": SOURCE_AGENT,
+                "ticket_id": "42",
+                "updated_at": "2026-08-19T14:32:00+00:00",
+            }
+        )
+        assert text == "Last updated by AI working ticket 42 at 2026-08-19 14:32 UTC"
+
+    def test_agent_update_without_ticket_id_falls_back_gracefully(self):
+        text = format_provenance_badge(
+            {
+                "source": SOURCE_AGENT,
+                "ticket_id": None,
+                "updated_at": "2026-08-19T14:32:00+00:00",
+            }
+        )
+        assert text == "Last updated by an AI agent at 2026-08-19 14:32 UTC"
+
+    def test_agent_update_without_timestamp_omits_at_clause(self):
+        text = format_provenance_badge(
+            {"source": SOURCE_AGENT, "ticket_id": "42", "updated_at": None}
+        )
+        assert text == "Last updated by AI working ticket 42"
+        assert " at " not in text
+
+    def test_inferred_update_mentions_marcus_and_ticket(self):
+        text = format_provenance_badge(
+            {
+                "source": SOURCE_INFERRED,
+                "ticket_id": "7",
+                "updated_at": "2026-08-19T14:32:00+00:00",
+            }
+        )
+        assert text is not None
+        assert "Marcus" in text
+        assert "ticket 7" in text
+
+    def test_human_update(self):
+        text = format_provenance_badge(
+            {
+                "source": SOURCE_HUMAN,
+                "ticket_id": None,
+                "updated_at": "2026-08-19T14:32:00+00:00",
+            }
+        )
+        assert text == "Last updated by a human at 2026-08-19 14:32 UTC"
+
+    def test_template_shows_placeholder_note_not_none_strings(self):
+        text = format_provenance_badge(
+            {"source": SOURCE_TEMPLATE, "ticket_id": None, "updated_at": None}
+        )
+        assert text is not None
+        assert "None" not in text
+
+    def test_absent_returns_none(self):
+        assert (
+            format_provenance_badge(
+                {"source": SOURCE_ABSENT, "ticket_id": None, "updated_at": None}
+            )
+            is None
+        )
 
 
 # ---------------------------------------------------------------------------

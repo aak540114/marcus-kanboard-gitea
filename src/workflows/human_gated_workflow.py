@@ -5247,7 +5247,9 @@ class HumanGatedWorkflow:
                 "reason": "a human has edited this description; not overwriting",
             }
         try:
-            mgr.update_description(project_id, text, source=SOURCE_AGENT)
+            mgr.update_description(
+                project_id, text, source=SOURCE_AGENT, ticket_id=ticket_id
+            )
         except Exception as exc:  # noqa: BLE001
             return {
                 "updated": False,
@@ -5898,7 +5900,9 @@ class HumanGatedWorkflow:
             return False
 
         try:
-            mgr.update_description(project_id, inferred, source=SOURCE_INFERRED)
+            mgr.update_description(
+                project_id, inferred, source=SOURCE_INFERRED, ticket_id=ticket_id
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not store inferred description: %s", exc)
             return False

@@ -2903,6 +2903,56 @@ class TestGetProjectDescription:
 
 
 # ---------------------------------------------------------------------------
+# apply_agent_project_description: agent writes are tagged with the
+# triggering ticket_id, visible later as a "last updated by AI working
+# ticket <id>" badge (see format_provenance_badge).
+# ---------------------------------------------------------------------------
+
+
+class TestApplyAgentProjectDescription:
+    """An agent's description update is stamped with the ticket that
+    triggered it, so a human reader can see who/what wrote it."""
+
+    @pytest.mark.asyncio
+    async def test_write_is_tagged_with_source_agent_and_ticket_id(
+        self, workflow, mock_kanban
+    ):
+        from src.core.project_description import SOURCE_AGENT
+
+        mock_kanban.get_task_by_id = AsyncMock(return_value=_make_task_mock())
+        with patch(
+            "src.core.project_description.ProjectDescriptionManager"
+        ) as MockMgr:
+            instance = MockMgr.return_value
+            instance.can_auto_update.return_value = True
+            result = await workflow.apply_agent_project_description(
+                "71", "# Updated by an agent\n"
+            )
+
+        assert result == {"updated": True, "project_id": 9}
+        instance.update_description.assert_called_once_with(
+            9, "# Updated by an agent\n", source=SOURCE_AGENT, ticket_id="71"
+        )
+
+    @pytest.mark.asyncio
+    async def test_refuses_when_human_has_locked_the_description(
+        self, workflow, mock_kanban
+    ):
+        mock_kanban.get_task_by_id = AsyncMock(return_value=_make_task_mock())
+        with patch(
+            "src.core.project_description.ProjectDescriptionManager"
+        ) as MockMgr:
+            instance = MockMgr.return_value
+            instance.can_auto_update.return_value = False
+            result = await workflow.apply_agent_project_description(
+                "71", "# Agent's attempt\n"
+            )
+
+        assert result["updated"] is False
+        instance.update_description.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # _is_unassigned helper
 # ---------------------------------------------------------------------------
 
@@ -3683,6 +3733,11 @@ class TestReviewFixes:
         mgr = pd.ProjectDescriptionManager(data_dir=tmp_path)
         assert mgr.get_source(42) == pd.SOURCE_INFERRED
         assert mgr.get_stack(42) is not None
+        # Tagged with the ticket that triggered the inference, so a
+        # reader of the description sees which ticket produced it.
+        provenance = mgr.get_provenance(42)
+        assert provenance["ticket_id"] == "5"
+        assert provenance["updated_at"] is not None
 
     @pytest.mark.asyncio
     async def test_stack_check_does_not_overwrite_human_description(

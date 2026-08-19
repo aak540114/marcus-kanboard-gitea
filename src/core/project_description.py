@@ -22,12 +22,14 @@ ProjectDescriptionManager
     Reads, writes, and parses project description documents.
 """
 
+import json
 import logging
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Awaitable, Callable, List, Optional
+from typing import Awaitable, Callable, Dict, List, Optional
 
 #: Provenance values stamped alongside a description (see
 #: ProjectDescriptionManager.get_source). Only ``"human"`` locks a
@@ -366,17 +368,53 @@ class ProjectDescriptionManager:
     def _source_path(self, project_id: int) -> Path:
         return self._dir / f"{project_id}.source"
 
-    def get_source(self, project_id: int) -> str:
-        """Return who last wrote a project's description.
+    def _read_sidecar(self, project_id: int) -> Dict[str, Optional[str]]:
+        """Parse the ``.source`` sidecar file into structured provenance.
 
-        One of :data:`SOURCE_ABSENT` (no description yet),
-        :data:`SOURCE_TEMPLATE` (blank seed), :data:`SOURCE_INFERRED`
-        (Marcus), :data:`SOURCE_AGENT` (a coding agent), or
-        :data:`SOURCE_HUMAN`. A description file with no provenance sidecar
-        (written before this feature existed) is assumed to be a
-        ``template`` — automated inference only ever replaces a description
-        with NO parseable stack, so a genuinely human-authored legacy
-        description with a real stack is never at risk.
+        Handles two on-disk formats:
+
+        - Current: a JSON object ``{"source", "ticket_id", "updated_at"}``.
+        - Legacy (written before ticket_id/updated_at tracking existed,
+          or before the provenance feature existed at all): a bare
+          source string like ``"human"``.
+
+        Returns
+        -------
+        Dict[str, Optional[str]]
+            ``{"source": str, "ticket_id": Optional[str], "updated_at":
+            Optional[str]}``. Falls back to :data:`SOURCE_TEMPLATE` with
+            no ticket/timestamp when the sidecar is missing, empty, or
+            unreadable.
+        """
+        empty: Dict[str, Optional[str]] = {
+            "source": SOURCE_TEMPLATE,
+            "ticket_id": None,
+            "updated_at": None,
+        }
+        sp = self._source_path(project_id)
+        if not sp.exists():
+            return empty
+        try:
+            raw = sp.read_text(encoding="utf-8").strip()
+        except OSError:
+            return empty
+        if not raw:
+            return empty
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict) and data.get("source"):
+                return {
+                    "source": str(data["source"]),
+                    "ticket_id": data.get("ticket_id"),
+                    "updated_at": data.get("updated_at"),
+                }
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+        # Legacy bare-string sidecar: the whole file IS the source value.
+        return {"source": raw, "ticket_id": None, "updated_at": None}
+
+    def get_provenance(self, project_id: int) -> Dict[str, Optional[str]]:
+        """Return who last wrote a project's description, and when.
 
         Parameters
         ----------
@@ -385,20 +423,30 @@ class ProjectDescriptionManager:
 
         Returns
         -------
-        str
-            The provenance marker.
+        Dict[str, Optional[str]]
+            ``{"source": str, "ticket_id": Optional[str], "updated_at":
+            Optional[str]}``. ``source`` is one of :data:`SOURCE_ABSENT`
+            (no description yet), :data:`SOURCE_TEMPLATE` (blank seed),
+            :data:`SOURCE_INFERRED` (Marcus), :data:`SOURCE_AGENT` (a
+            coding agent), or :data:`SOURCE_HUMAN`. ``ticket_id`` is the
+            ticket whose work produced an agent/inferred update, if
+            known. ``updated_at`` is an ISO-8601 UTC timestamp, if known.
+            A description file with no provenance sidecar (written
+            before this feature existed) is assumed to be a
+            ``template`` — automated inference only ever replaces a
+            description with NO parseable stack, so a genuinely
+            human-authored legacy description with a real stack is
+            never at risk.
         """
         if not self._path(project_id).exists():
-            return SOURCE_ABSENT
-        sp = self._source_path(project_id)
-        if sp.exists():
-            try:
-                val = sp.read_text(encoding="utf-8").strip()
-                if val:
-                    return val
-            except OSError:
-                pass
-        return SOURCE_TEMPLATE
+            return {"source": SOURCE_ABSENT, "ticket_id": None, "updated_at": None}
+        return self._read_sidecar(project_id)
+
+    def get_source(self, project_id: int) -> str:
+        """Return just the provenance marker — see :meth:`get_provenance`."""
+        source = self.get_provenance(project_id)["source"]
+        assert source is not None  # get_provenance always sets a source
+        return source
 
     def can_auto_update(self, project_id: int) -> bool:
         """Return ``True`` unless a human has edited this description.
@@ -432,7 +480,11 @@ class ProjectDescriptionManager:
             return None
 
     def update_description(
-        self, project_id: int, text: str, source: str = SOURCE_HUMAN
+        self,
+        project_id: int,
+        text: str,
+        source: str = SOURCE_HUMAN,
+        ticket_id: Optional[str] = None,
     ) -> None:
         """Overwrite the description for a project and stamp its provenance.
 
@@ -449,15 +501,30 @@ class ProjectDescriptionManager:
             automated overwrites. Automated callers pass
             :data:`SOURCE_INFERRED` / :data:`SOURCE_AGENT` /
             :data:`SOURCE_TEMPLATE`.
+        ticket_id : Optional[str]
+            The ticket whose work produced this update, for
+            :data:`SOURCE_AGENT` / :data:`SOURCE_INFERRED` writes. Recorded
+            alongside the write timestamp so a reader of the description can
+            see e.g. "last updated by AI working ticket 42". ``None`` for
+            writes with no associated ticket (human edits, template seeds,
+            project clones).
         """
         p = self._path(project_id)
         try:
             p.write_text(text, encoding="utf-8")
-            self._source_path(project_id).write_text(source, encoding="utf-8")
+            sidecar = {
+                "source": source,
+                "ticket_id": ticket_id,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._source_path(project_id).write_text(
+                json.dumps(sidecar), encoding="utf-8"
+            )
             logger.info(
-                "Updated project description for project %d (source=%s)",
+                "Updated project description for project %d (source=%s%s)",
                 project_id,
                 source,
+                f", ticket={ticket_id}" if ticket_id else "",
             )
         except OSError as exc:
             logger.error("Could not write project description %s: %s", p, exc)
@@ -501,6 +568,54 @@ class ProjectDescriptionManager:
         if text is None:
             return None
         return parse_stack_from_text(text)
+
+
+def _format_timestamp(iso_str: str) -> str:
+    """Render an ISO-8601 timestamp as ``YYYY-MM-DD HH:MM UTC``.
+
+    Falls back to the raw string unchanged if it cannot be parsed.
+    """
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        return dt.strftime("%Y-%m-%d %H:%M UTC")
+    except (ValueError, TypeError):
+        return iso_str
+
+
+def format_provenance_badge(info: Dict[str, Optional[str]]) -> Optional[str]:
+    """Render a human-readable "last updated by ..." badge for a reader.
+
+    Parameters
+    ----------
+    info : Dict[str, Optional[str]]
+        The dict returned by :meth:`ProjectDescriptionManager.get_provenance`.
+
+    Returns
+    -------
+    Optional[str]
+        Badge text, or ``None`` when there is nothing worth showing (no
+        description has ever been written for this project).
+    """
+    source = info.get("source")
+    ticket_id = info.get("ticket_id")
+    updated_at = info.get("updated_at")
+    when = f" at {_format_timestamp(updated_at)}" if updated_at else ""
+
+    if source == SOURCE_AGENT:
+        who = f"AI working ticket {ticket_id}" if ticket_id else "an AI agent"
+        return f"Last updated by {who}{when}"
+    if source == SOURCE_INFERRED:
+        who = (
+            f"Marcus, auto-inferred from ticket {ticket_id}"
+            if ticket_id
+            else "Marcus (auto-inferred)"
+        )
+        return f"Last updated by {who}{when}"
+    if source == SOURCE_HUMAN:
+        return f"Last updated by a human{when}"
+    if source == SOURCE_TEMPLATE:
+        return "Blank template — not yet filled in"
+    return None  # SOURCE_ABSENT, or an unrecognized value
 
 
 # ---------------------------------------------------------------------------
