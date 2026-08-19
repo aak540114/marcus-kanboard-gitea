@@ -630,7 +630,10 @@ class TaskEnricher:
         suggestions = []
 
         # Get typical dependencies for task type
-        self.task_patterns.get(task_type, {}).get("typical_dependencies", [])
+        typical_dependencies = self.task_patterns.get(task_type, {}).get(
+            "typical_dependencies", []
+        )
+        suggestions.extend(typical_dependencies)
 
         # Add logical dependencies based on common patterns
         task_text = f"{task.name} {task.description or ''}".lower()

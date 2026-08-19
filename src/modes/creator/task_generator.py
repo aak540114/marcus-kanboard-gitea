@@ -46,7 +46,9 @@ class TaskGenerator:
         """
         # Extract customizations
         project_size = customizations.get("size", ProjectSize.MEDIUM)
-        excluded_phases: List[str] = customizations.get("excluded_phases", [])
+        excluded_phases: List[str] = [
+            p.lower() for p in customizations.get("excluded_phases", [])
+        ]
         additional_labels: List[str] = customizations.get("labels", [])
         project_name = customizations.get("project_name", template.name)
         start_date = customizations.get("start_date", datetime.now(timezone.utc))

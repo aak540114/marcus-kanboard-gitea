@@ -486,7 +486,7 @@ class EnricherMode:
         if not total:
             return "unknown"
 
-        in_progress_ratio = status_counts.get("IN_PROGRESS", 0) / total
+        in_progress_ratio = status_counts.get("in_progress", 0) / total
 
         if in_progress_ratio > 0.5:
             return "parallel"
