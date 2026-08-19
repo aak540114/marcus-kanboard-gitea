@@ -391,6 +391,8 @@ async def get_task_count(server: Any, project_id: str) -> int:
     int
         Number of tasks in the project
     """
+    current_id = None
+    switched = False
     try:
         # Switch to project to get its task count
         current_project = await server.project_registry.get_active_project()
@@ -398,20 +400,22 @@ async def get_task_count(server: Any, project_id: str) -> int:
 
         # Temporarily switch to target project
         await server.project_manager.switch_project(project_id)
+        switched = True
         kanban_client = await server.project_manager.get_kanban_client()
 
         # Get task count
         tasks = await kanban_client.get_available_tasks()
-        task_count = len(tasks) if tasks else 0
-
-        # Switch back to original project
-        if current_id:
-            await server.project_manager.switch_project(current_id)
-
-        return task_count
+        return len(tasks) if tasks else 0
     except Exception as e:
         logger.warning(f"Failed to get task count for project {project_id}: {e}")
         return 0
+    finally:
+        # Always switch back to the original project, even if getting
+        # the task count raised after the switch above — otherwise an
+        # exception here (e.g. a transient kanban error) permanently
+        # leaves the server's active project pointed at project_id.
+        if switched and current_id:
+            await server.project_manager.switch_project(current_id)
 
 
 def calculate_similarity(query: str, target: str) -> float:
