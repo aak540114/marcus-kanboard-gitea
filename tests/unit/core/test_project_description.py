@@ -466,6 +466,32 @@ class TestGetProvenance:
         info = mgr.get_provenance(7)
         assert info["ticket_id"] == "2"
 
+    def test_truncated_utf8_sidecar_does_not_raise(self, tmp_path):
+        """
+        Regression test: a sidecar truncated mid multi-byte UTF-8
+        character (e.g. a crash between update_description's two
+        separate writes, landing inside a non-ASCII ticket_id) raised
+        UnicodeDecodeError, which is NOT an OSError and was not caught.
+        get_provenance/get_source/can_auto_update must degrade to the
+        template default instead of propagating the exception — one
+        caller is the /project-description page route, which has no
+        exception handling of its own and would 500 on this, blocking
+        the exact page a human needs to fix a corrupted sidecar.
+        """
+        mgr = self._mgr(tmp_path)
+        (tmp_path / "10.md").write_text("# doc\n", encoding="utf-8")
+        with open(tmp_path / "10.source", "wb") as f:
+            # A JSON prefix truncated mid-way through a multi-byte
+            # UTF-8 character (0xC3 alone is an incomplete 2-byte
+            # sequence) — invalid UTF-8, distinct from invalid JSON.
+            f.write(b'{"source": "agent", "ticket_id": "caf\xc3')
+
+        info = mgr.get_provenance(10)
+
+        assert info == {"source": SOURCE_TEMPLATE, "ticket_id": None, "updated_at": None}
+        assert mgr.get_source(10) == SOURCE_TEMPLATE
+        assert mgr.can_auto_update(10) is True
+
 
 # ---------------------------------------------------------------------------
 # format_provenance_badge

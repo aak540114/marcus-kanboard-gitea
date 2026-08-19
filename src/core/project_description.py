@@ -396,7 +396,20 @@ class ProjectDescriptionManager:
             return empty
         try:
             raw = sp.read_text(encoding="utf-8").strip()
-        except OSError:
+        except (OSError, UnicodeDecodeError):
+            # UnicodeDecodeError is not an OSError — reachable if the
+            # sidecar was truncated mid-write (e.g. a crash between the
+            # two separate, non-atomic writes in update_description)
+            # exactly inside a multi-byte UTF-8 sequence. Before this
+            # sidecar held JSON with caller-supplied ticket_id content,
+            # the file was always one of a handful of hardcoded ASCII
+            # SOURCE_* constants, so a torn write could never land
+            # mid-character — this is a new failure mode for the
+            # richer format. Callers of get_provenance/get_source
+            # include the /project-description page route, which has
+            # no exception handling of its own, so leaving this
+            # uncaught would 500 the exact page a human needs to open
+            # to fix a corrupted sidecar.
             return empty
         if not raw:
             return empty
