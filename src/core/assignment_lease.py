@@ -1250,11 +1250,15 @@ class AssignmentLeaseManager:
             # survives a service restart during the extension window
             # (Codex P1 on PR #350).
             assignment["merge_conflict_extensions"] = lease.merge_conflict_extensions
-            await self.assignment_persistence.save_assignment(
-                lease.agent_id,
-                lease.task_id,
-                assignment.get("assigned_at", datetime.now(timezone.utc).isoformat()),
-            )
+            # ``get_assignment`` returns the same dict object stored in
+            # the persistence cache, so the mutations above already
+            # updated it in place. Use ``flush`` (not ``save_assignment``)
+            # to write that mutated dict to disk as-is — save_assignment
+            # would replace it with a bare {task_id, assigned_at,
+            # task_data} shape, silently discarding lease_expires,
+            # renewal_count, progress_percentage, and every other field
+            # just set above.
+            await self.assignment_persistence.flush()
 
     async def load_active_leases(self) -> None:
         """Load active leases from persistence on startup."""

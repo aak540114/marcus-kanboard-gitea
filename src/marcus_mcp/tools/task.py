@@ -4740,6 +4740,7 @@ async def report_task_progress(
                     None,
                 )
                 if task_obj is not None and task_obj.status in {
+                    TaskStatus.DONE,
                     "done",
                     "completed",
                 }:

@@ -51,6 +51,21 @@ class AssignmentPersistence:
         """Get lock for the current event loop."""
         return self._lock_manager.get_lock()
 
+    async def flush(self) -> None:
+        """
+        Persist the current in-memory assignment cache to disk as-is.
+
+        Unlike :meth:`save_assignment`, this does not replace or
+        reshape any cache entry — it writes whatever is currently in
+        ``_assignments_cache``. Used by callers (e.g. the lease
+        manager) that mutate a dict returned by :meth:`get_assignment`
+        in place and then need those mutations durably written,
+        without ``save_assignment``'s narrower ``{task_id,
+        assigned_at, task_data}`` shape overwriting the extra fields.
+        """
+        async with self.lock:
+            await self._write_assignments()
+
     async def save_assignment(
         self, worker_id: str, task_id: str, task_data: Dict[str, Any]
     ) -> None:

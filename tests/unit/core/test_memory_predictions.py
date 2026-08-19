@@ -187,6 +187,83 @@ class TestMemoryPredictions:
         # Check affected task details
         affected_ids = [t["task_id"] for t in result["affected_tasks"]]
         assert "task-2" in affected_ids
+
+    @pytest.mark.asyncio
+    async def test_predict_cascade_effects_diamond_dependency_not_double_counted(
+        self, memory
+    ):
+        """
+        Regression test: a diamond-shaped dependency graph must not
+        double-count the shared descendant.
+
+        task-2 and task-3 both depend on task-1; task-4 depends on
+        both task-2 and task-3. The cascade walk from task-1 reaches
+        task-4 via two paths (through task-2 and through task-3), but
+        task-4 must appear exactly once in affected_tasks and
+        contribute its delay exactly once to total_delay.
+        """
+        tasks = [
+            Task(
+                id="task-1",
+                name="Design Schema",
+                description="",
+                status=TaskStatus.TODO,
+                priority=Priority.HIGH,
+                assigned_to=None,
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+                due_date=None,
+                estimated_hours=8.0,
+                dependencies=[],
+            ),
+            Task(
+                id="task-2",
+                name="Backend",
+                description="",
+                status=TaskStatus.TODO,
+                priority=Priority.MEDIUM,
+                assigned_to=None,
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+                due_date=None,
+                estimated_hours=8.0,
+                dependencies=["task-1"],
+            ),
+            Task(
+                id="task-3",
+                name="Frontend",
+                description="",
+                status=TaskStatus.TODO,
+                priority=Priority.MEDIUM,
+                assigned_to=None,
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+                due_date=None,
+                estimated_hours=8.0,
+                dependencies=["task-1"],
+            ),
+            Task(
+                id="task-4",
+                name="Integration Tests",
+                description="",
+                status=TaskStatus.TODO,
+                priority=Priority.MEDIUM,
+                assigned_to=None,
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+                due_date=None,
+                estimated_hours=6.0,
+                dependencies=["task-2", "task-3"],
+            ),
+        ]
+
+        memory.update_project_tasks(tasks)
+
+        result = await memory.predict_cascade_effects("task-1", 4.0)
+
+        affected_ids = [t["task_id"] for t in result["affected_tasks"]]
+        assert affected_ids.count("task-4") == 1
+        assert len(result["affected_tasks"]) == 3
         assert "task-3" in affected_ids
 
     @pytest.mark.asyncio

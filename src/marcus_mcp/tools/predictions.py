@@ -6,7 +6,7 @@ task outcomes, blockage probability, and cascade effects analysis.
 """
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from mcp.types import Tool
 
@@ -326,16 +326,21 @@ async def predict_cascade_effects(
     # Find all dependent tasks
     all_tasks = await project_context.kanban_provider.get_tasks()
 
-    def find_dependents(task_id: str, tasks: List[Task]) -> List[Task]:
+    def find_dependents(
+        task_id: str, tasks: List[Task], visited: Set[str]
+    ) -> List[Task]:
         dependents = []
         for t in tasks:
+            if t.id in visited:
+                continue
             if task_id in (t.dependencies or []):
+                visited.add(t.id)
                 dependents.append(t)
                 # Recursively find transitive dependents
-                dependents.extend(find_dependents(t.id, tasks))
+                dependents.extend(find_dependents(t.id, tasks, visited))
         return dependents
 
-    affected = find_dependents(task_id, all_tasks)
+    affected = find_dependents(task_id, all_tasks, set())
 
     # Calculate impact
     total_delay = delay_days * len(affected)

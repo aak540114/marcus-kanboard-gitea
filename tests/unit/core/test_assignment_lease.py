@@ -131,6 +131,7 @@ class TestAssignmentLeaseManager:
             }
         )
         persistence.save_assignment = AsyncMock()
+        persistence.flush = AsyncMock()
         persistence.remove_assignment = AsyncMock()
         persistence.load_assignments = AsyncMock(return_value={})
         return persistence
@@ -636,7 +637,7 @@ class TestUpdateTimestampPersistence:
             "assigned_at": now.isoformat(),
         }
         mock_persistence.get_assignment = AsyncMock(return_value=existing_assignment)
-        mock_persistence.save_assignment = AsyncMock()
+        mock_persistence.flush = AsyncMock()
 
         lease_manager = AssignmentLeaseManager(
             kanban_client=Mock(),
@@ -659,6 +660,76 @@ class TestUpdateTimestampPersistence:
 
         assert "update_timestamps" in existing_assignment
         assert len(existing_assignment["update_timestamps"]) == 2
+        mock_persistence.flush.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_persist_lease_round_trips_through_real_persistence(
+        self, tmp_path
+    ):
+        """
+        Regression test: _persist_lease must not lose data on a real
+        save -> disk -> load round trip.
+
+        Reproduces a bug where _persist_lease called
+        ``assignment_persistence.save_assignment(agent_id, task_id,
+        assignment["assigned_at"])`` — passing a bare ISO date string
+        as the ``task_data`` dict argument. ``save_assignment``
+        unconditionally overwrites the cache entry with
+        ``{"task_id", "assigned_at": now(), "task_data": <string>}``,
+        silently discarding lease_expires/renewal_count/
+        progress_percentage/update_timestamps/merge_conflict_extensions
+        that were just set on the mutated dict, and resetting
+        assigned_at. Uses the real AssignmentPersistence class (not a
+        mock) so a regression here is caught by an actual round trip,
+        not by a spec'd Mock that accepts any argument type.
+        """
+        from src.core.assignment_persistence import AssignmentPersistence
+
+        persistence = AssignmentPersistence(storage_dir=tmp_path)
+        original_assigned_at = datetime.now(timezone.utc) - timedelta(hours=1)
+        await persistence.save_assignment(
+            "agent-001",
+            "task-789",
+            {"name": "Build API", "priority": "high"},
+        )
+        # save_assignment always stamps assigned_at = now(); override it
+        # to a distinguishable value so we can prove it survives _persist_lease.
+        cached = await persistence.get_assignment("agent-001")
+        cached["assigned_at"] = original_assigned_at.isoformat()
+
+        lease_manager = AssignmentLeaseManager(
+            kanban_client=Mock(),
+            assignment_persistence=persistence,
+        )
+
+        now = datetime.now(timezone.utc)
+        lease = AssignmentLease(
+            task_id="task-789",
+            agent_id="agent-001",
+            assigned_at=original_assigned_at,
+            lease_expires=now + timedelta(minutes=5),
+            last_renewed=now,
+            renewal_count=3,
+            progress_percentage=42,
+            update_timestamps=[now],
+            merge_conflict_extensions=1,
+        )
+
+        await lease_manager._persist_lease(lease)
+
+        # Reload from disk into a fresh instance to prove it was
+        # actually written, not just mutated in memory.
+        reloaded = AssignmentPersistence(storage_dir=tmp_path)
+        assignments = await reloaded.load_assignments()
+        persisted = assignments["agent-001"]
+
+        assert persisted["assigned_at"] == original_assigned_at.isoformat()
+        assert persisted["task_data"] == {"name": "Build API", "priority": "high"}
+        assert persisted["lease_expires"] == lease.lease_expires.isoformat()
+        assert persisted["renewal_count"] == 3
+        assert persisted["progress_percentage"] == 42
+        assert persisted["merge_conflict_extensions"] == 1
+        assert len(persisted["update_timestamps"]) == 1
 
 
 class TestRecoveryInfo:
@@ -764,6 +835,7 @@ class TestRecoveryHandoffDualWrite:
         persistence = Mock()
         persistence.get_assignment = AsyncMock(return_value=None)
         persistence.save_assignment = AsyncMock()
+        persistence.flush = AsyncMock()
         persistence.remove_assignment = AsyncMock()
         persistence.load_assignments = AsyncMock(return_value={})
         return persistence
@@ -1039,6 +1111,7 @@ class TestExpiredLeaseProgressCapture:
         persistence = Mock()
         persistence.get_assignment = AsyncMock(return_value=None)
         persistence.save_assignment = AsyncMock()
+        persistence.flush = AsyncMock()
         persistence.remove_assignment = AsyncMock()
         persistence.load_assignments = AsyncMock(return_value={})
         return persistence
@@ -1237,6 +1310,7 @@ class TestMergeConflictExtension:
     def mock_persistence(self):
         persistence = Mock()
         persistence.save_assignment = AsyncMock()
+        persistence.flush = AsyncMock()
         persistence.remove_assignment = AsyncMock()
         persistence.load_assignments = AsyncMock(return_value={})
         # Default to returning an assignment dict so _persist_lease's
@@ -1536,8 +1610,8 @@ class TestMergeConflictExtension:
         ):
             await lease_manager.check_expired_leases()
 
-        # _persist_lease writes via assignment_persistence.save_assignment
-        mock_persistence.save_assignment.assert_called()
+        # _persist_lease writes via assignment_persistence.flush
+        mock_persistence.flush.assert_called()
         # The persisted assignment dict must include the new field
         # so a restart can rehydrate the cap counter.
         # Check the dict that get_assignment returned was mutated:
@@ -1886,6 +1960,7 @@ class TestExtendForValidation:
             }
         )
         persistence.save_assignment = AsyncMock()
+        persistence.flush = AsyncMock()
         persistence.remove_assignment = AsyncMock()
         persistence.load_assignments = AsyncMock(return_value={})
         return persistence

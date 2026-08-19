@@ -789,20 +789,21 @@ class Memory:
                     task.id if hasattr(task, "id") else task.get("id")
                 )
 
-        # Calculate cascade effect using BFS
-        visited = set()
+        # Calculate cascade effect using BFS. ``visited`` is marked at
+        # enqueue time (not pop time) so a diamond-shaped dependency
+        # graph — e.g. both B and C depend on the delayed task, and D
+        # depends on both B and C — can't enqueue/count D twice before
+        # its first occurrence is popped.
+        visited = {task_id}
         to_process = [(task_id, delay_hours)]
 
         while to_process:
             current_id, current_delay = to_process.pop(0)
-            if current_id in visited:
-                continue
-
-            visited.add(current_id)
 
             # Find tasks depending on current task
             for dependent_id in dependency_map.get(current_id, []):
                 if dependent_id not in visited and dependent_id in task_map:
+                    visited.add(dependent_id)
                     dependent_task = task_map[dependent_id]
 
                     # Estimate propagated delay (may be less than full delay)
