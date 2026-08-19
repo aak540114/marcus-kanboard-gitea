@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from src.integrations.gitea_manager import (
     GiteaManager,
     _auth_clone_url,
+    _run_git,
     _slugify,
     public_authenticated_clone_url,
     public_branch_web_url,
@@ -445,7 +446,7 @@ class TestInitWithReadme:
 
         run_calls = []
 
-        async def fake_run_git(args, cwd):
+        async def fake_run_git(args, cwd, timeout=None):
             run_calls.append(args)
 
         local_path = str(tmp_path / "my-app")
@@ -483,7 +484,7 @@ class TestInitWithReadme:
 
         run_calls = []
 
-        async def fake_run_git(args, cwd):
+        async def fake_run_git(args, cwd, timeout=None):
             run_calls.append(args)
             if args[:4] == ["git", "diff", "--cached", "--quiet"]:
                 # Non-zero exit = staged changes exist.
@@ -516,7 +517,7 @@ class TestInitWithReadme:
 
         run_calls = []
 
-        async def fake_run_git(args, cwd):
+        async def fake_run_git(args, cwd, timeout=None):
             run_calls.append(args)
             # Clean staged tree (diff --cached exits 0 → no exception),
             # committed by the earlier attempt.
@@ -555,7 +556,7 @@ class TestMirrorClone:
 
         run_calls = []
 
-        async def fake_run_git(args, cwd):
+        async def fake_run_git(args, cwd, timeout=None):
             run_calls.append((tuple(args), cwd))
 
         local_path = str(tmp_path / "cloned-app")
@@ -614,7 +615,7 @@ class TestMirrorClone:
         mgr._username = "root"
         run_calls = []
 
-        async def fake_run_git(args, cwd):
+        async def fake_run_git(args, cwd, timeout=None):
             run_calls.append(tuple(args))
 
         local_path = str(tmp_path / "cloned-app")
@@ -635,7 +636,7 @@ class TestMirrorClone:
         mgr = GiteaManager("http://localhost:3000", "tok")
         mgr._username = "root"
 
-        async def fake_run_git(args, cwd):
+        async def fake_run_git(args, cwd, timeout=None):
             if args[:3] == ["git", "clone", "--mirror"]:
                 raise RuntimeError("fatal: repository not found")
 
@@ -655,7 +656,7 @@ class TestMirrorClone:
         mgr = GiteaManager("http://localhost:3000", "tok")
         mgr._username = "root"
 
-        async def fake_run_git(args, cwd):
+        async def fake_run_git(args, cwd, timeout=None):
             if args[:3] == ["git", "push", "--mirror"]:
                 raise RuntimeError("fatal: repository not found")
 
@@ -697,7 +698,7 @@ class TestMirrorClone:
 
         run_calls = []
 
-        async def fake_run_git(args, cwd):
+        async def fake_run_git(args, cwd, timeout=None):
             run_calls.append((tuple(args), cwd))
 
         local_path = "./data/repos/testtttttt"
@@ -724,3 +725,29 @@ class TestMirrorClone:
         # i.e. the real local_path, not the doubled one.
         config_cwds = {c for (a, c) in run_calls if a[:2] == ("git", "config")}
         assert config_cwds == {local_path}
+
+
+class TestRunGitTimeout:
+    """
+    Regression coverage: _run_git previously awaited proc.communicate()
+    with no bound, so a stalled/unreachable git remote (network
+    partition, container restart mid-transfer) would hang the calling
+    coroutine forever. These tests exercise the real subprocess/timeout
+    machinery (not a mock) to prove a slow command is killed and raises
+    rather than hanging.
+    """
+
+    @pytest.mark.asyncio
+    async def test_raises_runtime_error_on_timeout_instead_of_hanging(self):
+        with pytest.raises(RuntimeError, match="timed out"):
+            await _run_git(["sleep", "5"], cwd=".", timeout=0.1)
+
+    @pytest.mark.asyncio
+    async def test_succeeds_within_timeout(self, tmp_path):
+        # A trivially fast command must not be affected by the timeout.
+        await _run_git(["true"], cwd=str(tmp_path), timeout=5.0)
+
+    @pytest.mark.asyncio
+    async def test_still_raises_on_nonzero_exit_not_timeout(self, tmp_path):
+        with pytest.raises(RuntimeError, match="git command failed"):
+            await _run_git(["false"], cwd=str(tmp_path), timeout=5.0)

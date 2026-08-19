@@ -38,6 +38,14 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# Bounds every _run_git call so a stalled/unreachable Gitea remote
+# (container restart, network partition, firewall drop instead of a
+# clean refusal) can't hang the calling coroutine indefinitely during
+# repo provisioning. push/mirror operations get the larger allowance
+# since they transfer real repository content.
+GIT_TIMEOUT_SECONDS = 30.0
+GIT_TRANSFER_TIMEOUT_SECONDS = 120.0
+
 
 class GiteaManager:
     """Create and configure Gitea repositories for new Kanboard projects.
@@ -356,7 +364,9 @@ class GiteaManager:
             )
 
         await _run_git(
-            ["git", "push", "-u", "origin", "main"], cwd=local_path
+            ["git", "push", "-u", "origin", "main"],
+            cwd=local_path,
+            timeout=GIT_TRANSFER_TIMEOUT_SECONDS,
         )
         logger.info("Pushed initial commit to %s", clone_url)
 
@@ -407,8 +417,13 @@ class GiteaManager:
             await _run_git(
                 ["git", "clone", "--mirror", auth_source, mirror_dir],
                 cwd=scratch_dir,
+                timeout=GIT_TRANSFER_TIMEOUT_SECONDS,
             )
-            await _run_git(["git", "push", "--mirror", auth_dest], cwd=mirror_dir)
+            await _run_git(
+                ["git", "push", "--mirror", auth_dest],
+                cwd=mirror_dir,
+                timeout=GIT_TRANSFER_TIMEOUT_SECONDS,
+            )
 
         # This command's cwd is already local_path's PARENT (see above), so
         # git must be given just the basename as the destination argument
@@ -425,6 +440,7 @@ class GiteaManager:
         await _run_git(
             ["git", "clone", auth_dest, os.path.basename(local_path)],
             cwd=parent_dir,
+            timeout=GIT_TRANSFER_TIMEOUT_SECONDS,
         )
         await _run_git(["git", "config", "user.email", "marcus@localhost"], cwd=local_path)
         await _run_git(["git", "config", "user.name", "Marcus"], cwd=local_path)
@@ -595,7 +611,9 @@ def public_authenticated_clone_url(
     return _auth_clone_url(rehosted, username, token)
 
 
-async def _run_git(args: List[str], cwd: str) -> None:
+async def _run_git(
+    args: List[str], cwd: str, timeout: float = GIT_TIMEOUT_SECONDS
+) -> None:
     """Run a git command asynchronously, raising RuntimeError on non-zero exit.
 
     Parameters
@@ -604,22 +622,39 @@ async def _run_git(args: List[str], cwd: str) -> None:
         Command and arguments (e.g. ``["git", "init"]``).
     cwd : str
         Working directory.
+    timeout : float
+        Seconds to wait before killing a stalled process and raising
+        RuntimeError. Defaults to GIT_TIMEOUT_SECONDS; transfer
+        operations (push/clone/mirror) should pass
+        GIT_TRANSFER_TIMEOUT_SECONDS.
 
     Raises
     ------
     RuntimeError
-        If the command exits with a non-zero code.
+        If the command exits with a non-zero code, or times out.
     """
+    safe_args = [re.sub(r"://[^:@/]+:[^@]*@", "://***:***@", a) for a in args]
     proc = await asyncio.create_subprocess_exec(
         *args,
         cwd=cwd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout_bytes, stderr_bytes = await proc.communicate()
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout
+        )
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+            await proc.wait()
+        except ProcessLookupError:
+            pass
+        raise RuntimeError(
+            f"git command timed out after {timeout}s: {' '.join(safe_args)}"
+        )
     if proc.returncode != 0:
         # Redact any embedded credentials (http://user:TOKEN@host) before logging.
-        safe_args = [re.sub(r"://[^:@/]+:[^@]*@", "://***:***@", a) for a in args]
         raise RuntimeError(
             f"git command failed: {' '.join(safe_args)}\n"
             f"stdout: {stdout_bytes.decode()}\nstderr: {stderr_bytes.decode()}"
