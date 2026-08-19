@@ -470,14 +470,21 @@ Focus on logical dependencies based on:
             for result in results:
                 if result["dependency_direction"] != "none":
                     if result["dependency_direction"] == "1->2":
-                        # task1 depends on task2
-                        dep_id = result["task2_id"]
-                        dependent_id = result["task1_id"]
+                        # "1->2": task1 precedes task2, so task2 depends
+                        # on task1 (matches the "2->1"/else arm below,
+                        # which is pinned by test_hybrid_mode_low_
+                        # confidence_triggers_ai and
+                        # test_combined_confidence_boost against real
+                        # dependency direction — the two arms must be
+                        # opposites of each other for the direction
+                        # field to mean anything).
+                        dependent_id = result["task2_id"]
+                        dep_id = result["task1_id"]
                     else:  # 2->1
-                        # "2->1" means task "2" depends on task "1"
-                        # task1_id="2", task2_id="1", so task1_id depends on task2_id
-                        dependent_id = result["task1_id"]  # "2" - the one that depends
-                        dep_id = result["task2_id"]  # "1" - the dependency
+                        # "2->1": task2 precedes task1, so task1 depends
+                        # on task2.
+                        dependent_id = result["task1_id"]
+                        dep_id = result["task2_id"]
 
                     key = (dependent_id, dep_id)
                     ai_dependencies[key] = HybridDependency(
