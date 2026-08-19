@@ -641,6 +641,77 @@ class TestKanbanClientWithCreate:
     @pytest.mark.asyncio
     @patch("src.integrations.kanban_client_with_create.stdio_client")
     @patch("src.integrations.kanban_client_with_create.ClientSession")
+    @patch("src.integrations.kanban_client_with_create.LabelManagerHelper")
+    async def test_create_task_with_on_hold_status_targets_on_hold_list(
+        self,
+        mock_label_helper_class,
+        mock_session_class,
+        mock_stdio,
+        client,
+        sample_task_data,
+        mock_stdio_client,
+        mock_session_context,
+        mock_client_session,
+    ):
+        """
+        Regression test: status="on hold" must target the "On Hold"
+        list when the board has both an "On Hold" and a "Blocked" list.
+
+        Previously status="on hold" was mapped to the single keyword
+        "blocked", so it never matched an "On Hold" list name and fell
+        through to the backlog fallback instead.
+        """
+        mock_stdio.return_value = mock_stdio_client()
+        mock_session_class.return_value = mock_session_context()
+
+        mock_label_helper = AsyncMock()
+        mock_label_helper.add_labels_to_card = AsyncMock(return_value=[])
+        mock_label_helper_class.return_value = mock_label_helper
+
+        list_response = Mock()
+        list_response.content = [
+            Mock(
+                text=json.dumps(
+                    [
+                        {"id": "list-backlog", "name": "Backlog"},
+                        {"id": "list-on-hold", "name": "On Hold"},
+                        {"id": "list-blocked", "name": "Blocked"},
+                    ]
+                )
+            )
+        ]
+
+        card_response = Mock()
+        card_response.content = [
+            Mock(
+                text=json.dumps(
+                    {
+                        "id": "card-123",
+                        "name": sample_task_data["name"],
+                        "listId": "list-on-hold",
+                    }
+                )
+            )
+        ]
+
+        async def mock_call_tool(tool_name, params):
+            if tool_name == "mcp_kanban_list_manager":
+                return list_response
+            elif tool_name == "mcp_kanban_card_manager":
+                assert params["listId"] == "list-on-hold"
+                return card_response
+            return Mock(content=[Mock(text=json.dumps({"id": "default"}))])
+
+        mock_client_session.call_tool = mock_call_tool
+
+        task_data = {**sample_task_data, "status": "on hold"}
+        task = await client.create_task(task_data)
+
+        assert task.id == "card-123"
+
+    @pytest.mark.asyncio
+    @patch("src.integrations.kanban_client_with_create.stdio_client")
+    @patch("src.integrations.kanban_client_with_create.ClientSession")
     async def test_create_task_with_acceptance_criteria_only(
         self,
         mock_session_class,

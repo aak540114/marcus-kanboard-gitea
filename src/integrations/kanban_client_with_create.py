@@ -176,31 +176,41 @@ class KanbanClientWithCreate(KanbanClient):
 
                     # Determine target list based on status field
                     status = task_data.get("status")
-                    target_list_name = "backlog"  # Default
+                    target_list_names = ["backlog"]  # Default
 
-                    # Map status to list name
+                    # Map status to list name(s), tried in order. "on
+                    # hold"/"blocked" both map here since boards
+                    # commonly use either name (see the equivalent
+                    # mapping in kanban_client.py's
+                    # update_task_status: "Try 'on hold' first, then
+                    # 'blocked'").
                     if isinstance(status, str):
                         status_lower = status.lower()
                         if status_lower in ["done", "completed"]:
-                            target_list_name = "done"
+                            target_list_names = ["done"]
                         elif status_lower in ["in_progress", "in progress", "active"]:
-                            target_list_name = "in progress"
+                            target_list_names = ["in progress"]
                         elif status_lower in ["blocked", "on hold"]:
-                            target_list_name = "blocked"
+                            target_list_names = ["on hold", "blocked"]
                         # else: remains "backlog" for "todo" or any other value
 
                     # DEBUG: Log status mapping for About tasks
                     if "About" in task_data.get("name", ""):
                         logger.info(
                             f"[DEBUG] create_task for '{task_data.get('name')}': "
-                            f"status={status}, target_list_name={target_list_name}"
+                            f"status={status}, target_list_names={target_list_names}"
                         )
 
-                    # Find the target list by name
-                    for lst in lists:
-                        list_name_lower = lst.get("name", "").lower()
-                        if target_list_name in list_name_lower:
-                            target_list = lst
+                    # Find the target list by name, trying each
+                    # candidate keyword in priority order across all
+                    # lists before falling back to the next keyword.
+                    for target_list_name in target_list_names:
+                        for lst in lists:
+                            list_name_lower = lst.get("name", "").lower()
+                            if target_list_name in list_name_lower:
+                                target_list = lst
+                                break
+                        if target_list:
                             break
 
                     # Fallback: If target list not found, look for backlog/todo
