@@ -22,6 +22,7 @@ ProjectDescriptionManager
     Reads, writes, and parses project description documents.
 """
 
+import difflib
 import json
 import logging
 import os
@@ -29,7 +30,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Awaitable, Callable, Dict, List, Optional
+from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
 #: Provenance values stamped alongside a description (see
 #: ProjectDescriptionManager.get_source). Only ``"human"`` locks a
@@ -39,6 +40,10 @@ SOURCE_TEMPLATE = "template"
 SOURCE_INFERRED = "inferred"
 SOURCE_AGENT = "agent"
 SOURCE_HUMAN = "human"
+
+#: Maximum number of past updates kept in a project's ``.history.json``
+#: sidecar (see :meth:`ProjectDescriptionManager.get_history`).
+MAX_HISTORY_ENTRIES = 20
 
 logger = logging.getLogger(__name__)
 
@@ -368,6 +373,9 @@ class ProjectDescriptionManager:
     def _source_path(self, project_id: int) -> Path:
         return self._dir / f"{project_id}.source"
 
+    def _history_path(self, project_id: int) -> Path:
+        return self._dir / f"{project_id}.history.json"
+
     def _read_sidecar(self, project_id: int) -> Dict[str, Optional[str]]:
         """Parse the ``.source`` sidecar file into structured provenance.
 
@@ -461,6 +469,93 @@ class ProjectDescriptionManager:
         assert source is not None  # get_provenance always sets a source
         return source
 
+    def _read_history(self, project_id: int) -> List[Dict[str, Optional[str]]]:
+        """Load this project's raw history list (oldest first), or ``[]``.
+
+        Degrades to an empty list on any missing/corrupt file — history
+        is a nice-to-have audit trail, not load-bearing.
+        """
+        hp = self._history_path(project_id)
+        if not hp.exists():
+            return []
+        try:
+            raw = hp.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            # Same failure mode as the .source sidecar (see _read_sidecar) —
+            # a write truncated mid multi-byte character. History is a
+            # nice-to-have audit trail, not load-bearing, so degrade to
+            # "no history" rather than raise.
+            return []
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                return [e for e in data if isinstance(e, dict) and "text" in e]
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+        return []
+
+    def _append_history(
+        self,
+        project_id: int,
+        source: str,
+        ticket_id: Optional[str],
+        updated_at: str,
+        text: str,
+    ) -> None:
+        """Record one update in the project's history, trimmed to the cap.
+
+        Best-effort: a failure here is logged, never raised, so a history
+        write can't turn a successful description update into a reported
+        failure for the caller (see :meth:`update_description`).
+        """
+        history = self._read_history(project_id)
+        history.append(
+            {
+                "source": source,
+                "ticket_id": ticket_id,
+                "updated_at": updated_at,
+                "text": text,
+            }
+        )
+        if len(history) > MAX_HISTORY_ENTRIES:
+            history = history[-MAX_HISTORY_ENTRIES:]
+        try:
+            self._history_path(project_id).write_text(
+                json.dumps(history), encoding="utf-8"
+            )
+        except OSError as exc:
+            logger.warning(
+                "Could not write project description history for %d: %s",
+                project_id,
+                exc,
+            )
+
+    def get_history(
+        self, project_id: int, limit: int = MAX_HISTORY_ENTRIES
+    ) -> List[Dict[str, Optional[str]]]:
+        """Return this project's description update history, newest first.
+
+        Parameters
+        ----------
+        project_id : int
+            Kanboard project ID.
+        limit : int
+            Maximum number of entries to return (from the most recent).
+
+        Returns
+        -------
+        List[Dict[str, Optional[str]]]
+            Each entry: ``{"source", "ticket_id", "updated_at", "text"}``
+            — the same provenance shape as :meth:`get_provenance`, plus
+            ``text``, the full description content as of that update. At
+            most :data:`MAX_HISTORY_ENTRIES` are ever stored, so history
+            beyond that many updates ago is not available.
+        """
+        history = self._read_history(project_id)
+        return list(reversed(history))[:limit]
+
     def can_auto_update(self, project_id: int) -> bool:
         """Return ``True`` unless a human has edited this description.
 
@@ -525,10 +620,11 @@ class ProjectDescriptionManager:
         p = self._path(project_id)
         try:
             p.write_text(text, encoding="utf-8")
+            updated_at = datetime.now(timezone.utc).isoformat()
             sidecar = {
                 "source": source,
                 "ticket_id": ticket_id,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": updated_at,
             }
             self._source_path(project_id).write_text(
                 json.dumps(sidecar), encoding="utf-8"
@@ -542,6 +638,7 @@ class ProjectDescriptionManager:
         except OSError as exc:
             logger.error("Could not write project description %s: %s", p, exc)
             raise
+        self._append_history(project_id, source, ticket_id, updated_at, text)
 
     def seed_if_missing(self, project_id: int, project_name: str) -> None:
         """Create a blank description template if none exists yet.
@@ -629,6 +726,40 @@ def format_provenance_badge(info: Dict[str, Optional[str]]) -> Optional[str]:
     if source == SOURCE_TEMPLATE:
         return "Blank template — not yet filled in"
     return None  # SOURCE_ABSENT, or an unrecognized value
+
+
+def compute_diff_lines(old_text: str, new_text: str) -> List[Tuple[str, str]]:
+    """Line-level diff between two description versions, for rendering.
+
+    Parameters
+    ----------
+    old_text : str
+        The prior version's full text (``""`` if this is the first
+        recorded version).
+    new_text : str
+        This version's full text.
+
+    Returns
+    -------
+    List[Tuple[str, str]]
+        ``(kind, line)`` pairs, in order, where ``kind`` is ``"add"``,
+        ``"remove"``, or ``"context"``. Diff-format header/hunk lines
+        (``---``, ``+++``, ``@@``) are omitted — callers only need the
+        content, not unified-diff plumbing.
+    """
+    old_lines = old_text.splitlines()
+    new_lines = new_text.splitlines()
+    result: List[Tuple[str, str]] = []
+    for line in difflib.unified_diff(old_lines, new_lines, lineterm="", n=2):
+        if line.startswith(("+++", "---", "@@")):
+            continue
+        if line.startswith("+"):
+            result.append(("add", line[1:]))
+        elif line.startswith("-"):
+            result.append(("remove", line[1:]))
+        else:
+            result.append(("context", line[1:] if line.startswith(" ") else line))
+    return result
 
 
 # ---------------------------------------------------------------------------

@@ -7,12 +7,14 @@ Tests cover:
 - ProjectDescriptionManager: read/write, seed_if_missing, get_stack
 """
 
+import json
 from datetime import datetime
 
 import pytest
 from pathlib import Path
 
 from src.core.project_description import (
+    MAX_HISTORY_ENTRIES,
     ProjectDescriptionInferrer,
     ProjectDescriptionManager,
     ProjectStack,
@@ -23,6 +25,7 @@ from src.core.project_description import (
     SOURCE_TEMPLATE,
     _TEMPLATE,
     _WAITING_COMMENT,
+    compute_diff_lines,
     format_provenance_badge,
     parse_stack_from_text,
 )
@@ -610,3 +613,164 @@ class TestProjectDescriptionInferrer:
         inf = ProjectDescriptionInferrer(llm_generate=None)
         result = await inf.infer("Shop", "Make it nicer", "look prettier")
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# get_history: per-update audit trail, capped at MAX_HISTORY_ENTRIES
+# ---------------------------------------------------------------------------
+
+
+class TestGetHistory:
+    """Every update_description() call appends a history entry."""
+
+    def _mgr(self, tmp_path):
+        return ProjectDescriptionManager(data_dir=tmp_path)
+
+    def test_no_history_when_never_updated(self, tmp_path):
+        mgr = self._mgr(tmp_path)
+        assert mgr.get_history(7) == []
+
+    def test_single_update_produces_one_entry(self, tmp_path):
+        mgr = self._mgr(tmp_path)
+        mgr.update_description(7, "# v1\n", source=SOURCE_AGENT, ticket_id="42")
+
+        history = mgr.get_history(7)
+
+        assert len(history) == 1
+        assert history[0]["source"] == SOURCE_AGENT
+        assert history[0]["ticket_id"] == "42"
+        assert history[0]["text"] == "# v1\n"
+        assert history[0]["updated_at"] is not None
+
+    def test_returned_newest_first(self, tmp_path):
+        mgr = self._mgr(tmp_path)
+        mgr.update_description(7, "# v1\n", source=SOURCE_AGENT, ticket_id="1")
+        mgr.update_description(7, "# v2\n", source=SOURCE_AGENT, ticket_id="2")
+        mgr.update_description(7, "# v3\n", source=SOURCE_HUMAN)
+
+        history = mgr.get_history(7)
+
+        assert [h["text"] for h in history] == ["# v3\n", "# v2\n", "# v1\n"]
+
+    def test_capped_at_max_history_entries(self, tmp_path):
+        mgr = self._mgr(tmp_path)
+        for i in range(MAX_HISTORY_ENTRIES + 5):
+            mgr.update_description(
+                7, f"# v{i}\n", source=SOURCE_AGENT, ticket_id=str(i)
+            )
+
+        history = mgr.get_history(7)
+
+        assert len(history) == MAX_HISTORY_ENTRIES
+        # Oldest entries (v0..v4) were dropped; newest-first starts at the
+        # last update and the oldest surviving entry is v5.
+        assert history[0]["text"] == f"# v{MAX_HISTORY_ENTRIES + 4}\n"
+        assert history[-1]["text"] == "# v5\n"
+
+    def test_limit_parameter_truncates_further(self, tmp_path):
+        mgr = self._mgr(tmp_path)
+        mgr.update_description(7, "# v1\n", source=SOURCE_AGENT, ticket_id="1")
+        mgr.update_description(7, "# v2\n", source=SOURCE_AGENT, ticket_id="2")
+        mgr.update_description(7, "# v3\n", source=SOURCE_HUMAN)
+
+        history = mgr.get_history(7, limit=2)
+
+        assert len(history) == 2
+        assert history[0]["text"] == "# v3\n"
+
+    def test_on_disk_history_file_itself_is_capped(self, tmp_path):
+        """The stored history file must not grow past MAX_HISTORY_ENTRIES.
+
+        get_history() always truncates its return value to `limit`, so a
+        test asserting only on get_history()'s output would pass even if
+        the on-disk file were never trimmed on write — the file would
+        just grow unbounded forever. This reads the raw sidecar file to
+        confirm the trim in _append_history is actually happening.
+        """
+        mgr = self._mgr(tmp_path)
+        for i in range(MAX_HISTORY_ENTRIES + 5):
+            mgr.update_description(
+                7, f"# v{i}\n", source=SOURCE_AGENT, ticket_id=str(i)
+            )
+
+        raw = json.loads((tmp_path / "7.history.json").read_text(encoding="utf-8"))
+
+        assert len(raw) == MAX_HISTORY_ENTRIES
+
+    def test_history_is_per_project(self, tmp_path):
+        mgr = self._mgr(tmp_path)
+        mgr.update_description(1, "# project one\n", source=SOURCE_HUMAN)
+        mgr.update_description(2, "# project two\n", source=SOURCE_HUMAN)
+
+        assert len(mgr.get_history(1)) == 1
+        assert mgr.get_history(1)[0]["text"] == "# project one\n"
+        assert mgr.get_history(2)[0]["text"] == "# project two\n"
+
+    def test_corrupted_history_file_degrades_to_empty(self, tmp_path):
+        """A malformed .history.json must not crash get_history."""
+        mgr = self._mgr(tmp_path)
+        (tmp_path / "9.md").write_text("# doc\n", encoding="utf-8")
+        (tmp_path / "9.history.json").write_text("not valid json{{{", encoding="utf-8")
+
+        assert mgr.get_history(9) == []
+
+    def test_history_write_failure_does_not_break_the_update(self, tmp_path, monkeypatch):
+        """
+        A history-write failure is best-effort: the description content
+        and provenance must still be saved successfully.
+        """
+        mgr = self._mgr(tmp_path)
+
+        real_write_text = Path.write_text
+
+        def flaky_write_text(self, *args, **kwargs):
+            if self.name.endswith(".history.json"):
+                raise OSError("disk full")
+            return real_write_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", flaky_write_text)
+
+        mgr.update_description(7, "# saved anyway\n", source=SOURCE_HUMAN)
+
+        assert mgr.get_description(7) == "# saved anyway\n"
+        assert mgr.get_source(7) == SOURCE_HUMAN
+        # The history write genuinely failed — confirm it didn't silently
+        # succeed some other way.
+        assert mgr.get_history(7) == []
+
+
+# ---------------------------------------------------------------------------
+# compute_diff_lines
+# ---------------------------------------------------------------------------
+
+
+class TestComputeDiffLines:
+    def test_added_lines_marked_add(self):
+        diff = compute_diff_lines("", "line one\nline two\n")
+        kinds = {kind for kind, _ in diff}
+        assert kinds == {"add"}
+        assert ("add", "line one") in diff
+        assert ("add", "line two") in diff
+
+    def test_removed_lines_marked_remove(self):
+        diff = compute_diff_lines("line one\nline two\n", "")
+        kinds = {kind for kind, _ in diff}
+        assert kinds == {"remove"}
+
+    def test_identical_text_produces_no_diff_lines(self):
+        text = "same\ntext\n"
+        assert compute_diff_lines(text, text) == []
+
+    def test_single_line_change_shows_remove_and_add(self):
+        diff = compute_diff_lines("Language: Python\n", "Language: Node.js\n")
+        assert ("remove", "Language: Python") in diff
+        assert ("add", "Language: Node.js") in diff
+
+    def test_unchanged_surrounding_lines_marked_context(self):
+        old = "line 1\nline 2\nline 3\n"
+        new = "line 1\nCHANGED\nline 3\n"
+        diff = compute_diff_lines(old, new)
+        kinds = [kind for kind, _ in diff]
+        assert "context" in kinds
+        assert ("remove", "line 2") in diff
+        assert ("add", "CHANGED") in diff
