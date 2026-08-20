@@ -4864,6 +4864,7 @@ if __name__ == "__main__":
                 SOURCE_AGENT,
                 SOURCE_INFERRED,
                 ProjectDescriptionManager,
+                compute_diff_lines,
                 format_provenance_badge,
             )
 
@@ -4896,6 +4897,32 @@ if __name__ == "__main__":
                     f'<p class="{badge_class}">{_html.escape(badge_text)}</p>'
                 )
 
+            history = desc_mgr.get_history(pid)  # newest first
+            history_items = []
+            for i, entry in enumerate(history):
+                entry_badge = format_provenance_badge(entry) or "Update"
+                older_text = history[i + 1]["text"] if i + 1 < len(history) else ""
+                diff_lines = compute_diff_lines(older_text or "", entry.get("text") or "")
+                diff_html_parts = []
+                for kind, line in diff_lines:
+                    css_class = {"add": "diff-add", "remove": "diff-remove"}.get(
+                        kind, "diff-context"
+                    )
+                    prefix = {"add": "+", "remove": "-"}.get(kind, " ")
+                    diff_html_parts.append(
+                        f'<span class="{css_class}">{_html.escape(prefix + line)}</span>'
+                    )
+                diff_html = "\n".join(diff_html_parts) if diff_html_parts else "(no changes)"
+                history_items.append(
+                    "<details class=\"history-entry\">"
+                    f'<summary>{_html.escape(entry_badge)}</summary>'
+                    f'<pre class="diff">{diff_html}</pre>'
+                    "</details>"
+                )
+            history_html = "".join(history_items) if history_items else (
+                '<p class="hint">No update history recorded yet.</p>'
+            )
+
             api_url = f"/api/project-description?project_id={pid}"
             page = f"""<!doctype html>
 <html lang="en">
@@ -4915,6 +4942,15 @@ if __name__ == "__main__":
   .badge {{ display: inline-block; background: #f1f5f9; color: #475569; padding: 4px 12px;
             border-radius: 999px; font-size: 12px; margin: 0 0 14px; }}
   .badge-ai {{ background: #eef2ff; color: #3730a3; }}
+  h2 {{ font-size: 1.1rem; color: #1e293b; margin-top: 36px; }}
+  .history-entry {{ border: 1px solid #e2e8f0; border-radius: 6px; margin-bottom: 8px; padding: 6px 12px; }}
+  .history-entry summary {{ cursor: pointer; font-size: 13px; color: #475569; padding: 4px 0; }}
+  pre.diff {{ font-family: monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word;
+              background: #f8fafc; border-radius: 4px; padding: 10px; margin: 8px 0 4px; }}
+  pre.diff span {{ display: block; }}
+  .diff-add {{ color: #15803d; background: #ecfdf3; }}
+  .diff-remove {{ color: #b91c1c; background: #fef2f2; text-decoration: line-through; }}
+  .diff-context {{ color: #64748b; }}
 </style>
 </head>
 <body>
@@ -4927,6 +4963,9 @@ AI agents read and update it automatically. Humans can edit it here.</p>
 <span id="saved-msg">&#10003; Saved</span>
 <p class="hint">The <strong>Tech Stack</strong> section is read by Marcus to set up the live-preview
 Docker container. Make sure to fill in <em>Language</em> and <em>Dev server command</em>.</p>
+<h2>Update History</h2>
+<p class="hint">The last {len(history_items) if history_items else 0} update(s) to this description, most recent first. Click an entry to see what changed.</p>
+{history_html}
 <script>
 function save() {{
   var text = document.getElementById('desc-text').value;
