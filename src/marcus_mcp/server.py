@@ -4862,6 +4862,7 @@ if __name__ == "__main__":
             """
             from src.core.project_description import (
                 SOURCE_AGENT,
+                SOURCE_HUMAN,
                 SOURCE_INFERRED,
                 ProjectDescriptionManager,
                 compute_diff_lines,
@@ -4879,6 +4880,23 @@ if __name__ == "__main__":
                 desc_mgr = ProjectDescriptionManager()
                 server._project_desc_mgr = desc_mgr  # type: ignore[attr-defined]
 
+            def source_tag(source: Optional[str]) -> str:
+                """A small colored "Human" / "AI" label distinguishing who wrote an entry.
+
+                Human-written entries are authoritative: once a human edits
+                the description, ``can_auto_update`` permanently blocks
+                agents/Marcus from overwriting it (see
+                ``ProjectDescriptionManager.can_auto_update`` and
+                ``HumanGatedWorkflow.apply_agent_project_description``) — this
+                tag exists so a reader can see that lock reflected in the
+                history, not just be told about it in prose.
+                """
+                if source == SOURCE_HUMAN:
+                    return '<span class="src-tag src-human">&#128100; Human</span>'
+                if source in (SOURCE_AGENT, SOURCE_INFERRED):
+                    return '<span class="src-tag src-ai">&#129302; AI</span>'
+                return '<span class="src-tag src-template">Template</span>'
+
             raw = desc_mgr.get_description(pid) or ""
             provenance = desc_mgr.get_provenance(pid)
             badge_text = format_provenance_badge(provenance)
@@ -4888,16 +4906,25 @@ if __name__ == "__main__":
 
             badge_html = ""
             if badge_text:
-                badge_class = (
-                    "badge badge-ai"
-                    if provenance.get("source") in (SOURCE_AGENT, SOURCE_INFERRED)
-                    else "badge"
-                )
                 badge_html = (
-                    f'<p class="{badge_class}">{_html.escape(badge_text)}</p>'
+                    '<p class="badge">'
+                    f"{source_tag(provenance.get('source'))} "
+                    f"{_html.escape(badge_text)}</p>"
                 )
 
             history = desc_mgr.get_history(pid)  # newest first
+            # Index of the most recent human-authored entry, if any. Once a
+            # human writes, can_auto_update() permanently blocks agents from
+            # writing again (see apply_agent_project_description), so every
+            # entry OLDER than this one (higher index — including any AI
+            # entries) is guaranteed to have been overridden by that edit,
+            # not merely superseded in time. Flag those explicitly so a
+            # reader never mistakes an old AI-written entry for something
+            # still in effect.
+            newest_human_idx = next(
+                (i for i, e in enumerate(history) if e.get("source") == SOURCE_HUMAN),
+                None,
+            )
             history_items = []
             for i, entry in enumerate(history):
                 entry_badge = format_provenance_badge(entry) or "Update"
@@ -4913,9 +4940,21 @@ if __name__ == "__main__":
                         f'<span class="{css_class}">{_html.escape(prefix + line)}</span>'
                     )
                 diff_html = "\n".join(diff_html_parts) if diff_html_parts else "(no changes)"
+                entry_class = (
+                    "history-entry history-human"
+                    if entry.get("source") == SOURCE_HUMAN
+                    else "history-entry"
+                )
+                superseded_html = ""
+                if newest_human_idx is not None and i > newest_human_idx:
+                    superseded_html = (
+                        ' <span class="src-tag src-superseded">'
+                        "&#8856; overridden by a later human edit</span>"
+                    )
                 history_items.append(
-                    "<details class=\"history-entry\">"
-                    f'<summary>{_html.escape(entry_badge)}</summary>'
+                    f'<details class="{entry_class}">'
+                    f'<summary>{source_tag(entry.get("source"))} '
+                    f'{_html.escape(entry_badge)}{superseded_html}</summary>'
                     f'<pre class="diff">{diff_html}</pre>'
                     "</details>"
                 )
@@ -4941,10 +4980,16 @@ if __name__ == "__main__":
   .hint {{ font-size: 12px; color: #64748b; margin-top: 6px; }}
   .badge {{ display: inline-block; background: #f1f5f9; color: #475569; padding: 4px 12px;
             border-radius: 999px; font-size: 12px; margin: 0 0 14px; }}
-  .badge-ai {{ background: #eef2ff; color: #3730a3; }}
+  .src-tag {{ display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 8px;
+              border-radius: 999px; margin-right: 4px; vertical-align: middle; }}
+  .src-human {{ background: #dcfce7; color: #15803d; }}
+  .src-ai {{ background: #eef2ff; color: #3730a3; }}
+  .src-template {{ background: #f1f5f9; color: #64748b; }}
+  .src-superseded {{ background: #fef2f2; color: #b91c1c; }}
   h2 {{ font-size: 1.1rem; color: #1e293b; margin-top: 36px; }}
   .history-entry {{ border: 1px solid #e2e8f0; border-radius: 6px; margin-bottom: 8px; padding: 6px 12px; }}
   .history-entry summary {{ cursor: pointer; font-size: 13px; color: #475569; padding: 4px 0; }}
+  .history-entry.history-human {{ border-left: 3px solid #15803d; }}
   pre.diff {{ font-family: monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word;
               background: #f8fafc; border-radius: 4px; padding: 10px; margin: 8px 0 4px; }}
   pre.diff span {{ display: block; }}
@@ -4957,14 +5002,19 @@ if __name__ == "__main__":
 <h1>&#128203; Project Description — Project #{pid}</h1>
 {badge_html}
 <p class="hint">This document is the source of truth for the tech stack and project context.
-AI agents read and update it automatically. Humans can edit it here.</p>
+AI agents read and update it automatically — but once a
+<span class="src-tag src-human">&#128100; Human</span> edits this description, it is locked:
+AI agents can read it but can no longer overwrite or contradict it, only a human edit can
+change it further.</p>
 <textarea id="desc-text">{escaped}</textarea><br>
 <button class="btn" onclick="save()">Save</button>
 <span id="saved-msg">&#10003; Saved</span>
 <p class="hint">The <strong>Tech Stack</strong> section is read by Marcus to set up the live-preview
 Docker container. Make sure to fill in <em>Language</em> and <em>Dev server command</em>.</p>
 <h2>Update History</h2>
-<p class="hint">The last {len(history_items) if history_items else 0} update(s) to this description, most recent first. Click an entry to see what changed.</p>
+<p class="hint">The last {len(history_items) if history_items else 0} update(s) to this description, most recent first.
+<span class="src-tag src-human">&#128100; Human</span> = written by a person and locked against AI overwrite.
+<span class="src-tag src-ai">&#129302; AI</span> = written by an agent or Marcus. Click an entry to see what changed.</p>
 {history_html}
 <script>
 function save() {{
