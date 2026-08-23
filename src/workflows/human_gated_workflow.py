@@ -3808,6 +3808,88 @@ class HumanGatedWorkflow:
                     record.ticket_id,
                     exc,
                 )
+            # _check_parent_completion only ever ACTS when children are
+            # done (moving the parent on to Waiting-for-Human/Done); it
+            # returns early otherwise, leaving a parent that should still
+            # visibly sit in Blocked completely unchecked. Re-fetch and
+            # verify its board card actually reflects that.
+            still = self._lifecycle.get(record.ticket_id, self._provider)
+            if still is not None and still.state == TicketState.BLOCKED:
+                try:
+                    await self._reconcile_parent_column(record.ticket_id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Reconcile: could not verify board column for "
+                        "parent %s: %s",
+                        record.ticket_id,
+                        exc,
+                    )
+
+    async def _reconcile_parent_column(self, parent_id: str) -> None:
+        """Self-heal a BLOCKED parent's board card stuck on the wrong column.
+
+        ``decompose_ticket``'s move to the Blocked column is best-effort —
+        it can fail silently (no matching column on that project's board,
+        a transient RPC blip) and is only ever logged as a WARNING, never
+        retried. Nothing else corrects it afterward: BoardWatcher only
+        fires a status-changed event on an observed DIFF between polls, so
+        a card stuck on its PRE-decompose column (almost always "In
+        Progress", since decomposing an in-flight ticket via "@marcus
+        decompose" is a normal, supported use) produces no event to react
+        to, ever — Marcus's own lifecycle state is correctly BLOCKED the
+        whole time; only the visible Kanboard card is wrong. Called from
+        :meth:`_reconcile_blocked_parents`'s periodic sweep for every
+        parent that is still BLOCKED (not yet ready to complete), so the
+        drift self-heals within one sweep interval regardless of cause —
+        including a human manually dragging the card elsewhere.
+
+        Parameters
+        ----------
+        parent_id : str
+            Ticket identifier of a parent whose lifecycle state is
+            currently :data:`TicketState.BLOCKED`.
+        """
+        get_task = getattr(self._kanban, "get_task_by_id", None)
+        if get_task is None:
+            return
+        try:
+            task = await get_task(parent_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "Reconcile: could not fetch board column for parent %s: %s",
+                parent_id,
+                exc,
+            )
+            return
+        if task is None or task.status == TaskStatus.BLOCKED:
+            return
+        was_status = task.status.value if task.status is not None else "unknown"
+        try:
+            moved = await self._kanban.move_task_to_column(parent_id, "blocked")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Reconcile: could not move parent %s back to Blocked "
+                "(board showed %r): %s",
+                parent_id,
+                was_status,
+                exc,
+            )
+            return
+        if moved:
+            logger.info(
+                "Reconcile: corrected parent %s's board column back to "
+                "Blocked (was %r)",
+                parent_id,
+                was_status,
+            )
+        else:
+            logger.warning(
+                "Reconcile: parent %s still did not move to the 'Blocked' "
+                "column (does this project's board have a column named "
+                "'Blocked'?). It remains %r on the board.",
+                parent_id,
+                was_status,
+            )
 
     async def _complete_parent_ticket(
         self, parent_id: str, record: TicketRecord

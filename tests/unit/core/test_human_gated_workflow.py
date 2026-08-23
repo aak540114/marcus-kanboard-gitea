@@ -5806,6 +5806,111 @@ class TestReconcileBlockedParents:
         mock_kanban.get_task_links.assert_not_awaited()
         assert lifecycle.get("258", "kanboard").state == TicketState.BLOCKED
 
+    @pytest.mark.asyncio
+    async def test_sweep_corrects_a_parent_stuck_on_its_pre_decompose_column(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Regression: decompose_ticket's initial move to Blocked can fail
+        silently (no matching column, a transient RPC blip) and is never
+        retried on its own — nothing else corrects it, since BoardWatcher
+        only fires an event on an observed DIFF, and a card stuck on its
+        pre-decompose column produces no further diff to react to. Marcus's
+        own lifecycle state is correctly BLOCKED throughout; only the
+        visible Kanboard card is wrong (typically still "In Progress",
+        since decomposing an in-flight ticket via "@marcus decompose" is a
+        normal, supported use). The periodic sweep must notice and retry
+        the move for any parent that is still correctly BLOCKED (not yet
+        ready to complete)."""
+        lifecycle.get_or_create("262", "kanboard")  # parent
+        lifecycle.human_transition("262", "kanboard", TicketState.BLOCKED)
+        self._child(lifecycle, "263", "262")
+        lifecycle.transition("263", "kanboard", TicketState.READY)
+        lifecycle.transition("263", "kanboard", TicketState.IN_PROGRESS)
+        # #263 not done yet — parent must stay Blocked.
+
+        # The board card never actually left "In Progress" — the
+        # symptom this test reproduces.
+        stuck_task = MagicMock(status=TaskStatus.IN_PROGRESS)
+        mock_kanban.get_task_by_id = AsyncMock(return_value=stuck_task)
+
+        await workflow._reconcile_blocked_parents()
+
+        # Lifecycle state is untouched (still correctly Blocked)...
+        assert lifecycle.get("262", "kanboard").state == TicketState.BLOCKED
+        # ...but the board card was retried back to Blocked.
+        mock_kanban.get_task_by_id.assert_awaited_with("262")
+        mock_kanban.move_task_to_column.assert_any_call("262", "blocked")
+
+    @pytest.mark.asyncio
+    async def test_sweep_does_not_re_move_a_parent_already_on_blocked_column(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """No redundant move_task_to_column call when the board already
+        correctly shows Blocked — the common case."""
+        lifecycle.get_or_create("264", "kanboard")
+        lifecycle.human_transition("264", "kanboard", TicketState.BLOCKED)
+        self._child(lifecycle, "265", "264")
+        lifecycle.transition("265", "kanboard", TicketState.READY)
+
+        mock_kanban.get_task_by_id = AsyncMock(
+            return_value=MagicMock(status=TaskStatus.BLOCKED)
+        )
+
+        await workflow._reconcile_blocked_parents()
+
+        mock_kanban.move_task_to_column.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_sweep_column_reconcile_failure_is_logged_not_raised(
+        self, workflow, lifecycle, mock_kanban, caplog
+    ):
+        """A get_task_by_id failure during the column check must not crash
+        the sweep — it degrades to "try again next sweep interval"."""
+        lifecycle.get_or_create("266", "kanboard")
+        lifecycle.human_transition("266", "kanboard", TicketState.BLOCKED)
+        self._child(lifecycle, "267", "266")
+        lifecycle.transition("267", "kanboard", TicketState.READY)
+
+        mock_kanban.get_task_by_id = AsyncMock(
+            side_effect=RuntimeError("kanboard RPC timeout")
+        )
+
+        import logging
+
+        with caplog.at_level(logging.DEBUG):
+            await workflow._reconcile_blocked_parents()
+
+        assert lifecycle.get("266", "kanboard").state == TicketState.BLOCKED
+        mock_kanban.move_task_to_column.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_sweep_skips_column_reconcile_for_a_parent_just_completed(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """A parent whose children just finished moves on to Waiting for
+        Human (or Done) via _check_parent_completion — the column-reconcile
+        step must not then also try to move it BACK to Blocked."""
+        lifecycle.get_or_create("268", "kanboard")  # parent
+        lifecycle.human_transition("268", "kanboard", TicketState.BLOCKED)
+        self._child(lifecycle, "269", "268")
+        lifecycle.transition("269", "kanboard", TicketState.READY)
+        lifecycle.transition("269", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("269", "kanboard", TicketState.DONE)
+
+        mock_kanban.get_task_by_id = AsyncMock(
+            return_value=MagicMock(status=TaskStatus.IN_PROGRESS)
+        )
+
+        await workflow._reconcile_blocked_parents()
+
+        assert lifecycle.get("268", "kanboard").state == TicketState.WAITING_FOR_HUMAN
+        # Only the completion move happened — no extra "back to blocked" call.
+        moves = [
+            call.args for call in mock_kanban.move_task_to_column.await_args_list
+        ]
+        assert ("268", "blocked") not in moves
+        assert ("268", "waiting for human") in moves
+
 
 class TestParentAutoCompleteEndToEnd:
     """Same guarantee as TestParentAutoComplete (all children Done -> parent
