@@ -3949,6 +3949,208 @@ def _main_preview_ticket_id(project_id_str: str) -> str:
         return ""
 
 
+#: STACK_CONFIGS keys that map to a well-known framework name, for the
+#: "Framework" field _persist_corrected_stack writes. File-sniffing alone
+#: (see detect_project_type) can tell FastAPI/Flask/Django apart via
+#: requirements.txt content, but "nodejs" covers Express, Fastify, plain
+#: http, etc. indistinguishably — left blank rather than guessing wrong
+#: a second time.
+_STACK_FRAMEWORK_LABELS: Dict[str, str] = {
+    "python-fastapi": "FastAPI",
+    "python-flask": "Flask",
+    "python-django": "Django",
+}
+
+#: STACK_CONFIGS keys that map to a human-readable "Language" field value.
+_STACK_LANGUAGE_LABELS: Dict[str, str] = {
+    "nodejs": "Node.js",
+    "python": "Python",
+    "python-fastapi": "Python",
+    "python-flask": "Python",
+    "python-django": "Python",
+    "go": "Go",
+    "rust": "Rust",
+    "ruby": "Ruby",
+    "java": "Java",
+    "php": "PHP",
+}
+
+
+def _reconcile_stack_with_repo(
+    desc_mgr: Any, project_id: int, project_stack: Any, repo_path: Optional[str]
+) -> Any:
+    """Cross-check a project's declared Tech Stack against its real repo.
+
+    Root-cause context: a project's Tech Stack is normally either
+    written by a human or auto-inferred by an LLM from a single ticket's
+    text (``ProjectDescriptionInferrer`` — see its docstring: "It is fine
+    to be a best guess"), with NO access to the actual repository content
+    at inference time. Once that guess produces anything syntactically
+    valid (a language + a dev command, however wrong), ``_check_project_
+    stack`` in human_gated_workflow.py treats the project as permanently
+    "described" and never re-examines it — and nothing in an AI agent's
+    normal workflow ever prompts it to compare the declared stack against
+    the real code it's actually working in, even though the tool to
+    correct it (``apply_agent_project_description``) has existed all
+    along. Reported symptom: a project's description confidently
+    declared "Python / Django", right down to a fabricated app structure
+    and route list, while the actual repo was a small Node.js/Express
+    server — every preview 404'd because Marcus dutifully ran
+    `python manage.py runserver` against a repo with no manage.py at all.
+
+    This closes that loop the cheap, deterministic way: reusing
+    ``detect_project_type`` (the same file-sniffing heuristic already
+    used when NO description exists at all) as a sanity check at the one
+    point a mismatch actually matters — starting a preview, where both
+    the declared stack and the real repo path are already in hand. A
+    hard LANGUAGE-level mismatch (not e.g. a Framework detail
+    file-sniffing can't resolve at all) means "trust the files, not the
+    prose": the corrected stack is used for THIS preview immediately, and
+    — unless a human has already locked the description
+    (``can_auto_update``) — persisted back into the stored description
+    too, so this self-heals for every future preview and every human
+    reading the page, not just this one request.
+
+    Parameters
+    ----------
+    desc_mgr : ProjectDescriptionManager
+        The project's description manager.
+    project_id : int
+        Kanboard project ID (for logging and the persisted update).
+    project_stack : ProjectStack
+        The stack resolved from the project's current description.
+    repo_path : Optional[str]
+        Local path to the project's cloned repo, or ``None``/nonexistent
+        if unresolvable — in which case there is nothing to check against
+        and *project_stack* is returned unchanged.
+
+    Returns
+    -------
+    ProjectStack
+        *project_stack* unchanged when nothing to check, no mismatch, or
+        the mismatch was too weak a signal to trust (``detect_project_
+        type`` returning ``"static"`` — no recognized manifest file at
+        all — is not strong enough evidence to override an EXPLICIT
+        stack someone already wrote); otherwise a corrected stack built
+        from the repo's own detected type.
+    """
+    if not repo_path or not os.path.isdir(repo_path):
+        return project_stack
+
+    from src.core.dev_environment import STACK_CONFIGS, detect_project_type
+
+    try:
+        detected_key = detect_project_type(repo_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "Stack reconciliation: could not sniff repo %s: %s", repo_path, exc
+        )
+        return project_stack
+
+    if detected_key == "static":
+        return project_stack
+
+    detected_language = detected_key.split("-", 1)[0]
+    declared_language = (project_stack.language or "").lower()
+    if detected_language == declared_language:
+        return project_stack
+
+    from src.core.project_description import ProjectStack
+
+    fb = STACK_CONFIGS[detected_key]
+    corrected = ProjectStack(
+        language=detected_language,
+        framework=_STACK_FRAMEWORK_LABELS.get(detected_key, ""),
+        install_cmd=fb["install"],
+        dev_cmd=fb["start"],
+        use_hm_reload=fb["hm"],
+        extra_apt=list(fb.get("apk", [])),
+    )
+    logger.warning(
+        "Project %d's description declares language=%r but its repo's own "
+        "files say %r (detected via %r) — using the repo's actual stack "
+        "for this preview instead of the mismatched description",
+        project_id,
+        project_stack.language,
+        detected_language,
+        detected_key,
+    )
+
+    if desc_mgr.can_auto_update(project_id):
+        _persist_corrected_stack(desc_mgr, project_id, corrected)
+
+    return corrected
+
+
+def _persist_corrected_stack(desc_mgr: Any, project_id: int, corrected: Any) -> None:
+    """Best-effort: rewrite only the ``## Tech Stack`` section of a
+    project's stored description to match *corrected*, leaving every
+    other section (Overview, Architecture Notes, Open Questions, or any
+    other human-written prose) untouched.
+
+    Never raises: a failure here must not break the preview the caller
+    is in the middle of starting. On any failure (or an unrecognized
+    description format with no matching section to replace), the stored
+    description is simply left as-is — the caller already has the
+    corrected stack for the CURRENT preview regardless.
+
+    Parameters
+    ----------
+    desc_mgr : ProjectDescriptionManager
+        The project's description manager.
+    project_id : int
+        Kanboard project ID.
+    corrected : ProjectStack
+        The repo-verified stack to write into the Tech Stack section.
+    """
+    from src.core.project_description import SOURCE_INFERRED, _extract_field
+
+    try:
+        text = desc_mgr.get_description(project_id)
+        if not text:
+            return
+        database = _extract_field(text, "database") or "none"
+        lang_display = _STACK_LANGUAGE_LABELS.get(
+            corrected.language, corrected.language.capitalize()
+        )
+        new_section = (
+            "## Tech Stack\n"
+            f"- **Language**: {lang_display}\n"
+            f"- **Framework**: {corrected.framework or 'none'}\n"
+            f"- **Database**: {database}\n"
+            f"- **Dev server command**: {corrected.dev_cmd}\n"
+            f"- **Install command**: {corrected.install_cmd}\n"
+        )
+        new_text, n = re.subn(
+            r"## Tech Stack\n.*?(?=\n#{1,6} |\Z)",
+            new_section,
+            text,
+            count=1,
+            flags=re.DOTALL,
+        )
+        if n == 0:
+            logger.warning(
+                "Stack reconciliation: project %d's description has no "
+                "'## Tech Stack' section to correct (unrecognized format) "
+                "— leaving the stored description untouched",
+                project_id,
+            )
+            return
+        desc_mgr.update_description(project_id, new_text, source=SOURCE_INFERRED)
+        logger.info(
+            "Stack reconciliation: corrected project %d's stored Tech "
+            "Stack section to match its repo",
+            project_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Stack reconciliation: could not persist corrected description "
+            "for project %d: %s",
+            project_id,
+            exc,
+        )
+
+
 def _dev_env_starting_page(
     ticket_id: str, provider: str, url: str, *, label: Optional[str] = None
 ) -> str:
@@ -4782,6 +4984,8 @@ if __name__ == "__main__":
 
                 # ── Resolve tech stack from project description ──────────
                 project_stack = None
+                pid: Optional[int] = None
+                desc_mgr = None
                 if project_id:
                     try:
                         pid = int(project_id)
@@ -4808,6 +5012,14 @@ if __name__ == "__main__":
                 if info is None:
                     branch = _resolve_ticket_branch(server, ticket_id, provider)
                     repo_path = await _resolve_ticket_repo_path(server, project_id)
+
+                    # Sanity-check the declared stack against the repo it's
+                    # actually about to run — see _reconcile_stack_with_repo's
+                    # docstring for why this can't just be trusted forever.
+                    if project_stack is not None and pid is not None and desc_mgr is not None:
+                        project_stack = _reconcile_stack_with_repo(
+                            desc_mgr, pid, project_stack, repo_path
+                        )
 
                     info = await dev_mgr.start(
                         ticket_id=ticket_id,
@@ -5780,6 +5992,12 @@ setInterval(refresh, 30000);
 
                 info = dev_mgr.get_info(synthetic_id, provider)
                 if info is None:
+                    # Sanity-check the declared stack against the repo it's
+                    # actually about to run — see _reconcile_stack_with_repo's
+                    # docstring for why this can't just be trusted forever.
+                    project_stack = _reconcile_stack_with_repo(
+                        desc_mgr, project_id, project_stack, repo_path
+                    )
                     info = await dev_mgr.start(
                         ticket_id=synthetic_id,
                         provider=provider,
