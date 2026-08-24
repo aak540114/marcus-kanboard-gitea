@@ -4816,6 +4816,29 @@ if __name__ == "__main__":
                         project_stack=project_stack,
                         repo_path=repo_path,
                     )
+                else:
+                    # An already-running preview is normally kept fresh by
+                    # the Gitea push webhook (handle_branch_push ->
+                    # DevEnvironmentManager.refresh_by_branch) firing on
+                    # every commit pushed to this ticket's branch — but
+                    # that's a single best-effort trigger with no retry.
+                    # A human re-opening this SAME preview later (e.g.
+                    # checking on progress) is explicitly asking to see
+                    # the branch's current state, so pull it here too
+                    # regardless of whether that webhook already
+                    # succeeded — refresh() is a cheap, idempotent `git
+                    # fetch && reset --hard`, a no-op when nothing
+                    # changed. See dev_env_main_view's identical reasoning
+                    # for its own long-lived main-branch preview.
+                    try:
+                        await dev_mgr.refresh(ticket_id, provider)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "Could not refresh preview for ticket %s "
+                            "before viewing: %s",
+                            ticket_id,
+                            exc,
+                        )
 
                 # The container has only just been asked to start: `docker
                 # run -d` returns immediately, long before the entrypoint has
@@ -5764,6 +5787,36 @@ setInterval(refresh, 30000);
                         project_stack=project_stack,
                         repo_path=repo_path,
                     )
+                else:
+                    # An already-running main preview is normally kept
+                    # fresh by the Gitea push webhook (_handle_main_push ->
+                    # DevEnvironmentManager.refresh), fired the instant a
+                    # merge lands on main. But that is a single
+                    # best-effort background trigger with no retry — a
+                    # missed/misconfigured webhook delivery, a repo-name
+                    # resolver miss, or Marcus being down for the instant
+                    # the webhook fired all leave this long-lived
+                    # container silently stuck serving whatever commit it
+                    # was cloned from, indefinitely. A human opening this
+                    # page is explicitly asking "show me main RIGHT NOW",
+                    # so pull the latest commit here too regardless of
+                    # whether the webhook already succeeded — refresh() is
+                    # a cheap, idempotent `git fetch && reset --hard`, a
+                    # no-op when nothing changed. This is what actually
+                    # fixes the reported symptom: a ticket's own branch
+                    # preview (freshly cloned at start time) shows a fix
+                    # correctly, but revisiting this SAME reused main
+                    # preview after merging that fix keeps showing the
+                    # pre-fix content forever.
+                    try:
+                        await dev_mgr.refresh(synthetic_id, provider)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "Could not refresh main preview for project "
+                            "%s before viewing: %s",
+                            project_id,
+                            exc,
+                        )
 
                 is_serving = getattr(dev_mgr, "is_serving", None)
                 serving_now = False
