@@ -192,6 +192,20 @@ class TestParseStackFromText:
         assert stack is not None
         assert "pip install" in stack.install_cmd
 
+    def test_inferred_python_install_cmd_survives_pep_668(self):
+        """Regression: the preview container's Alpine 3.20 python3 (3.12+)
+        enforces PEP 668 and refuses a bare `pip install` with
+        "externally-managed-environment" — silently swallowed by this
+        command's own trailing `|| true`, leaving no dependencies
+        installed and the dev server crashing too. Docker still reports
+        the container "Up" (BusyBox's static fallback answers the port),
+        so the only visible symptom is a 404 on an apparently healthy
+        preview.
+        """
+        stack = parse_stack_from_text("Language: Python\nDev server command: python main.py")
+        assert stack is not None
+        assert "--break-system-packages" in stack.install_cmd
+
     def test_infers_nodejs_install_cmd(self):
         """nodejs → npm install inferred when not explicit."""
         stack = parse_stack_from_text("Language: nodejs")

@@ -139,24 +139,40 @@ _STATIC_FALLBACK = f"httpd -f -p {_APP_PORT} -h /app"
 #: the list of Alpine packages that install the language runtime the stack
 #: needs on top of :data:`_BASE_IMAGE` (which already ships ``python3``);
 #: an empty list means "the base image already has everything".
+#:
+#: Every ``pip install`` here carries ``--break-system-packages``:
+#: :data:`_BASE_IMAGE` is Alpine 3.20, whose ``python3`` is 3.12+, which
+#: enforces PEP 668 ("externally-managed-environment") — a bare
+#: ``pip install`` refuses to touch the system site-packages at all and
+#: exits non-zero immediately. Since these containers are single-purpose,
+#: throwaway previews (never anything else on the same Python install),
+#: there is no "system" to protect here; a venv would be the "correct"
+#: fix but adds an activation step to every start command for no benefit
+#: in this disposable context. Without this flag every Python preview's
+#: install step fails outright — and where it's chained with `|| true`
+#: (the ``"python"`` fallback), that failure is silently swallowed,
+#: leaving the dev server to run against whatever was already on the
+#: image (nothing project-specific), so it immediately crashes too and
+#: BusyBox's static fallback take over — the app 404s despite Docker
+#: showing the container itself as healthy and "Up".
 _FALLBACK_STACKS: Dict[str, Dict[str, Any]] = {
     "nodejs":         {"install": "npm install",
                        "start":   "npm run dev -- --port 3000",
                        "hm":      True,
                        "apk":     ["nodejs", "npm"]},
-    "python-fastapi": {"install": "pip install --no-cache-dir -r requirements.txt",
+    "python-fastapi": {"install": "pip install --break-system-packages --no-cache-dir -r requirements.txt",
                        "start":   "uvicorn main:app --host 0.0.0.0 --port 3000",
                        "hm":      False,
                        "apk":     ["python3", "py3-pip"]},
-    "python-flask":   {"install": "pip install --no-cache-dir -r requirements.txt",
+    "python-flask":   {"install": "pip install --break-system-packages --no-cache-dir -r requirements.txt",
                        "start":   "flask run --host 0.0.0.0 --port 3000",
                        "hm":      False,
                        "apk":     ["python3", "py3-pip"]},
-    "python-django":  {"install": "pip install --no-cache-dir -r requirements.txt",
+    "python-django":  {"install": "pip install --break-system-packages --no-cache-dir -r requirements.txt",
                        "start":   "python manage.py runserver 0.0.0.0:3000 --noreload",
                        "hm":      False,
                        "apk":     ["python3", "py3-pip"]},
-    "python":         {"install": "pip install --no-cache-dir -r requirements.txt 2>/dev/null || true",
+    "python":         {"install": "pip install --break-system-packages --no-cache-dir -r requirements.txt 2>/dev/null || true",
                        "start":   "python3 -m http.server 3000",
                        "hm":      False,
                        "apk":     ["python3", "py3-pip"]},

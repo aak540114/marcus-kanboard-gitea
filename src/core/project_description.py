@@ -282,7 +282,16 @@ def parse_stack_from_text(text: str) -> Optional[ProjectStack]:
     # ── Infer install_cmd if not explicit ─────────────────────────────────
     if not install_cmd:
         if language == "python":
-            install_cmd = "pip install --no-cache-dir -r requirements.txt 2>/dev/null || true"
+            # --break-system-packages: the dev-environment preview
+            # container is Alpine 3.20 (see src/core/dev_environment.py's
+            # _BASE_IMAGE), whose python3 is 3.12+ and enforces PEP 668
+            # ("externally-managed-environment") — a bare `pip install`
+            # exits non-zero immediately without it. That failure is
+            # silently swallowed by the trailing `|| true` here, leaving
+            # no dependencies installed at all; the dev server then
+            # crashes too and the container falls back to serving static
+            # files, which 404s despite Docker showing it as "Up".
+            install_cmd = "pip install --break-system-packages --no-cache-dir -r requirements.txt 2>/dev/null || true"
         elif language == "nodejs":
             install_cmd = "npm install"
         elif language == "go":

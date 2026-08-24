@@ -278,6 +278,37 @@ class TestDetectProjectType:
 
 
 # ---------------------------------------------------------------------------
+# STACK_CONFIGS: every Python install command must survive PEP 668
+# ---------------------------------------------------------------------------
+
+
+class TestPythonInstallCommandsSurvivePep668:
+    """Regression: alpine:3.20's python3 (3.12+) enforces PEP 668
+    ("externally-managed-environment") — a bare `pip install` inside the
+    preview container exits non-zero immediately without
+    --break-system-packages. Reported symptom: `docker ps` showed a
+    healthy, "Up" container, but visiting its preview URL gave a 404 —
+    the install failure (silently swallowed by a trailing `|| true` on
+    the generic "python" fallback) left no dependencies installed, so
+    the real dev server crashed too and BusyBox's static `httpd` fallback
+    took over, 404ing because the repo has no index.html at its root.
+    Docker's own health/serving check can't tell the difference, since
+    *something* is still answering the port either way.
+    """
+
+    @pytest.mark.parametrize(
+        "stack_key", ["python-fastapi", "python-flask", "python-django", "python"]
+    )
+    def test_stack_config_install_cmd_has_the_flag(self, stack_key: str) -> None:
+        install_cmd = STACK_CONFIGS[stack_key]["install"]
+        assert "--break-system-packages" in install_cmd
+        # And it must still be a genuine pip install of requirements.txt —
+        # not just an incidental substring match.
+        assert install_cmd.startswith("pip install ")
+        assert "-r requirements.txt" in install_cmd
+
+
+# ---------------------------------------------------------------------------
 # _resolve_nodejs_dev_command
 # ---------------------------------------------------------------------------
 
