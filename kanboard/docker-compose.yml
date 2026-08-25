@@ -77,11 +77,13 @@ services:
       # empirically (a real web request sees getenv('SESSION_HANDLER')
       # === false even though `docker exec ... printenv`/`php -r` both
       # show it correctly, since those bypass PHP-FPM entirely). The
-      # Dockerfile in this directory bakes in an additional
-      # php-fpm-marcus-env.conf to actually forward these two — see its
-      # own header comment for the full explanation. DB_TIMEOUT doesn't
-      # have this problem (it IS on env.conf's allowlist); it's a no-op
-      # for the separate reason explained in the root docker-compose.yml.
+      # Dockerfile in this directory appends env[] lines for these two
+      # directly onto that same env.conf at build time to actually
+      # forward them — see its own comment for the full explanation
+      # (including why a separate sibling file / a second `include =`
+      # line were tried first and don't work). DB_TIMEOUT doesn't have
+      # this problem (it IS on env.conf's allowlist); it's a no-op for
+      # the separate reason explained in the root docker-compose.yml.
       SESSION_HANDLER: "file"
       DB_WAL_MODE: "true"
       DB_TIMEOUT: "300"

@@ -23,23 +23,34 @@ RUN chown -R www-data:www-data /var/www/app/plugins/MarcusDevEnv
 # variable, so setting them in docker-compose.yml's environment: block
 # alone never reaches a real web request (only docker exec's shell and
 # PHP-CLI, which is misleading during troubleshooting since both LOOK
-# correct). See php-fpm-marcus-env.conf's own header comment for the
-# full, empirically-confirmed explanation (verified against
-# kanboard/kanboard:v1.2.53, which pins /etc/php84/php-fpm.d/ — this
-# image tracks :latest instead, so the PHP version's config directory
-# name isn't assumed; it's located at build time so this doesn't
-# silently break on a PHP version bump). Baked in at build time (not
-# bind-mounted) because this Dockerfile is what Railway/Fly.io build
-# from directly — no host filesystem access at deploy time there.
-COPY php-fpm-marcus-env.conf /tmp/marcus-env.conf
+# correct). See kanboard/php-fpm-env.conf's own header comment (used by
+# the root docker-compose.yml's bind mount) for the full,
+# empirically-confirmed explanation.
+#
+# Two mechanisms were tried and rejected before this one: (1) a
+# separate sibling conf file — silently never read, since this image's
+# pool conf loads env.conf by its EXACT filename
+# (`include = .../php-fpm.d/env.conf`), not a directory-wide glob;
+# confirmed live, this is why the first version of this fix didn't
+# work despite the file being correctly present on disk. (2) a SECOND
+# `include =` line pointing at that sibling file — PHP-FPM's own
+# config parser (sapi/fpm/fpm/fpm_conf.c) rejects a second `include`
+# directive within one file outright ("two includes at the same
+# time!"), which would have broken Kanboard's startup entirely rather
+# than just failing to forward two env vars. APPENDING these two lines
+# directly onto whatever env.conf the build finds — the SAME file
+# already trusted by the existing single include — sidesteps both
+# problems. Located dynamically rather than hardcoded to
+# /etc/php84/..., since this image tracks :latest (unlike the pinned
+# v1.2.53 the live diagnosis above was run against), so the PHP
+# version's directory name isn't assumed.
 RUN set -eu; \
-    fpm_d=$(find /etc -mindepth 2 -maxdepth 2 -type d -name 'php-fpm.d' | head -n1); \
-    if [ -z "$fpm_d" ]; then \
-        echo "ERROR: could not locate a php-fpm.d directory in this base image" >&2; \
+    env_conf=$(find /etc -type f -name 'env.conf' -path '*php-fpm*' | head -n1); \
+    if [ -z "$env_conf" ]; then \
+        echo "ERROR: could not locate php-fpm.d/env.conf in this base image — cannot forward SESSION_HANDLER/DB_WAL_MODE to PHP-FPM" >&2; \
         exit 1; \
     fi; \
-    cp /tmp/marcus-env.conf "$fpm_d/marcus-env.conf"; \
-    rm /tmp/marcus-env.conf
+    printf '\n; Marcus additions — see kanboard/php-fpm-env.conf for why\nenv[SESSION_HANDLER] = $SESSION_HANDLER\nenv[DB_WAL_MODE] = $DB_WAL_MODE\n' >> "$env_conf"
 
 # Expose Kanboard's HTTP port
 EXPOSE 80

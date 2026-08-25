@@ -68,11 +68,14 @@ services:
       # Bind-mount the plugin from source so edits are immediately testable
       - ./kanboard/plugins:/var/www/app/plugins
       # SESSION_HANDLER and DB_WAL_MODE below are otherwise silently
-      # discarded before PHP ever sees them — see
-      # kanboard/php-fpm-marcus-env.conf's own header comment for the
-      # full, empirically-confirmed explanation (PHP-FPM's env allowlist
-      # at /etc/php84/php-fpm.d/env.conf doesn't cover either variable).
-      - ./kanboard/php-fpm-marcus-env.conf:/etc/php84/php-fpm.d/marcus-env.conf:ro
+      # discarded before PHP ever sees them, no matter what this
+      # `environment:` block says — see kanboard/php-fpm-env.conf's own
+      # header comment for the full, empirically-confirmed explanation
+      # (PHP-FPM's own env allowlist doesn't cover either variable, and
+      # the file it's loaded from is referenced by exact filename, not
+      # a directory-wide glob — a same-named REPLACEMENT is required,
+      # not an additional sibling file or a second `include =` line).
+      - ./kanboard/php-fpm-env.conf:/etc/php84/php-fpm.d/env.conf:ro
     environment:
       # Browser-facing — embedded server-side into client-side fetch() URLs
       # by kanboard/plugins/MarcusDevEnv/Template/{board,task}/*.php
