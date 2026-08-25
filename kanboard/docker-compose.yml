@@ -69,6 +69,19 @@ services:
       # unbounded — PHP-FPM has a finite worker pool, so an unbounded wait
       # under sustained contention would freeze the whole UI instead of
       # surfacing an occasional error).
+      #
+      # IMPORTANT — SESSION_HANDLER and DB_WAL_MODE here do nothing on
+      # their own: PHP-FPM clears almost all env vars from what PHP
+      # scripts actually see, and this image's own env allowlist
+      # (php-fpm.d/env.conf) doesn't cover either variable — confirmed
+      # empirically (a real web request sees getenv('SESSION_HANDLER')
+      # === false even though `docker exec ... printenv`/`php -r` both
+      # show it correctly, since those bypass PHP-FPM entirely). The
+      # Dockerfile in this directory bakes in an additional
+      # php-fpm-marcus-env.conf to actually forward these two — see its
+      # own header comment for the full explanation. DB_TIMEOUT doesn't
+      # have this problem (it IS on env.conf's allowlist); it's a no-op
+      # for the separate reason explained in the root docker-compose.yml.
       SESSION_HANDLER: "file"
       DB_WAL_MODE: "true"
       DB_TIMEOUT: "300"

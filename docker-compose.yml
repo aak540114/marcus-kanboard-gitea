@@ -67,6 +67,12 @@ services:
       - kanboard_data:/var/www/app/data
       # Bind-mount the plugin from source so edits are immediately testable
       - ./kanboard/plugins:/var/www/app/plugins
+      # SESSION_HANDLER and DB_WAL_MODE below are otherwise silently
+      # discarded before PHP ever sees them — see
+      # kanboard/php-fpm-marcus-env.conf's own header comment for the
+      # full, empirically-confirmed explanation (PHP-FPM's env allowlist
+      # at /etc/php84/php-fpm.d/env.conf doesn't cover either variable).
+      - ./kanboard/php-fpm-marcus-env.conf:/etc/php84/php-fpm.d/marcus-env.conf:ro
     environment:
       # Browser-facing — embedded server-side into client-side fetch() URLs
       # by kanboard/plugins/MarcusDevEnv/Template/{board,task}/*.php
@@ -120,6 +126,26 @@ services:
       #   never a problem in practice (Kanboard sessions are short-lived
       #   anyway). Not a volume-mounted path: container-local /tmp is
       #   fine, sessions don't need to survive a container restart.
+      #
+      #   IMPORTANT — setting this env var ALONE does nothing on the
+      #   kanboard/kanboard:v1.2.53 image. Confirmed empirically against
+      #   a live container: `docker exec ... printenv SESSION_HANDLER`
+      #   and `php -r 'getenv(...)'` (PHP-CLI) both correctly show
+      #   "file", yet the crash still reproduces — because the actual
+      #   web request is served by a PHP-FPM WORKER, a separate process
+      #   whose environment PHP-FPM clears by default (clear_env). The
+      #   image ships an explicit allowlist at
+      #   /etc/php84/php-fpm.d/env.conf covering dozens of documented
+      #   settings (DB_DRIVER, DB_TIMEOUT, API_AUTHENTICATION_TOKEN,
+      #   ...) via `env[VARNAME] = $VARNAME` lines — but SESSION_HANDLER
+      #   and DB_WAL_MODE are simply not on that list, so
+      #   getenv('SESSION_HANDLER') is `false` for every real web
+      #   request regardless of this setting, and app/constants.php's
+      #   `getenv('SESSION_HANDLER') ?: 'db'` silently falls back to
+      #   'db' every time. The kanboard/php-fpm-marcus-env.conf bind
+      #   mount below (loaded from the SAME include directory as
+      #   env.conf) is what ACTUALLY makes this env var reach PHP — this
+      #   setting alone is necessary but not sufficient.
       #   DB_WAL_MODE: Kanboard's own app/constants.php already defaults
       #   this to true (getenv('DB_WAL_MODE') ?: true), so this is
       #   belt-and-suspenders — pinned explicitly rather than trusting a
@@ -128,7 +154,8 @@ services:
       #   src/cost_tracking/cost_store.py) always sets WAL explicitly too.
       #   WAL lets human UI reads proceed without blocking on Marcus's
       #   writes (and vice versa) instead of every access fighting over
-      #   one exclusive file lock.
+      #   one exclusive file lock. Same PHP-FPM allowlist gap as
+      #   SESSION_HANDLER above — also needs the bind-mounted conf file.
       #   DB_TIMEOUT: PDO::ATTR_TIMEOUT — SQLite's own busy_timeout
       #   mechanism, which internally RETRIES (sleeping with backoff) for
       #   up to this many seconds before giving up and throwing. Kept set
@@ -143,14 +170,17 @@ services:
       #   PicoDb's Sqlite driver (libs/picodb/lib/PicoDb/Driver/Sqlite.php)
       #   always falls back to its own hardcoded 30s regardless of what
       #   this is set to. Not worth patching around: SESSION_HANDLER=file
-      #   above already removes the dominant contention source (every
-      #   human page load/AJAX call previously writing to this same
-      #   file), so the built-in 30s should rarely be tested in practice.
-      #   If "database is locked" crashes recur even after that fix is
-      #   actually applied to a running container (see below), that 30s
-      #   ceiling — not this setting — is the next thing to raise, and
-      #   doing so needs a bind-mounted patch to DatabaseProvider.php
-      #   itself, not an env var.
+      #   (now actually applied via the bind-mounted conf below) already
+      #   removes the dominant contention source (every human page
+      #   load/AJAX call previously writing to this same file), so the
+      #   built-in 30s should rarely be tested in practice. If "database
+      #   is locked" crashes recur even after that fix, that 30s ceiling
+      #   — not this setting — is the next thing to raise, and doing so
+      #   needs a bind-mounted patch to DatabaseProvider.php itself, not
+      #   an env var. Unlike SESSION_HANDLER/DB_WAL_MODE above, DB_TIMEOUT
+      #   IS on env.conf's PHP-FPM allowlist and does reach PHP fine —
+      #   its no-op-ness is purely PicoDb's own SQLite driver ignoring it,
+      #   confirmed directly against that file, not an env-passthrough gap.
       SESSION_HANDLER: "file"
       DB_WAL_MODE: "true"
       DB_TIMEOUT: "300"
