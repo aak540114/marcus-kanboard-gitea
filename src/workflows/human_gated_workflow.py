@@ -5706,6 +5706,25 @@ class HumanGatedWorkflow:
                 main_branch=main_branch,
             )
             await self._post_comment(ticket_id, comment)
+            # Flag the card itself — visible on the board without opening
+            # the ticket — so a card bouncing back to Ready isn't mistaken
+            # for a fresh, never-started ticket. Mirrors the human-gate
+            # merge-failure path in _merge_ticket_to_main (see its matching
+            # comment); this AI-gate path used to only post the comment
+            # above, silently missing the same visible flag. Best-effort:
+            # only a KanboardKanban-specific capability, never blocks the
+            # rest of the recovery flow.
+            if hasattr(self._kanban, "set_merge_conflict_flag"):
+                try:
+                    await self._kanban.set_merge_conflict_flag(
+                        ticket_id, present=True
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Could not set merge-conflict flag for %s: %s",
+                        ticket_id,
+                        exc,
+                    )
             # Send the ticket back to an AI agent to rebase and resolve the
             # conflict itself — see the matching comment in
             # _merge_ticket_to_main. Without this the ticket stayed
@@ -5758,6 +5777,14 @@ class HumanGatedWorkflow:
             pass
 
         await self._dev_env.stop(ticket_id, self._provider)
+
+        # Clear any merge-conflict flag from a previous failed attempt on
+        # this same ticket — it's resolved now. Mirrors the human-gate
+        # merge-success path (_merge_ticket_to_main); a ticket that failed
+        # to auto-merge once, got parked in Ready for rebase (flagged
+        # above), and now succeeds on retry must not keep showing a stale
+        # "still broken" tag once it's actually Done and merged.
+        await self._clear_merge_conflict_flag(ticket_id)
 
         try:
             await self._kanban.move_task_to_column(ticket_id, "done")

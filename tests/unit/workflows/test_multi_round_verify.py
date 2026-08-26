@@ -435,6 +435,81 @@ class TestMergeFailureClearsCounter:
         assert any("rebase" in body.lower() for body in posted_bodies)
 
 
+class TestMergeFailureFlagsTheCardVisibly:
+    """Regression: the AI-gate auto-merge failure path (_autocomplete_
+    ticket) used to only post a merge-conflict COMMENT — unlike the
+    human-gate path (_merge_ticket_to_main), it never set the visible
+    "merge-conflict" card tag, so a card bouncing back to Ready with
+    verify_count > 0 showed a "Verify N" tag (correctly cleared before
+    the merge attempt) but no indication anything had actually failed
+    without opening the ticket to read comments."""
+
+    @pytest.mark.asyncio
+    async def test_merge_failure_sets_the_visible_tag(self, workflow):
+        workflow._gate.set_project_gate(1, "ai")
+        workflow._gate.set_project_verify_count(1, 1)
+        workflow._verifier.verify = AsyncMock(return_value=_pass_result())
+        workflow._branch.merge_to_main = AsyncMock(return_value=False)
+
+        record = _make_record()
+        workflow._lifecycle.get_or_create("42", "kanboard")
+        workflow._lifecycle._records[("42", "kanboard")] = record
+
+        result = await workflow._autocomplete_ticket("42", record)
+
+        assert result is False
+        workflow._kanban.set_merge_conflict_flag.assert_any_call(
+            "42", present=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_tag_set_failure_does_not_break_the_recovery_flow(
+        self, workflow
+    ):
+        """Best-effort: a KanboardKanban RPC error setting the tag must
+        never prevent the ticket from being correctly parked for rebase."""
+        workflow._gate.set_project_gate(1, "ai")
+        workflow._gate.set_project_verify_count(1, 1)
+        workflow._verifier.verify = AsyncMock(return_value=_pass_result())
+        workflow._branch.merge_to_main = AsyncMock(return_value=False)
+        workflow._kanban.set_merge_conflict_flag = AsyncMock(
+            side_effect=RuntimeError("kanboard RPC timeout")
+        )
+
+        record = _make_record()
+        workflow._lifecycle.get_or_create("42", "kanboard")
+        workflow._lifecycle._records[("42", "kanboard")] = record
+
+        result = await workflow._autocomplete_ticket("42", record)
+
+        assert result is False
+        workflow._kanban.move_task_to_column.assert_any_call("42", "ready")
+
+
+class TestSuccessfulRetryClearsTheMergeConflictTag:
+    """A ticket that failed to auto-merge once (tag set above), gets
+    fixed and re-signals, must have the stale tag cleared once it
+    actually succeeds and reaches Done — otherwise a finished, merged
+    ticket keeps showing a "still broken" tag forever."""
+
+    @pytest.mark.asyncio
+    async def test_successful_merge_clears_the_tag(self, workflow):
+        workflow._gate.set_project_gate(1, "ai")
+        workflow._gate.set_project_verify_count(1, 0)  # skip verification
+        workflow._branch.merge_to_main = AsyncMock(return_value=True)
+
+        record = _make_record()
+        workflow._lifecycle.get_or_create("42", "kanboard")
+        workflow._lifecycle._records[("42", "kanboard")] = record
+
+        result = await workflow._autocomplete_ticket("42", record)
+
+        assert result is True
+        workflow._kanban.set_merge_conflict_flag.assert_any_call(
+            "42", present=False
+        )
+
+
 class TestFindingsSummaryIncludedInComment:
     """The whole point of AI Verify posting anything at all: whatever
     gaps/bugs the verifier actually found must be summarized, verbatim,
