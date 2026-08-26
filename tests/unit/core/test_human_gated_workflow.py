@@ -2498,6 +2498,136 @@ class TestGetWorkContextEnrichedFields:
 
 
 # ---------------------------------------------------------------------------
+# get_work_context: surfaces the CURRENT project Tech Stack, and instructs
+# the agent to reconcile it before finishing — regression coverage for the
+# reported gap: an agent builds something that adds to or contradicts the
+# documented stack, never updates the description, and the NEXT ticket's
+# preview breaks with no bug ticket having been filed for it.
+# ---------------------------------------------------------------------------
+
+
+class TestGetWorkContextTechStackReconciliation:
+    @pytest.mark.asyncio
+    async def test_project_tech_stack_present_when_description_parses(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        lifecycle.get_or_create("80", "kanboard")
+        mock_kanban.get_task_by_id = AsyncMock(return_value=_make_task_mock())
+        from src.core.project_description import ProjectStack
+
+        fake_stack = ProjectStack(
+            language="nodejs", framework="Express",
+            install_cmd="npm install", dev_cmd="npm start",
+        )
+        with patch(
+            "src.core.project_description.ProjectDescriptionManager"
+        ) as MockMgr:
+            MockMgr.return_value.get_stack.return_value = fake_stack
+            ctx = await workflow.get_work_context("80")
+
+        assert ctx["project_tech_stack"] == {
+            "language": "nodejs",
+            "framework": "Express",
+            "install_cmd": "npm install",
+            "dev_cmd": "npm start",
+        }
+
+    @pytest.mark.asyncio
+    async def test_project_tech_stack_none_when_no_description(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        lifecycle.get_or_create("81", "kanboard")
+        mock_kanban.get_task_by_id = AsyncMock(return_value=_make_task_mock())
+        with patch(
+            "src.core.project_description.ProjectDescriptionManager"
+        ) as MockMgr:
+            MockMgr.return_value.get_stack.return_value = None
+            ctx = await workflow.get_work_context("81")
+
+        assert ctx["project_tech_stack"] is None
+
+    @pytest.mark.asyncio
+    async def test_project_tech_stack_none_when_no_project_id(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """A ticket whose project can't be resolved must not crash — the
+        stack just isn't available, matching every other project-scoped
+        field's degradation in this method."""
+        lifecycle.get_or_create("82", "kanboard")
+        task = MagicMock()
+        task.name = "no project"
+        task.description = "desc"
+        task.source_context = {}
+        task.labels = []
+        mock_kanban.get_task_by_id = AsyncMock(return_value=task)
+
+        ctx = await workflow.get_work_context("82")
+
+        assert ctx["project_tech_stack"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_lookup_failure_degrades_to_none_not_a_crash(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        lifecycle.get_or_create("83", "kanboard")
+        mock_kanban.get_task_by_id = AsyncMock(return_value=_make_task_mock())
+        with patch(
+            "src.core.project_description.ProjectDescriptionManager",
+            side_effect=RuntimeError("disk full"),
+        ):
+            ctx = await workflow.get_work_context("83")
+
+        assert ctx["project_tech_stack"] is None
+        assert ctx["ticket_id"] == "83"  # rest of the context still works
+
+    @pytest.mark.asyncio
+    async def test_instructions_tell_the_agent_to_reconcile_before_finishing(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """The instructions field must actually mention the reconciliation
+        step and name the real tool — this is the only channel an agent
+        reads that closes the reported gap, so its exact wording matters."""
+        lifecycle.get_or_create("84", "kanboard")
+        mock_kanban.get_task_by_id = AsyncMock(return_value=_make_task_mock())
+        with patch(
+            "src.core.project_description.ProjectDescriptionManager"
+        ) as MockMgr:
+            MockMgr.return_value.get_stack.return_value = None
+            ctx = await workflow.get_work_context("84")
+
+        assert "update_project_description" in ctx["instructions"]
+        assert "project_tech_stack" in ctx["instructions"]
+        # The reconciliation step must come BEFORE signal_ready_for_review,
+        # not after — an agent that already signaled done has moved on.
+        reconcile_pos = ctx["instructions"].index("update_project_description")
+        signal_pos = ctx["instructions"].index("signal_ready_for_review")
+        assert reconcile_pos < signal_pos
+
+
+class TestWorkerInstructionsTechStackReconciliation:
+    """Same coverage for orchestrate mode's _worker_instructions(), the
+    parallel instruction channel for the marcus_work loop."""
+
+    def test_mentions_update_project_description_before_done_report(
+        self, workflow
+    ):
+        text = workflow._worker_instructions()
+        assert "update_project_description" in text
+        reconcile_pos = text.index("update_project_description")
+        done_pos = text.index('report="DONE')
+        assert reconcile_pos < done_pos
+
+    def test_explains_the_human_lock_is_automatic(self, workflow):
+        """Must reassure the agent it never needs to check/work around a
+        human-locked description itself — Marcus already enforces that,
+        and telling the agent so avoids it either skipping the update
+        out of caution or trying to force one."""
+        text = workflow._worker_instructions()
+        assert "human" in text.lower()
+        assert "ignores" in text.lower() or "automatic" in text.lower()
+
+
+# ---------------------------------------------------------------------------
 # get_work_context: on-demand Gitea repo provisioning via ProjectSyncWorkflow
 # ---------------------------------------------------------------------------
 

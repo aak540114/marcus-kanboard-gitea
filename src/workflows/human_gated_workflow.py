@@ -1452,11 +1452,19 @@ class HumanGatedWorkflow:
             "id/email>\", \"used\": <number>, \"limit\": <number or null>, "
             "\"unit\": \"<e.g. tokens>\"}` (null/omit `limit` for a self-hosted "
             "or unlimited model) so the human sees it on the ticket.\n"
-            "4. When EVERY acceptance criterion is met, FIRST push your final "
-            "commit, THEN call `marcus_work` with `report=\"DONE - <one-line "
-            "summary>\"` (start the report with the word DONE). If you hit "
-            "something only a human can resolve, call with `report=\"BLOCKED - "
-            "<reason>\"`.\n"
+            "4. When EVERY acceptance criterion is met: if what you built "
+            "added, changed, or contradicted anything about the project's "
+            "tech stack (a new dependency, a different dev/install "
+            "command, a new architectural piece) beyond what "
+            "`get_project_description` already documents, call "
+            "`update_project_description` FIRST — this is what the NEXT "
+            "ticket's agent and the dev-environment preview both rely on. "
+            "If a human already edited the description, Marcus ignores "
+            "this update automatically; you never need to check that "
+            "yourself. THEN push your final commit, and call `marcus_work` "
+            "with `report=\"DONE - <one-line summary>\"` (start the report "
+            "with the word DONE). If you hit something only a human can "
+            "resolve, call with `report=\"BLOCKED - <reason>\"`.\n"
             "DO NOT run dev servers, start Docker containers, or bind host "
             "ports (no `npm run dev`, `python -m http.server`, `docker run`, "
             "etc.). Your ONLY outputs are commits pushed to the branch. The "
@@ -4351,6 +4359,32 @@ class HumanGatedWorkflow:
             and self._gate.get_effective_gate(ticket_id, kanboard_project_id) == "ai"
         )
 
+        # Current project Tech Stack, so an agent can see up front what's
+        # ALREADY documented and judge whether its own work is going to
+        # add to or contradict it — see the "instructions" field's final
+        # step. Previously this required a separate get_project_description
+        # call an agent had no particular reason to make; surfacing it here
+        # means every agent sees it, not just ones that happen to look.
+        project_tech_stack: Optional[Dict[str, Any]] = None
+        if kanboard_project_id is not None:
+            try:
+                from src.core.project_description import ProjectDescriptionManager
+
+                stack = ProjectDescriptionManager().get_stack(kanboard_project_id)
+                if stack is not None:
+                    project_tech_stack = {
+                        "language": stack.language,
+                        "framework": stack.framework,
+                        "install_cmd": stack.install_cmd,
+                        "dev_cmd": stack.dev_cmd,
+                    }
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "Could not resolve tech stack for project %s: %s",
+                    kanboard_project_id,
+                    exc,
+                )
+
         return {
             "ticket_id": ticket_id,
             "provider": self._provider,
@@ -4376,6 +4410,12 @@ class HumanGatedWorkflow:
             "labels": labels,
             "links": links,
             "recent_comments": recent_comments,
+            # The project's currently-documented Tech Stack (None if the
+            # project has no description yet, or it's not parseable) — see
+            # instructions step 5 below. get_project_description returns
+            # the same shape plus the full markdown, for when this summary
+            # isn't enough context (e.g. checking Architecture Notes too).
+            "project_tech_stack": project_tech_stack,
             # Informational reconnect hint. Hardcoding localhost handed a
             # REMOTE agent a URL pointing at its own machine; honor MARCUS_URL
             # (the deployment's public base) when set.
@@ -4393,7 +4433,17 @@ class HumanGatedWorkflow:
                 "remote; use `git checkout -B <branch_name> origin/<branch_name>`)\n"
                 "3. Read the description and acceptance_criteria\n"
                 "4. Implement the work; commit and `git push origin <branch_name>`\n"
-                "5. Call signal_ready_for_review when done"
+                "5. Before finishing: compare what you built against "
+                "project_tech_stack above. If you added, changed, or "
+                "contradicted anything about the tech stack (a new "
+                "dependency, a different dev/install command, a new "
+                "architectural piece) that isn't already reflected there, "
+                "call update_project_description so the NEXT ticket's agent "
+                "— and the dev-environment preview — see it too. If a human "
+                "already edited the description, Marcus ignores this "
+                "update automatically; you never need to check that "
+                "yourself or work around it.\n"
+                "6. Call signal_ready_for_review when done"
                 + (
                     " — NOTE: gate_mode is 'ai', so this will auto-merge and "
                     "complete without human review."

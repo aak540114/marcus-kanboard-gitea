@@ -1016,8 +1016,11 @@ def get_tool_definitions(role: str = "agent") -> List[types.Tool]:
             description=(
                 "Return everything a new AI agent needs to start working on a "
                 "ticket: title, description, acceptance criteria, git branch name, "
-                "local repo path, Gitea URL, and step-by-step instructions. "
-                "Call this first when assigned to a Kanboard ticket."
+                "local repo path, Gitea URL, the project's current tech stack "
+                "(project_tech_stack), and step-by-step instructions — including "
+                "a final step to update the project description if your work "
+                "changes or adds to that tech stack. Call this first when "
+                "assigned to a Kanboard ticket."
             ),
             inputSchema={
                 "type": "object",
