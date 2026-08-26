@@ -613,7 +613,9 @@ class KanboardKanban(KanbanInterface):
     #: SubtaskModel.php) — 0=todo, 1=in progress, 2=done.
     _SUBTASK_STATUS_DONE = 2
 
-    async def create_subtask(self, task_id: str, title: str) -> Optional[str]:
+    async def create_subtask(
+        self, task_id: str, title: str, assignee: Optional[str] = None
+    ) -> Optional[str]:
         """Create a native Kanboard subtask on *task_id*.
 
         Subtasks render in Kanboard's own built-in "Subtasks" section on
@@ -628,6 +630,16 @@ class KanboardKanban(KanbanInterface):
             The task to attach the subtask to (the parent ticket).
         title : str
             Subtask title.
+        assignee : Optional[str]
+            Kanboard user ID or username to assign the subtask to (same
+            format :meth:`_resolve_user_id` / :meth:`assign_task`
+            accept). Without this, ``createSubtask``'s ``user_id``
+            defaults to ``0`` (unassigned), which is why the native
+            "Assignee" column on the Sub-tasks table was always blank —
+            unlike "Internal Links", a plain task-to-task link, which
+            shows the LINKED task's own real assignee automatically and
+            was never affected. Best-effort: an unresolvable assignee
+            just leaves the subtask unassigned; never blocks creation.
 
         Returns
         -------
@@ -636,12 +648,20 @@ class KanboardKanban(KanbanInterface):
         """
         if self._client is None:
             raise RuntimeError("Call connect() before create_subtask()")
-        result = await self._rpc(
-            "createSubtask", task_id=int(task_id), title=title
-        )
+        kwargs: Dict[str, Any] = {"task_id": int(task_id), "title": title}
+        if assignee:
+            user_id = await self._resolve_user_id(assignee)
+            if user_id is not None:
+                kwargs["user_id"] = user_id
+        result = await self._rpc("createSubtask", **kwargs)
         return str(result) if result else None
 
-    async def mark_subtask_done(self, task_id: str, title_prefix: str) -> bool:
+    async def mark_subtask_done(
+        self,
+        task_id: str,
+        title_prefix: str,
+        time_spent_hours: Optional[float] = None,
+    ) -> bool:
         """Mark done the subtask on *task_id* whose title starts with
         *title_prefix*, matching the id embedded by :meth:`create_subtask`.
 
@@ -656,6 +676,15 @@ class KanboardKanban(KanbanInterface):
             The task the subtask lives on (the parent ticket).
         title_prefix : str
             Prefix identifying which subtask to update.
+        time_spent_hours : Optional[float]
+            Elapsed hours to record in the subtask's "Time spent" field —
+            Kanboard's own float-hours convention (confirmed directly
+            against app/Template/subtask/timer.php on v1.2.53:
+            ``t('%sh spent', n($subtask['time_spent']))`` — the raw
+            number IS hours, no further conversion). ``None`` leaves it
+            unset (0 from creation), which is why the native "Time
+            Tracking" column was always blank before this parameter
+            existed — nothing ever wrote to it.
 
         Returns
         -------
@@ -667,12 +696,14 @@ class KanboardKanban(KanbanInterface):
         subtasks = await self._rpc("getAllSubtasks", task_id=int(task_id))
         for st in subtasks or []:
             if str(st.get("title", "")).startswith(title_prefix):
-                await self._rpc(
-                    "updateSubtask",
-                    id=int(st["id"]),
-                    task_id=int(task_id),
-                    status=self._SUBTASK_STATUS_DONE,
-                )
+                kwargs: Dict[str, Any] = {
+                    "id": int(st["id"]),
+                    "task_id": int(task_id),
+                    "status": self._SUBTASK_STATUS_DONE,
+                }
+                if time_spent_hours is not None:
+                    kwargs["time_spent"] = round(time_spent_hours, 2)
+                await self._rpc("updateSubtask", **kwargs)
                 return True
         return False
 

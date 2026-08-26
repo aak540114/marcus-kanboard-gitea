@@ -2048,7 +2048,9 @@ class HumanGatedWorkflow:
                     # listing every child clearly. The "#<child_id> " prefix
                     # lets _maybe_complete_parent find and update the right
                     # entry later without storing a subtask id anywhere.
-                    await create_subtask(ticket_id, f"#{child_id} {s['title']}")
+                    await create_subtask(
+                        ticket_id, f"#{child_id} {s['title']}", assignee=owner
+                    )
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("Could not create subtask entry: %s", exc)
             child_ids.append(child_id)
@@ -3487,6 +3489,40 @@ class HumanGatedWorkflow:
         )
         return m.group(1) if m else None
 
+    @staticmethod
+    def _elapsed_hours_to_merge(record: TicketRecord) -> Optional[float]:
+        """Hours from a ticket's creation to when its branch merged.
+
+        Feeds the native Kanboard Sub-tasks table's "Time Tracking"
+        column (see :meth:`~src.integrations.providers.kanboard_kanban.
+        KanboardKanban.mark_subtask_done`'s ``time_spent_hours``
+        parameter) — that column was always blank before this existed,
+        since nothing ever wrote to it. Uses ``created_at``/``merged_at``
+        rather than scanning ``history`` for "to": "ready"/"done"
+        entries: both are already-parsed ``datetime`` fields set exactly
+        once per ticket (``merged_at`` via :meth:`~src.core.ticket_
+        lifecycle.TicketLifecycleManager.set_merged`, called from every
+        completion path — human-gate merge, AI-gate auto-merge, and
+        parent-ticket completion alike), so there is no ambiguity to
+        resolve about which of possibly several "ready"/"done" history
+        entries to pick for a ticket that bounced back and forth.
+
+        Parameters
+        ----------
+        record : TicketRecord
+            The ticket to measure.
+
+        Returns
+        -------
+        Optional[float]
+            Elapsed hours, or ``None`` if the ticket hasn't merged yet
+            (``merged_at`` unset) — nothing meaningful to report.
+        """
+        if record.merged_at is None:
+            return None
+        delta = record.merged_at - record.created_at
+        return max(delta.total_seconds() / 3600.0, 0.0)
+
     def _children_of(self, parent_id: str) -> List[TicketRecord]:
         """Return the sub-ticket records created for *parent_id*."""
         marker = f"<!-- Sub-ticket of #{parent_id} -->"
@@ -3602,7 +3638,11 @@ class HumanGatedWorkflow:
             mark_subtask_done = getattr(self._kanban, "mark_subtask_done", None)
             if mark_subtask_done is not None:
                 try:
-                    await mark_subtask_done(parent_id, f"#{child_id} ")
+                    await mark_subtask_done(
+                        parent_id,
+                        f"#{child_id} ",
+                        time_spent_hours=self._elapsed_hours_to_merge(child),
+                    )
                 except Exception as exc:  # noqa: BLE001
                     logger.debug(
                         "Could not sync subtask status for %s: %s", child_id, exc

@@ -2029,6 +2029,58 @@ class TestCreateSubtask:
 
         assert result is None
 
+    @pytest.mark.asyncio
+    async def test_assigns_subtask_when_assignee_resolves(self, kanban):
+        """A resolvable assignee is passed through as createSubtask's
+        user_id — this is what populates the native "Assignee" column on
+        the Sub-tasks table, which was always blank before this param
+        existed."""
+        kanban._client = AsyncMock()
+        kanban._rpc = AsyncMock(return_value=42)
+        kanban._resolve_user_id = AsyncMock(return_value=7)
+
+        result = await kanban.create_subtask(
+            "10", "#11 Do the thing", assignee="alice"
+        )
+
+        assert result == "42"
+        kanban._resolve_user_id.assert_awaited_once_with("alice")
+        kanban._rpc.assert_awaited_once_with(
+            "createSubtask", task_id=10, title="#11 Do the thing", user_id=7
+        )
+
+    @pytest.mark.asyncio
+    async def test_omits_user_id_when_assignee_unresolvable(self, kanban):
+        """An assignee that can't be resolved to a Kanboard user degrades
+        gracefully — the subtask is still created, just unassigned,
+        instead of failing outright."""
+        kanban._client = AsyncMock()
+        kanban._rpc = AsyncMock(return_value=42)
+        kanban._resolve_user_id = AsyncMock(return_value=None)
+
+        result = await kanban.create_subtask(
+            "10", "#11 Do the thing", assignee="ghost"
+        )
+
+        assert result == "42"
+        kanban._rpc.assert_awaited_once_with(
+            "createSubtask", task_id=10, title="#11 Do the thing"
+        )
+
+    @pytest.mark.asyncio
+    async def test_omits_user_id_when_assignee_not_given(self, kanban):
+        """No assignee at all → no resolution attempted, no user_id sent."""
+        kanban._client = AsyncMock()
+        kanban._rpc = AsyncMock(return_value=42)
+        kanban._resolve_user_id = AsyncMock(return_value=7)
+
+        await kanban.create_subtask("10", "#11 Do the thing")
+
+        kanban._resolve_user_id.assert_not_awaited()
+        kanban._rpc.assert_awaited_once_with(
+            "createSubtask", task_id=10, title="#11 Do the thing"
+        )
+
 
 class TestMarkSubtaskDone:
     """Test mark_subtask_done()."""
@@ -2083,6 +2135,62 @@ class TestMarkSubtaskDone:
         assert all(
             c.args[0] != "updateSubtask" for c in kanban._rpc.call_args_list
         )
+
+    @pytest.mark.asyncio
+    async def test_records_time_spent_when_given(self, kanban):
+        """time_spent_hours is forwarded to updateSubtask's time_spent
+        field (rounded to 2dp) — this is what populates the native "Time
+        Tracking" column, which was always blank before this param
+        existed since nothing ever wrote to it."""
+        kanban._client = AsyncMock()
+
+        async def fake_rpc(method, **params):
+            if method == "getAllSubtasks":
+                return [{"id": 6, "title": "#11 Do the thing"}]
+            if method == "updateSubtask":
+                return True
+            return None
+
+        kanban._rpc = AsyncMock(side_effect=fake_rpc)
+
+        result = await kanban.mark_subtask_done(
+            "10", "#11 ", time_spent_hours=2.5001
+        )
+
+        assert result is True
+        update_call = [
+            c for c in kanban._rpc.call_args_list if c.args[0] == "updateSubtask"
+        ][0]
+        assert update_call.kwargs == {
+            "id": 6,
+            "task_id": 10,
+            "status": 2,
+            "time_spent": 2.5,
+        }
+
+    @pytest.mark.asyncio
+    async def test_omits_time_spent_when_not_given(self, kanban):
+        """No time_spent_hours → updateSubtask's time_spent is left unset
+        entirely, not sent as 0 or None."""
+        kanban._client = AsyncMock()
+
+        async def fake_rpc(method, **params):
+            if method == "getAllSubtasks":
+                return [{"id": 6, "title": "#11 Do the thing"}]
+            if method == "updateSubtask":
+                return True
+            return None
+
+        kanban._rpc = AsyncMock(side_effect=fake_rpc)
+
+        result = await kanban.mark_subtask_done("10", "#11 ")
+
+        assert result is True
+        update_call = [
+            c for c in kanban._rpc.call_args_list if c.args[0] == "updateSubtask"
+        ][0]
+        assert update_call.kwargs == {"id": 6, "task_id": 10, "status": 2}
+        assert "time_spent" not in update_call.kwargs
 
 
 # ---------------------------------------------------------------------------

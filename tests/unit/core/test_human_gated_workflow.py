@@ -29,6 +29,7 @@ from src.core.events import Events
 from src.core.models import TaskStatus
 from src.core.ticket_lifecycle import (
     TicketLifecycleManager,
+    TicketRecord,
     TicketState,
 )
 from src.workflows.human_gated_workflow import HumanGatedWorkflow
@@ -5421,7 +5422,13 @@ class TestParentAutoComplete:
 
         await workflow._maybe_complete_parent("216")
 
-        mock_kanban.mark_subtask_done.assert_awaited_once_with("215", "#216 ")
+        # time_spent_hours is None here because this test drives the
+        # child straight to DONE via plain transition() calls, never
+        # actually merging it (set_merged is never called) — see
+        # TestSubtaskTimeTracking below for the populated case.
+        mock_kanban.mark_subtask_done.assert_awaited_once_with(
+            "215", "#216 ", time_spent_hours=None
+        )
         assert lifecycle.get("215", "kanboard").state == TicketState.BLOCKED
 
     @pytest.mark.asyncio
@@ -6040,6 +6047,182 @@ class TestReconcileBlockedParents:
         ]
         assert ("268", "blocked") not in moves
         assert ("268", "waiting for human") in moves
+
+
+class TestElapsedHoursToMerge:
+    """HumanGatedWorkflow._elapsed_hours_to_merge — feeds the native
+    Kanboard Sub-tasks table's "Time Tracking" column, which was always
+    blank before this existed since nothing ever computed or wrote to
+    it."""
+
+    def _record(self, created_at, merged_at=None):
+        return TicketRecord(
+            ticket_id="1", provider="kanboard", created_at=created_at,
+            merged_at=merged_at,
+        )
+
+    def test_none_when_never_merged(self, workflow):
+        record = self._record(created_at=datetime.now(timezone.utc))
+        assert workflow._elapsed_hours_to_merge(record) is None
+
+    def test_computes_hours_between_created_and_merged(self, workflow):
+        created = datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc)
+        merged = created + timedelta(hours=2, minutes=30)
+        record = self._record(created_at=created, merged_at=merged)
+
+        assert workflow._elapsed_hours_to_merge(record) == pytest.approx(2.5)
+
+    def test_computes_multi_day_spans_correctly(self, workflow):
+        created = datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc)
+        merged = created + timedelta(days=1, hours=3)
+        record = self._record(created_at=created, merged_at=merged)
+
+        assert workflow._elapsed_hours_to_merge(record) == pytest.approx(27.0)
+
+    def test_never_returns_negative_on_clock_skew(self, workflow):
+        """A merged_at earlier than created_at (clock skew, or a caller
+        passing an explicit timestamp out of order) must clamp to 0, not
+        report a nonsensical negative duration."""
+        created = datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc)
+        merged = created - timedelta(hours=1)
+        record = self._record(created_at=created, merged_at=merged)
+
+        assert workflow._elapsed_hours_to_merge(record) == 0.0
+
+
+class TestSubtaskTimeTrackingAndAssignee:
+    """Regression: the native Kanboard Sub-tasks table's Assignee and
+    Time Tracking columns were always blank — create_subtask never
+    passed a user_id, and nothing ever wrote a time_spent value on
+    completion, unlike the "Internal Links" table which shows a linked
+    task's real assignee automatically (a different Kanboard UI
+    element, unaffected)."""
+
+    def _child(self, lifecycle, tid, parent):
+        lifecycle.get_or_create(
+            tid, "kanboard",
+            acceptance_criteria=f"- [ ] x\n<!-- Sub-ticket of #{parent} -->",
+        )
+
+    @pytest.mark.asyncio
+    async def test_completion_passes_elapsed_hours_to_mark_subtask_done(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        mock_kanban.mark_subtask_done = AsyncMock(return_value=True)
+        lifecycle.get_or_create("300", "kanboard")  # parent
+        lifecycle.human_transition("300", "kanboard", TicketState.BLOCKED)
+        self._child(lifecycle, "301", "300")
+        lifecycle.transition("301", "kanboard", TicketState.READY)
+        lifecycle.transition("301", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("301", "kanboard", TicketState.DONE)
+        lifecycle.set_merged(
+            "301", "kanboard",
+            merged_at=lifecycle.get("301", "kanboard").created_at
+            + timedelta(hours=4),
+        )
+
+        await workflow._maybe_complete_parent("301")
+
+        mock_kanban.mark_subtask_done.assert_awaited_once_with(
+            "300", "#301 ", time_spent_hours=pytest.approx(4.0)
+        )
+
+    @pytest.mark.asyncio
+    async def test_decompose_creates_subtasks_with_the_owner_assigned(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        lifecycle.get_or_create("310", "kanboard")
+        lifecycle.transition("310", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("310", "kanboard", "alice")
+        lifecycle.update_acceptance_criteria(
+            "310", "kanboard",
+            "- [ ] a\n- [ ] b\n- [ ] c\n- [ ] d", "hash",
+        )
+
+        async def fake_llm(prompt):
+            return (
+                '{"subtasks": ['
+                '{"title": "Backend", "description": "api", '
+                '"acceptance_criteria": "- [ ] api"}, '
+                '{"title": "Frontend", "description": "ui", '
+                '"acceptance_criteria": "- [ ] ui"}'
+                "]}"
+            )
+
+        workflow._llm_generate = fake_llm
+        created = {"n": 400}
+
+        async def fake_create(data):
+            created["n"] += 1
+            t = MagicMock()
+            t.id = str(created["n"])
+            t.name = data["name"]
+            return t
+
+        mock_kanban.create_task = AsyncMock(side_effect=fake_create)
+        mock_kanban.create_task_link = AsyncMock(return_value=True)
+        mock_kanban.create_subtask = AsyncMock(return_value="90")
+        parent = MagicMock(description="do a lot")
+        parent.name = "Big"
+        parent.source_context = {"kanboard_task": {"project_id": 3}}
+        mock_kanban.get_task_by_id = AsyncMock(return_value=parent)
+
+        await workflow.decompose_ticket("310")
+
+        mock_kanban.create_subtask.assert_any_await(
+            "310", "#401 Backend", assignee="alice"
+        )
+        mock_kanban.create_subtask.assert_any_await(
+            "310", "#402 Frontend", assignee="alice"
+        )
+
+    @pytest.mark.asyncio
+    async def test_decompose_omits_assignee_when_parent_unassigned(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        lifecycle.get_or_create("320", "kanboard")
+        lifecycle.transition("320", "kanboard", TicketState.READY)
+        lifecycle.update_acceptance_criteria(
+            "320", "kanboard",
+            "- [ ] a\n- [ ] b\n- [ ] c\n- [ ] d", "hash",
+        )
+
+        async def fake_llm(prompt):
+            return (
+                '{"subtasks": ['
+                '{"title": "Backend", "description": "api", '
+                '"acceptance_criteria": "- [ ] api"}, '
+                '{"title": "Frontend", "description": "ui", '
+                '"acceptance_criteria": "- [ ] ui"}'
+                "]}"
+            )
+
+        workflow._llm_generate = fake_llm
+        created = {"n": 500}
+
+        async def fake_create(data):
+            created["n"] += 1
+            t = MagicMock()
+            t.id = str(created["n"])
+            t.name = data["name"]
+            return t
+
+        mock_kanban.create_task = AsyncMock(side_effect=fake_create)
+        mock_kanban.create_task_link = AsyncMock(return_value=True)
+        mock_kanban.create_subtask = AsyncMock(return_value="91")
+        parent = MagicMock(description="do a lot")
+        parent.name = "Big"
+        parent.source_context = {"kanboard_task": {"project_id": 3}}
+        mock_kanban.get_task_by_id = AsyncMock(return_value=parent)
+
+        await workflow.decompose_ticket("320")
+
+        mock_kanban.create_subtask.assert_any_await(
+            "320", "#501 Backend", assignee=None
+        )
+        mock_kanban.create_subtask.assert_any_await(
+            "320", "#502 Frontend", assignee=None
+        )
 
 
 class TestParentAutoCompleteEndToEnd:
