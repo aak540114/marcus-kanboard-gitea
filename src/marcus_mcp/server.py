@@ -3961,6 +3961,50 @@ _STACK_FRAMEWORK_LABELS: Dict[str, str] = {
     "python-django": "Django",
 }
 
+#: Keyword -> detect_project_type()-style key, used by _declared_stack_key
+#: to map a declared Python framework onto the same key-space so a
+#: same-language subtype mismatch (declared "Python" without naming
+#: Django, repo actually has manage.py) can be compared against the
+#: repo-detected key, not just the language.
+_PYTHON_FRAMEWORK_KEYS: Dict[str, str] = {
+    "django": "python-django",
+    "flask": "python-flask",
+    "fastapi": "python-fastapi",
+}
+
+
+def _declared_stack_key(project_stack: Any) -> str:
+    """Map a declared ``ProjectStack`` onto the same key-space
+    :func:`~src.core.dev_environment.detect_project_type` returns (e.g.
+    ``"python-django"``, ``"nodejs"``, or the bare ``"python"`` catch-all).
+
+    Needed because a mismatch can be same-language: a description that
+    says "Python" without specifically naming Django (or names the wrong
+    Python framework) looks identical to a correct declaration if only
+    ``language`` is compared — :func:`_reconcile_stack_with_repo` used to
+    do exactly that, so a repo that unmistakably has ``manage.py`` (Django)
+    but whose declared framework was missing/wrong never got corrected,
+    and every preview kept running the wrong dev command.
+
+    Parameters
+    ----------
+    project_stack : ProjectStack
+        The stack parsed from a project's stored description.
+
+    Returns
+    -------
+    str
+        A key like ``"python-django"``, ``"nodejs"``, or ``"python"``.
+    """
+    language = (project_stack.language or "").lower()
+    if language == "python":
+        framework = (project_stack.framework or "").lower()
+        for keyword, key in _PYTHON_FRAMEWORK_KEYS.items():
+            if keyword in framework:
+                return key
+        return "python"
+    return language
+
 #: STACK_CONFIGS keys that map to a human-readable "Language" field value.
 _STACK_LANGUAGE_LABELS: Dict[str, str] = {
     "nodejs": "Node.js",
@@ -3992,24 +4036,43 @@ def _reconcile_stack_with_repo(
     normal workflow ever prompts it to compare the declared stack against
     the real code it's actually working in, even though the tool to
     correct it (``apply_agent_project_description``) has existed all
-    along. Reported symptom: a project's description confidently
+    along. Reported symptom #1: a project's description confidently
     declared "Python / Django", right down to a fabricated app structure
     and route list, while the actual repo was a small Node.js/Express
     server — every preview 404'd because Marcus dutifully ran
     `python manage.py runserver` against a repo with no manage.py at all.
+    Reported symptom #2 (same bug, one layer down): the description
+    correctly says "Python" but never specifically names Django (or
+    names the wrong Python framework) even though the repo unmistakably
+    IS a Django app (``manage.py`` present) — comparing only the
+    LANGUAGE, as the first fix for symptom #1 did, treats "python" ==
+    "python" as a match and never notices the framework is wrong, so the
+    preview still runs the wrong dev command (e.g. a generic
+    ``python -m http.server`` instead of ``python manage.py runserver``)
+    and still 404s, despite the language technically being "correct".
 
     This closes that loop the cheap, deterministic way: reusing
     ``detect_project_type`` (the same file-sniffing heuristic already
     used when NO description exists at all) as a sanity check at the one
     point a mismatch actually matters — starting a preview, where both
-    the declared stack and the real repo path are already in hand. A
-    hard LANGUAGE-level mismatch (not e.g. a Framework detail
-    file-sniffing can't resolve at all) means "trust the files, not the
-    prose": the corrected stack is used for THIS preview immediately, and
-    — unless a human has already locked the description
-    (``can_auto_update``) — persisted back into the stored description
-    too, so this self-heals for every future preview and every human
-    reading the page, not just this one request.
+    the declared stack and the real repo path are already in hand. The
+    declared stack is mapped onto the same key-space via
+    :func:`_declared_stack_key` so a same-language SUBTYPE mismatch
+    (e.g. declared "python" vs. detected "python-django") is caught, not
+    just a different-language one — a full mismatch or a specific
+    detected framework (backed by that framework's own marker file, e.g.
+    ``manage.py``) means "trust the files, not the prose": the corrected
+    stack is used for THIS preview immediately, and — unless a human has
+    already locked the description (``can_auto_update``) — persisted
+    back into the stored description too, so this self-heals for every
+    future preview and every human reading the page, not just this one
+    request. The one case left alone is a bare, non-specific detection
+    (``detect_project_type`` returning generic ``"python"`` — no
+    ``manage.py``, no FastAPI/Flask marker found) against an
+    already-more-specific declared framework: that absence of evidence
+    isn't strong enough to overrule an explicit declaration, mirroring
+    the existing "an empty repo is too weak a signal" behavior for
+    ``"static"``.
 
     Parameters
     ----------
@@ -4027,12 +4090,13 @@ def _reconcile_stack_with_repo(
     Returns
     -------
     ProjectStack
-        *project_stack* unchanged when nothing to check, no mismatch, or
-        the mismatch was too weak a signal to trust (``detect_project_
-        type`` returning ``"static"`` — no recognized manifest file at
-        all — is not strong enough evidence to override an EXPLICIT
-        stack someone already wrote); otherwise a corrected stack built
-        from the repo's own detected type.
+        *project_stack* unchanged when nothing to check, no mismatch
+        (language AND subtype both agree), or the mismatch was too weak
+        a signal to trust (``detect_project_type`` returning ``"static"``
+        — no recognized manifest at all — or the bare, non-specific
+        ``"python"`` catch-all against an already-more-specific declared
+        framework); otherwise a corrected stack built from the repo's
+        own detected type.
     """
     if not repo_path or not os.path.isdir(repo_path):
         return project_stack
@@ -4052,7 +4116,14 @@ def _reconcile_stack_with_repo(
 
     detected_language = detected_key.split("-", 1)[0]
     declared_language = (project_stack.language or "").lower()
-    if detected_language == declared_language:
+    declared_key = _declared_stack_key(project_stack)
+    if detected_key == declared_key:
+        return project_stack
+    if detected_language == declared_language and detected_key == detected_language:
+        # Same language, and the detection carries no MORE information
+        # than that (bare "python" — no manage.py, no FastAPI/Flask
+        # marker found). Too weak to override an already-more-specific
+        # declared framework; see the docstring's "static" parallel.
         return project_stack
 
     from src.core.project_description import ProjectStack
@@ -4067,11 +4138,13 @@ def _reconcile_stack_with_repo(
         extra_apt=list(fb.get("apk", [])),
     )
     logger.warning(
-        "Project %d's description declares language=%r but its repo's own "
-        "files say %r (detected via %r) — using the repo's actual stack "
-        "for this preview instead of the mismatched description",
+        "Project %d's description declares language=%r framework=%r but "
+        "its repo's own files say %r (detected via %r) — using the "
+        "repo's actual stack for this preview instead of the mismatched "
+        "description",
         project_id,
         project_stack.language,
+        project_stack.framework,
         detected_language,
         detected_key,
     )

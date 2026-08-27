@@ -1,13 +1,20 @@
 """
 Unit tests for src/marcus_mcp/server.py's
-_reconcile_stack_with_repo / _persist_corrected_stack.
+_reconcile_stack_with_repo / _persist_corrected_stack / _declared_stack_key.
 
-Regression coverage for the bug where a project's description confidently
-declared "Python / Django" (an LLM's best-guess inference from a single
-ticket, never checked against the real repo) while the actual repo was a
-small Node.js/Express server — every dev-environment preview 404'd
-because Marcus ran `python manage.py runserver` against a repo with no
-manage.py at all, and nothing ever detected or corrected the mismatch.
+Regression coverage for two layers of the same bug. #1: a project's
+description confidently declared "Python / Django" (an LLM's best-guess
+inference from a single ticket, never checked against the real repo)
+while the actual repo was a small Node.js/Express server — every
+dev-environment preview 404'd because Marcus ran `python manage.py
+runserver` against a repo with no manage.py at all. #2 (one layer down,
+still reproducible after #1's fix): the description correctly says
+"Python" but never specifically names Django, even though the repo
+unmistakably IS a Django app (`manage.py` present) — comparing only the
+LANGUAGE treated "python" == "python" as a match and never noticed the
+framework was wrong, so the preview kept running the wrong dev command
+(e.g. a generic `python -m http.server` instead of `python manage.py
+runserver`) and kept 404ing despite the language being "correct".
 
 These tests exercise the reconciliation logic directly against a real
 ProjectDescriptionManager (temp-file backed, not mocked) and real
@@ -25,7 +32,11 @@ from src.core.project_description import (
     SOURCE_HUMAN,
     SOURCE_INFERRED,
 )
-from src.marcus_mcp.server import _persist_corrected_stack, _reconcile_stack_with_repo
+from src.marcus_mcp.server import (
+    _declared_stack_key,
+    _persist_corrected_stack,
+    _reconcile_stack_with_repo,
+)
 
 
 def _mgr(tmp_path: Path) -> ProjectDescriptionManager:
@@ -247,3 +258,136 @@ class TestPersistCorrectedStack:
         _persist_corrected_stack(mgr, 7, corrected)
 
         assert "PostgreSQL" in mgr.get_description(7)
+
+
+class TestDeclaredStackKey:
+    def test_maps_django_framework_to_python_django(self):
+        stack = ProjectStack(language="python", framework="Django")
+        assert _declared_stack_key(stack) == "python-django"
+
+    def test_maps_flask_framework_to_python_flask(self):
+        stack = ProjectStack(language="python", framework="Flask")
+        assert _declared_stack_key(stack) == "python-flask"
+
+    def test_maps_fastapi_framework_to_python_fastapi(self):
+        stack = ProjectStack(language="python", framework="FastAPI")
+        assert _declared_stack_key(stack) == "python-fastapi"
+
+    def test_is_case_insensitive(self):
+        stack = ProjectStack(language="Python", framework="django")
+        assert _declared_stack_key(stack) == "python-django"
+
+    def test_bare_python_with_no_framework_named(self):
+        stack = ProjectStack(language="python", framework="")
+        assert _declared_stack_key(stack) == "python"
+
+    def test_bare_python_with_unrecognized_framework_named(self):
+        stack = ProjectStack(language="python", framework="Tornado")
+        assert _declared_stack_key(stack) == "python"
+
+    def test_non_python_language_returns_language_unchanged(self):
+        stack = ProjectStack(language="nodejs", framework="Express")
+        assert _declared_stack_key(stack) == "nodejs"
+
+
+class TestReconcileStackSameLanguageSubtypeMismatch:
+    """The exact gap the user re-reported: a Python repo whose declared
+    framework doesn't (correctly) say Django, even though manage.py
+    proves it is one."""
+
+    def test_declared_python_no_framework_but_repo_is_django(self, tmp_path):
+        """description says just "Python" (framework left blank) — the
+        common case for an LLM's under-specified best-guess inference —
+        but the repo has manage.py, so it unmistakably IS Django."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "requirements.txt").write_text("Django>=4.2\n")
+        (repo / "manage.py").write_text("#!/usr/bin/env python\n")
+        mgr = _mgr(tmp_path)
+        declared = ProjectStack(
+            language="python", framework="",
+            install_cmd="pip install -r requirements.txt",
+            dev_cmd="python -m http.server 3000",
+        )
+
+        result = _reconcile_stack_with_repo(mgr, 7, declared, str(repo))
+
+        assert result is not declared
+        assert result.language == "python"
+        assert result.framework == "Django"
+        assert "manage.py" in result.dev_cmd
+
+    def test_declared_python_wrong_framework_but_repo_is_django(self, tmp_path):
+        """description names the wrong Python framework (Flask) while
+        the repo is actually Django."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "requirements.txt").write_text("Django>=4.2\n")
+        (repo / "manage.py").write_text("#!/usr/bin/env python\n")
+        mgr = _mgr(tmp_path)
+        declared = ProjectStack(
+            language="python", framework="Flask",
+            install_cmd="pip install -r requirements.txt",
+            dev_cmd="flask run --host 0.0.0.0 --port 3000",
+        )
+
+        result = _reconcile_stack_with_repo(mgr, 7, declared, str(repo))
+
+        assert result.framework == "Django"
+        assert "manage.py" in result.dev_cmd
+
+    def test_declared_django_but_generic_python_detected_is_left_alone(
+        self, tmp_path
+    ):
+        """The inverse: declared framework IS already Django, but the
+        repo only weakly matches (no manage.py, no framework keyword in
+        requirements.txt) — too weak a signal to downgrade an explicit
+        declaration, matching the "static is too weak" precedent."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "requirements.txt").write_text("some-other-lib==1.0\n")
+        mgr = _mgr(tmp_path)
+        declared = _django_declared_stack()
+
+        result = _reconcile_stack_with_repo(mgr, 7, declared, str(repo))
+
+        assert result is declared
+
+    def test_matching_subtype_returns_stack_unchanged(self, tmp_path):
+        """Declared and detected both say Django — genuinely nothing to
+        correct, so the object identity is preserved (no wasted rewrite)."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "requirements.txt").write_text("Django>=4.2\n")
+        (repo / "manage.py").write_text("#!/usr/bin/env python\n")
+        mgr = _mgr(tmp_path)
+        declared = _django_declared_stack()
+
+        result = _reconcile_stack_with_repo(mgr, 7, declared, str(repo))
+
+        assert result is declared
+
+    def test_subtype_mismatch_persists_corrected_description(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "requirements.txt").write_text("Django>=4.2\n")
+        (repo / "manage.py").write_text("#!/usr/bin/env python\n")
+        mgr = _mgr(tmp_path)
+        mgr.update_description(
+            7,
+            "# Demo\n\n## Tech Stack\n- **Language**: Python\n"
+            "- **Dev server command**: python -m http.server 3000\n"
+            "- **Install command**: pip install -r requirements.txt\n",
+            source=SOURCE_INFERRED,
+        )
+        declared = ProjectStack(
+            language="python", framework="",
+            install_cmd="pip install -r requirements.txt",
+            dev_cmd="python -m http.server 3000",
+        )
+
+        _reconcile_stack_with_repo(mgr, 7, declared, str(repo))
+
+        text = mgr.get_description(7)
+        assert "Django" in text
+        assert "manage.py" in text
