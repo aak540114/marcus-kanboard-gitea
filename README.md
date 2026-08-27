@@ -223,7 +223,9 @@ This always works from the same machine Marcus runs on. Connecting from a **diff
 
 Once connected, the simplest way to run an agent is **orchestrate mode** — prompt it with roughly:
 
-> Call the `marcus_work` tool with no arguments and do exactly what the returned `message` says. Every ~10 seconds call `marcus_work` again with the `agent_id`/`ticket_id` it gave you plus a one-line `report`. Report `DONE - <summary>` when finished.
+> Start `n` agents. Each does the following: call the `marcus_work` tool with no arguments and do exactly what the returned `message` says. Every ~10 seconds call `marcus_work` again with the `agent_id`/`ticket_id` it gave you plus a one-line `report`. Report `DONE - <summary>` when finished.
+
+Replace `n` with however many agents you want polling Marcus in parallel (e.g. "Start 3 agents..."). Each one calls `marcus_work` independently and gets its own auto-generated worker id, so they naturally land on different tickets — see [Running multiple agents](#3-running-multiple-agents--multiple-accounts) for how that works under the hood.
 
 Marcus hands out the next human-readied ticket, posts a summarized progress comment on each report, and completes the ticket through the gate — the agent needs no other tool. Alternatively, point the agent at a specific ticket: it calls `get_work_context`, which returns a `clone_url` it uses to `git clone` the repo into its own directory, then works on the pre-made branch. `prompts/Kanboard_Agent_Prompt.md` is the full agent operating manual (auth, gate modes, both flows). For a **remote** agent to clone a private repo seamlessly, set `GITEA_PUBLIC_URL` to a browser-reachable address and provide a `GITEA_AGENT_TOKEN`.
 
