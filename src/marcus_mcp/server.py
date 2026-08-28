@@ -4005,6 +4005,7 @@ def _declared_stack_key(project_stack: Any) -> str:
         return "python"
     return language
 
+
 #: STACK_CONFIGS keys that map to a human-readable "Language" field value.
 _STACK_LANGUAGE_LABELS: Dict[str, str] = {
     "nodejs": "Node.js",
@@ -4018,6 +4019,43 @@ _STACK_LANGUAGE_LABELS: Dict[str, str] = {
     "java": "Java",
     "php": "PHP",
 }
+
+
+def _stack_from_detected_key(detected_key: str) -> Any:
+    """Build a ``ProjectStack`` from a ``detect_project_type``-style key
+    (e.g. ``"python-django"``, ``"nodejs"``), using its
+    :data:`~src.core.dev_environment.STACK_CONFIGS` entry.
+
+    Shared by :func:`_reconcile_stack_with_repo` (correcting a declared
+    stack) and the AI-fallback path in :func:`_determine_dev_preview_stack`
+    (building a stack from scratch when no description exists at all) so
+    both construct a corrected/detected stack identically.
+
+    Parameters
+    ----------
+    detected_key : str
+        A key from :data:`~src.core.dev_environment.STACK_CONFIGS`
+        (never ``"static"`` — callers only reach here once a specific
+        stack was actually detected).
+
+    Returns
+    -------
+    ProjectStack
+        The stack built from that key's fallback config.
+    """
+    from src.core.dev_environment import STACK_CONFIGS
+    from src.core.project_description import ProjectStack
+
+    detected_language = detected_key.split("-", 1)[0]
+    fb = STACK_CONFIGS[detected_key]
+    return ProjectStack(
+        language=detected_language,
+        framework=_STACK_FRAMEWORK_LABELS.get(detected_key, ""),
+        install_cmd=fb["install"],
+        dev_cmd=fb["start"],
+        use_hm_reload=fb["hm"],
+        extra_apt=list(fb.get("apk", [])),
+    )
 
 
 def _reconcile_stack_with_repo(
@@ -4101,7 +4139,7 @@ def _reconcile_stack_with_repo(
     if not repo_path or not os.path.isdir(repo_path):
         return project_stack
 
-    from src.core.dev_environment import STACK_CONFIGS, detect_project_type
+    from src.core.dev_environment import detect_project_type
 
     try:
         detected_key = detect_project_type(repo_path)
@@ -4126,17 +4164,7 @@ def _reconcile_stack_with_repo(
         # declared framework; see the docstring's "static" parallel.
         return project_stack
 
-    from src.core.project_description import ProjectStack
-
-    fb = STACK_CONFIGS[detected_key]
-    corrected = ProjectStack(
-        language=detected_language,
-        framework=_STACK_FRAMEWORK_LABELS.get(detected_key, ""),
-        install_cmd=fb["install"],
-        dev_cmd=fb["start"],
-        use_hm_reload=fb["hm"],
-        extra_apt=list(fb.get("apk", [])),
-    )
+    corrected = _stack_from_detected_key(detected_key)
     logger.warning(
         "Project %d's description declares language=%r framework=%r but "
         "its repo's own files say %r (detected via %r) — using the "
@@ -4222,6 +4250,406 @@ def _persist_corrected_stack(desc_mgr: Any, project_id: int, corrected: Any) -> 
             project_id,
             exc,
         )
+
+
+def _persist_detected_stack(desc_mgr: Any, project_id: int, stack: Any) -> None:
+    """Persist *stack* into project_id's description, creating a minimal
+    one from scratch when none exists at all yet.
+
+    :func:`_persist_corrected_stack` only ever PATCHES an existing
+    description's ``## Tech Stack`` section — a deliberate, safe no-op
+    when no description exists yet, which is exactly right for its own
+    caller (:func:`_reconcile_stack_with_repo` only ever runs against an
+    already-declared stack, which means a description document is
+    guaranteed to already exist). This function's callers
+    (:func:`_detect_stack_from_repo_only`, :func:`_maybe_ai_infer_stack`)
+    are reached precisely BECAUSE no usable description exists — patching
+    a nonexistent document would silently do nothing, leaving the
+    detected/inferred stack visible for this one preview but never
+    written down anywhere a human or future preview would see it.
+
+    Parameters
+    ----------
+    desc_mgr : ProjectDescriptionManager
+        The project's description manager.
+    project_id : int
+        Kanboard project ID.
+    stack : ProjectStack
+        The detected or AI-inferred stack to persist.
+    """
+    try:
+        if desc_mgr.get_description(project_id) is not None:
+            _persist_corrected_stack(desc_mgr, project_id, stack)
+            return
+
+        from src.core.project_description import SOURCE_INFERRED
+
+        lang_display = _STACK_LANGUAGE_LABELS.get(
+            stack.language, (stack.language or "").capitalize()
+        )
+        text = (
+            "# Project\n\n"
+            "## Overview\n"
+            "<!-- Describe what this project does in 2-3 sentences. -->\n\n"
+            "## Tech Stack\n"
+            f"- **Language**: {lang_display}\n"
+            f"- **Framework**: {stack.framework or 'none'}\n"
+            "- **Database**: none\n"
+            f"- **Dev server command**: {stack.dev_cmd}\n"
+            f"- **Install command**: {stack.install_cmd}\n\n"
+            "## Architecture Notes\n"
+            "<!-- High-level design decisions, key modules, API shape, etc. -->\n\n"
+            "## Open Questions\n"
+            "<!-- Things that need human input before AI agents can proceed. -->\n"
+        )
+        desc_mgr.update_description(project_id, text, source=SOURCE_INFERRED)
+        logger.info(
+            "Created a project description for %d from its detected/"
+            "inferred dev-environment stack",
+            project_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Could not persist a description for project %d from its "
+            "detected stack: %s",
+            project_id,
+            exc,
+        )
+
+
+def _get_repo_stack_cache_mgr(server: "MarcusServer") -> Any:
+    """Return the shared RepoStackCache singleton, constructing it once.
+
+    Same reasoning as :func:`_get_project_stats_mgr`: the cache loads its
+    JSON file into memory at construction, so two separate instances
+    would silently diverge — one dev-preview-start request's AI-inference
+    result would never be visible to another.
+
+    Parameters
+    ----------
+    server : MarcusServer
+        The running server instance.
+
+    Returns
+    -------
+    RepoStackCache
+        The shared cache.
+    """
+    from src.core.repo_stack_cache import RepoStackCache
+
+    mgr = getattr(server, "_repo_stack_cache_mgr", None)
+    if mgr is None:
+        mgr = RepoStackCache()
+        server._repo_stack_cache_mgr = mgr  # type: ignore[attr-defined]
+    return mgr
+
+
+async def _repo_fingerprint(repo_path: str) -> str:
+    """Return *repo_path*'s current commit SHA, or ``""`` if it can't be
+    determined (not a git repo, no commits yet, git missing).
+
+    Used to key the AI-inferred-stack cache: a fingerprint mismatch means
+    the repo's content has changed since the AI last read it, so the
+    cached verdict is stale and should be recomputed.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "rev-parse",
+            "HEAD",
+            cwd=repo_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+        if proc.returncode != 0:
+            return ""
+        return stdout_bytes.decode().strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _detect_stack_from_repo_only(
+    desc_mgr: Optional[Any], project_id: int, repo_path: str
+) -> Optional[Any]:
+    """Build a stack purely from file-sniffing, for a project with NO
+    declared Tech Stack at all — the case :func:`_reconcile_stack_with_repo`
+    doesn't handle (it only ever *corrects* an already-declared stack).
+
+    Parameters
+    ----------
+    desc_mgr : Optional[ProjectDescriptionManager]
+        The project's description manager, or ``None`` when unavailable
+        (the caller then skips persisting anything).
+    project_id : int
+        Kanboard project ID.
+    repo_path : str
+        Local path to the project's cloned repo (already validated as an
+        existing directory by the caller).
+
+    Returns
+    -------
+    Optional[ProjectStack]
+        The detected stack, or ``None`` if file-sniffing found nothing
+        recognizable (``detect_project_type`` returned ``"static"``).
+    """
+    from src.core.dev_environment import detect_project_type
+
+    try:
+        detected_key = detect_project_type(repo_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Could not sniff repo %s: %s", repo_path, exc)
+        return None
+    if detected_key == "static":
+        return None
+
+    stack = _stack_from_detected_key(detected_key)
+    logger.info(
+        "Project %d has no declared Tech Stack — detected %r from its "
+        "repo's own files",
+        project_id,
+        detected_key,
+    )
+    if desc_mgr is not None and desc_mgr.can_auto_update(project_id):
+        _persist_detected_stack(desc_mgr, project_id, stack)
+    return stack
+
+
+async def _maybe_ai_infer_stack(
+    server: "MarcusServer",
+    desc_mgr: Optional[Any],
+    project_id: int,
+    resolved: Optional[Any],
+    repo_path: Optional[str],
+) -> Optional[Any]:
+    """AI-based last resort: read the repo's own files to infer a stack
+    when file-sniffing alone (``detect_project_type``) found nothing
+    recognizable at all.
+
+    Cached against the repo's current commit SHA (see
+    :func:`_repo_fingerprint`) so this LLM call only ever runs once per
+    repo state, not on every preview start. Best-effort throughout: any
+    failure (no AI provider configured, the call raising, an unparseable
+    response) just returns *resolved* unchanged — this can never be
+    what blocks a preview from starting.
+
+    Parameters
+    ----------
+    server : MarcusServer
+        The running server instance (for ``server.ai_engine``).
+    desc_mgr : Optional[ProjectDescriptionManager]
+        The project's description manager, or ``None``.
+    project_id : int
+        Kanboard project ID.
+    resolved : Optional[ProjectStack]
+        Whatever heuristics already produced (possibly ``None``).
+    repo_path : Optional[str]
+        Local path to the project's cloned repo.
+
+    Returns
+    -------
+    Optional[ProjectStack]
+        *resolved* unchanged, or an AI-inferred stack when one was
+        successfully produced.
+    """
+    if not repo_path or not os.path.isdir(repo_path):
+        return resolved
+    ai_engine = getattr(server, "ai_engine", None)
+    generate_text = getattr(ai_engine, "generate_text", None)
+    if generate_text is None:
+        return resolved
+
+    try:
+        cache = _get_repo_stack_cache_mgr(server)
+        fingerprint = await _repo_fingerprint(repo_path)
+        cached = cache.get_ai_stack(project_id) if fingerprint else None
+        if cached is not None and cached[0] == fingerprint:
+            from src.core.project_description import ProjectStack
+
+            ai_stack: Optional[Any] = ProjectStack(**cached[1])
+        else:
+            from src.core.repo_stack_inference import infer_stack_with_ai
+
+            ai_stack = await infer_stack_with_ai(repo_path, generate_text)
+            if ai_stack is not None and fingerprint:
+                cache.store_ai_stack(
+                    project_id,
+                    fingerprint,
+                    {
+                        "language": ai_stack.language,
+                        "framework": ai_stack.framework,
+                        "install_cmd": ai_stack.install_cmd,
+                        "dev_cmd": ai_stack.dev_cmd,
+                        "use_hm_reload": ai_stack.use_hm_reload,
+                        "extra_apt": list(ai_stack.extra_apt),
+                    },
+                )
+
+        if ai_stack is None:
+            return resolved
+
+        if desc_mgr is not None and desc_mgr.can_auto_update(project_id):
+            _persist_detected_stack(desc_mgr, project_id, ai_stack)
+        return ai_stack
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "AI-based stack inference failed for project %d: %s", project_id, exc
+        )
+        return resolved
+
+
+async def _maybe_update_dev_preview_readme(
+    server: "MarcusServer",
+    project_id: int,
+    stack: Any,
+    repo_path: str,
+    main_branch: str = "main",
+) -> None:
+    """Keep the repo's own README.md in sync with *stack*, but only do
+    the (relatively expensive: clone + commit + push) work when the
+    resolved stack actually differs from what's already written —
+    tracked via :class:`~src.core.repo_stack_cache.RepoStackCache`'s
+    README-hash cache.
+
+    Best-effort: never raises, never blocks preview start on failure.
+
+    Parameters
+    ----------
+    server : MarcusServer
+        The running server instance.
+    project_id : int
+        Kanboard project ID.
+    stack : ProjectStack
+        The final resolved stack for this preview.
+    repo_path : str
+        Local path to the project's cloned repo (already validated as an
+        existing directory by the caller).
+    main_branch : str
+        Branch to write the README update to. Defaults to ``"main"``.
+    """
+    try:
+        from src.core.repo_stack_cache import stack_hash
+
+        cache = _get_repo_stack_cache_mgr(server)
+        new_hash = stack_hash(stack)
+        if cache.get_readme_hash(project_id) == new_hash:
+            return
+
+        from src.core.repo_readme_writer import update_dev_preview_readme_section
+
+        wrote = await update_dev_preview_readme_section(
+            repo_path, stack, main_branch=main_branch
+        )
+        # Record the hash either way: a no-op write (README already said
+        # this — e.g. cache was cleared/missing but content matches) is
+        # just as much "up to date" as a fresh commit, and either way
+        # there is nothing left to redo until the stack changes again.
+        cache.store_readme_hash(project_id, new_hash)
+        if wrote:
+            logger.info(
+                "Dev-preview README instructions updated for project %d",
+                project_id,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Could not update dev-preview README for project %d: %s",
+            project_id,
+            exc,
+        )
+
+
+async def _determine_dev_preview_stack(
+    server: "MarcusServer",
+    desc_mgr: Optional[Any],
+    project_id: int,
+    project_stack: Optional[Any],
+    repo_path: Optional[str],
+    main_branch: str = "main",
+) -> Optional[Any]:
+    """Resolve the stack to actually use for starting a dev-environment
+    preview, without depending solely on a human-written project
+    description — the gap this closes: previously, no declared Tech
+    Stack meant an immediate dead end (a 400 page asking a human to fill
+    it in by hand), even when the repo's own files made the answer
+    obvious, and even a DECLARED stack was only ever cross-checked
+    against the repo when file-sniffing found something specific enough
+    to compare (see :func:`_reconcile_stack_with_repo`) — an
+    unrecognized layout silently fell back to serving static files
+    forever, with nothing ever actually reading the code.
+
+    Order of trust, cheapest/most-certain first:
+
+    1. A declared stack, reconciled against the repo's own files
+       (:func:`_reconcile_stack_with_repo`) — cheap, deterministic
+       file-sniffing corrects a wrong/incomplete declaration.
+    2. No declared stack at all: the same file-sniffing, used to build a
+       stack from scratch instead of only correcting one
+       (:func:`_detect_stack_from_repo_only`).
+    3. Still nothing recognized (``detect_project_type`` returns
+       ``"static"``, regardless of whether step 1 or 2 ran): ask
+       Marcus's own AI provider to read the repo's actual files —
+       README, manifests, common entrypoints — and infer how to run it
+       (:func:`_maybe_ai_infer_stack`), cached per repo commit so this
+       only ever costs one LLM call per repo state.
+
+    Whatever stack is ultimately chosen, this also (best-effort, only
+    when it actually changed) mirrors it into the repo's own README.md
+    (:func:`_maybe_update_dev_preview_readme`) so a human reading the
+    repo directly — not just Marcus's UI — can see how to run it.
+
+    Parameters
+    ----------
+    server : MarcusServer
+        The running server instance.
+    desc_mgr : Optional[ProjectDescriptionManager]
+        The project's description manager, or ``None`` when the caller
+        couldn't resolve a numeric project id.
+    project_id : int
+        Kanboard project ID.
+    project_stack : Optional[ProjectStack]
+        The stack from the project's current description, or ``None``
+        if it has none.
+    repo_path : Optional[str]
+        Local path to the project's cloned repo, or ``None``/nonexistent
+        if unresolvable.
+    main_branch : str
+        Branch to write any README update to. Defaults to ``"main"``.
+
+    Returns
+    -------
+    Optional[ProjectStack]
+        The resolved stack, or ``None`` only when every step above
+        failed to produce anything usable — the caller should fall back
+        to asking a human to fill in the Tech Stack section manually.
+    """
+    resolved: Optional[Any] = project_stack
+    if project_stack is not None:
+        resolved = _reconcile_stack_with_repo(
+            desc_mgr, project_id, project_stack, repo_path
+        )
+    elif repo_path and os.path.isdir(repo_path):
+        resolved = _detect_stack_from_repo_only(desc_mgr, project_id, repo_path)
+
+    detected_key = "static"
+    if repo_path and os.path.isdir(repo_path):
+        from src.core.dev_environment import detect_project_type
+
+        try:
+            detected_key = detect_project_type(repo_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Could not sniff repo %s: %s", repo_path, exc)
+
+    if detected_key == "static":
+        resolved = await _maybe_ai_infer_stack(
+            server, desc_mgr, project_id, resolved, repo_path
+        )
+
+    if resolved is not None and repo_path and os.path.isdir(repo_path):
+        await _maybe_update_dev_preview_readme(
+            server, project_id, resolved, repo_path, main_branch=main_branch
+        )
+
+    return resolved
 
 
 def _dev_env_starting_page(
@@ -5067,17 +5495,6 @@ if __name__ == "__main__":
                             desc_mgr = ProjectDescriptionManager()
                             server._project_desc_mgr = desc_mgr  # type: ignore[attr-defined]
                         project_stack = desc_mgr.get_stack(pid)
-                        if project_stack is None:
-                            # No stack info — ask human to fill in the description
-                            desc_url = f"/project-description?project_id={pid}"
-                            return HTMLResponse(
-                                f"<h1>Project description needed</h1>"
-                                f"<p>Marcus could not determine the tech stack for this project. "
-                                f"Please fill in the <strong>Tech Stack</strong> section of the "
-                                f'<a href="{desc_url}">Project Description</a> '
-                                f"and try again.</p>",
-                                status_code=400,
-                            )
                     except ValueError:
                         pass  # bad project_id — fall through to file detection
 
@@ -5086,13 +5503,31 @@ if __name__ == "__main__":
                     branch = _resolve_ticket_branch(server, ticket_id, provider)
                     repo_path = await _resolve_ticket_repo_path(server, project_id)
 
-                    # Sanity-check the declared stack against the repo it's
-                    # actually about to run — see _reconcile_stack_with_repo's
-                    # docstring for why this can't just be trusted forever.
-                    if project_stack is not None and pid is not None and desc_mgr is not None:
-                        project_stack = _reconcile_stack_with_repo(
-                            desc_mgr, pid, project_stack, repo_path
+                    # Resolve the stack to actually run this preview with:
+                    # reconcile/correct a declared stack against the repo's
+                    # own files, or — with no description at all — detect
+                    # one directly from those files, falling back further to
+                    # an AI-based read of the repo when file-sniffing alone
+                    # finds nothing recognizable. This no longer depends on
+                    # a project description existing at all; see
+                    # _determine_dev_preview_stack's docstring for the full
+                    # fallback order.
+                    if pid is not None:
+                        project_stack = await _determine_dev_preview_stack(
+                            server, desc_mgr, pid, project_stack, repo_path
                         )
+                        if project_stack is None:
+                            desc_url = f"/project-description?project_id={pid}"
+                            return HTMLResponse(
+                                f"<h1>Project description needed</h1>"
+                                f"<p>Marcus could not determine the tech stack for this "
+                                f"project — neither from its description nor by reading "
+                                f"its repository's own files. Please fill in the "
+                                f"<strong>Tech Stack</strong> section of the "
+                                f'<a href="{desc_url}">Project Description</a> '
+                                f"and try again.</p>",
+                                status_code=400,
+                            )
 
                     info = await dev_mgr.start(
                         ticket_id=ticket_id,
@@ -6029,16 +6464,6 @@ setInterval(refresh, 30000);
                     desc_mgr = ProjectDescriptionManager()
                     server._project_desc_mgr = desc_mgr  # type: ignore[attr-defined]
                 project_stack = desc_mgr.get_stack(project_id)
-                if project_stack is None:
-                    desc_url = f"/project-description?project_id={project_id}"
-                    return HTMLResponse(
-                        f"<h1>Project description needed</h1>"
-                        f"<p>Marcus could not determine the tech stack for this project. "
-                        f"Please fill in the <strong>Tech Stack</strong> section of the "
-                        f'<a href="{desc_url}">Project Description</a> '
-                        f"and try again.</p>",
-                        status_code=400,
-                    )
 
                 # ── repo_path via the same helper dev_env_view uses. Its
                 #    name says "ticket" but it is entirely project_id-driven
@@ -6065,12 +6490,34 @@ setInterval(refresh, 30000);
 
                 info = dev_mgr.get_info(synthetic_id, provider)
                 if info is None:
-                    # Sanity-check the declared stack against the repo it's
-                    # actually about to run — see _reconcile_stack_with_repo's
-                    # docstring for why this can't just be trusted forever.
-                    project_stack = _reconcile_stack_with_repo(
-                        desc_mgr, project_id, project_stack, repo_path
+                    # Resolve the stack to actually run this preview with:
+                    # reconcile/correct a declared stack against the repo's
+                    # own files, or — with no description at all — detect
+                    # one directly from those files, falling back further to
+                    # an AI-based read of the repo when file-sniffing alone
+                    # finds nothing recognizable. See
+                    # _determine_dev_preview_stack's docstring for the full
+                    # fallback order.
+                    project_stack = await _determine_dev_preview_stack(
+                        server,
+                        desc_mgr,
+                        project_id,
+                        project_stack,
+                        repo_path,
+                        main_branch=main_branch_name,
                     )
+                    if project_stack is None:
+                        desc_url = f"/project-description?project_id={project_id}"
+                        return HTMLResponse(
+                            f"<h1>Project description needed</h1>"
+                            f"<p>Marcus could not determine the tech stack for this "
+                            f"project — neither from its description nor by reading "
+                            f"its repository's own files. Please fill in the "
+                            f"<strong>Tech Stack</strong> section of the "
+                            f'<a href="{desc_url}">Project Description</a> '
+                            f"and try again.</p>",
+                            status_code=400,
+                        )
                     info = await dev_mgr.start(
                         ticket_id=synthetic_id,
                         provider=provider,
