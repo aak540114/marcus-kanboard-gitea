@@ -131,6 +131,34 @@ class TestInferStackWithAi:
         assert result.dev_cmd == "python main.py"
 
     @pytest.mark.asyncio
+    async def test_embedded_newline_in_dev_cmd_is_collapsed_to_one_line(self, tmp_path):
+        """Regression: the persisted project description stores dev_cmd
+        as a single markdown line, and re-parsing it only ever reads the
+        first line back out (confirmed against the real parser: a
+        multi-line dev_cmd round-trips to a truncated, broken fragment
+        like "cd backend &&" on the NEXT preview start). Every other
+        stack source is single-line by construction; only free-text AI
+        JSON can introduce this, so it must be sanitized here."""
+        (tmp_path / "main.py").write_text("import bottle")
+        response = json.dumps(
+            {
+                "language": "python",
+                "framework": "Bottle\nFlask-like",
+                "install_cmd": "pip install bottle",
+                "dev_cmd": "cd backend &&\npython main.py",
+                "use_hot_reload": False,
+                "apk_packages": [],
+            }
+        )
+
+        result = await infer_stack_with_ai(str(tmp_path), _fake_llm(response))
+
+        assert result is not None
+        assert "\n" not in result.dev_cmd
+        assert "\n" not in result.framework
+        assert result.dev_cmd == "cd backend && python main.py"
+
+    @pytest.mark.asyncio
     async def test_declared_unable_to_determine_yields_none(self, tmp_path):
         """The prompt explicitly instructs the AI to answer
         {"language": ""} when it can't confidently tell — must not be
@@ -141,6 +169,23 @@ class TestInferStackWithAi:
         result = await infer_stack_with_ai(str(tmp_path), _fake_llm(response))
 
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_confident_static_answer_is_a_usable_result(self, tmp_path):
+        """Regression: the prompt's own schema lists "static" as a valid
+        language value ("respond with {"language": ""} ... do not
+        guess" is the ONLY documented "I don't know" escape hatch) — a
+        confident "static" verdict must be honored as a real, working
+        stack (matching detect_project_type's own "static" fallback),
+        not discarded identically to an empty/unusable answer."""
+        (tmp_path / "index.html").write_text("<html>Hello</html>")
+        response = json.dumps({"language": "static", "dev_cmd": ""})
+
+        result = await infer_stack_with_ai(str(tmp_path), _fake_llm(response))
+
+        assert result is not None
+        assert result.language == "static"
+        assert "httpd" in result.dev_cmd
 
     @pytest.mark.asyncio
     async def test_missing_dev_cmd_yields_none(self, tmp_path):

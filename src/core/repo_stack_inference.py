@@ -159,6 +159,38 @@ def _build_repo_snapshot(repo_path: str) -> str:
     return snapshot
 
 
+def _single_line(text: str) -> str:
+    """Collapse any embedded newlines/carriage returns in *text* to
+    spaces, and squeeze repeated whitespace.
+
+    The persisted project description stores ``dev_cmd``/``install_cmd``/
+    ``framework`` as single markdown list-item lines (see
+    :func:`~src.marcus_mcp.server._persist_detected_stack`), and
+    :func:`~src.core.project_description._extract_field` only ever reads
+    the first line of a field's value back out. Every OTHER stack source
+    (:data:`~src.core.dev_environment.STACK_CONFIGS`, human-written text)
+    is single-line by construction, so this was never reachable before —
+    but an LLM's free-text JSON response can legitimately contain a
+    literal embedded newline (e.g. a multi-step command). Without this,
+    such a value round-trips fine the first time, then silently
+    truncates to its first line (e.g. a dangling ``"cd backend &&"``) on
+    every later preview start once it's re-parsed from the stored
+    description — confirmed empirically against the real parser.
+
+    Parameters
+    ----------
+    text : str
+        Raw text that must be safe to store as one markdown line.
+
+    Returns
+    -------
+    str
+        *text* with all whitespace runs (including newlines) collapsed
+        to single spaces, stripped.
+    """
+    return " ".join(text.split())
+
+
 def _build_prompt(snapshot: str) -> str:
     """Build the LLM prompt asking for a strict-JSON run configuration.
 
@@ -234,8 +266,38 @@ async def infer_stack_with_ai(
         data = parse_ai_json_response(response)
 
         language = str(data.get("language") or "").strip().lower()
-        dev_cmd = str(data.get("dev_cmd") or "").strip()
-        if not language or language == "static" or not dev_cmd:
+        if not language:
+            logger.info(
+                "AI stack inference for %s: could not determine a run "
+                "configuration",
+                repo_path,
+            )
+            return None
+
+        if language == "static":
+            # A confident "static" answer is a legitimate, USABLE result
+            # (see the prompt's own schema, which lists it as a valid
+            # language value) — not the same as "couldn't determine
+            # anything". Building this from STACK_CONFIGS keeps it
+            # identical to the deterministic detect_project_type("static")
+            # fallback rather than inventing a second copy of those values.
+            from src.core.dev_environment import STACK_CONFIGS
+
+            fb = STACK_CONFIGS["static"]
+            logger.info(
+                "AI stack inference for %s: repo is static content", repo_path
+            )
+            return ProjectStack(
+                language="static",
+                framework="",
+                install_cmd=fb["install"],
+                dev_cmd=fb["start"],
+                use_hm_reload=fb["hm"],
+                extra_apt=list(fb.get("apk", [])),
+            )
+
+        dev_cmd = _single_line(str(data.get("dev_cmd") or ""))
+        if not dev_cmd:
             logger.info(
                 "AI stack inference for %s returned no usable run "
                 "configuration (language=%r)",
@@ -253,8 +315,8 @@ async def infer_stack_with_ai(
 
         stack = ProjectStack(
             language=language,
-            framework=str(data.get("framework") or "").strip(),
-            install_cmd=str(data.get("install_cmd") or "").strip(),
+            framework=_single_line(str(data.get("framework") or "")),
+            install_cmd=_single_line(str(data.get("install_cmd") or "")),
             dev_cmd=dev_cmd,
             use_hm_reload=bool(data.get("use_hot_reload", False)),
             extra_apt=extra_apt,

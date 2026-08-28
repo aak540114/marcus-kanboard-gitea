@@ -259,6 +259,39 @@ class TestPersistCorrectedStack:
 
         assert "PostgreSQL" in mgr.get_description(7)
 
+    def test_identical_content_does_not_rewrite_or_grow_history(self, tmp_path):
+        """Regression: update_description() unconditionally appends a new
+        entry to the bounded (20-entry) history log on every call, with
+        no dedup check of its own. _maybe_ai_infer_stack re-persists its
+        CACHED stack on every single preview start (not just when it
+        actually changes) — for a project whose repo is permanently
+        "static" to file-sniffing, that means every preview-start click
+        would otherwise add a duplicate history entry, eventually
+        pushing out genuinely meaningful history. Persisting the exact
+        same stack twice must be a no-op the second time."""
+        mgr = _mgr(tmp_path)
+        mgr.update_description(
+            7,
+            "## Tech Stack\n- **Language**: Python\n"
+            "- **Framework**: Django\n"
+            "- **Database**: none\n"
+            "- **Dev server command**: python manage.py runserver 0.0.0.0:3000\n"
+            "- **Install command**: pip install -r requirements.txt\n",
+            source=SOURCE_INFERRED,
+        )
+        before_history_len = len(mgr.get_history(7))
+        stack = ProjectStack(
+            language="python", framework="Django",
+            install_cmd="pip install -r requirements.txt",
+            dev_cmd="python manage.py runserver 0.0.0.0:3000",
+        )
+
+        _persist_corrected_stack(mgr, 7, stack)
+        _persist_corrected_stack(mgr, 7, stack)
+        _persist_corrected_stack(mgr, 7, stack)
+
+        assert len(mgr.get_history(7)) == before_history_len
+
 
 class TestDeclaredStackKey:
     def test_maps_django_framework_to_python_django(self):

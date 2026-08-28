@@ -4237,6 +4237,18 @@ def _persist_corrected_stack(desc_mgr: Any, project_id: int, corrected: Any) -> 
                 project_id,
             )
             return
+        if new_text == text:
+            # Already says this — most commonly reached via a CACHED
+            # AI-inferred stack (see _maybe_ai_infer_stack), which is
+            # re-persisted on every preview start regardless of whether
+            # anything changed. update_description() has no no-op
+            # short-circuit of its own — it unconditionally rewrites the
+            # file AND appends a new entry to the bounded (20-entry)
+            # history log — so without this check, a project whose repo
+            # is permanently "static" to file-sniffing would get a fresh
+            # duplicate history entry on every single preview start,
+            # eventually pushing out genuinely meaningful history.
+            return
         desc_mgr.update_description(project_id, new_text, source=SOURCE_INFERRED)
         logger.info(
             "Stack reconciliation: corrected project %d's stored Tech "
@@ -4540,14 +4552,24 @@ async def _maybe_update_dev_preview_readme(
         wrote = await update_dev_preview_readme_section(
             repo_path, stack, main_branch=main_branch
         )
-        # Record the hash either way: a no-op write (README already said
-        # this — e.g. cache was cleared/missing but content matches) is
-        # just as much "up to date" as a fresh commit, and either way
-        # there is nothing left to redo until the stack changes again.
-        cache.store_readme_hash(project_id, new_hash)
+        # wrote is a tri-state: True (freshly committed) or False
+        # (confirmed no-op — the README already said this) both mean the
+        # README is now known to be in the desired state, so the hash is
+        # cached either way. None means the update could not even be
+        # attempted or failed outright (no remote, clone/push error) —
+        # the hash must NOT be cached in that case, or a transient
+        # failure would be mistaken for "done" and never retried.
+        if wrote is not None:
+            cache.store_readme_hash(project_id, new_hash)
         if wrote:
             logger.info(
                 "Dev-preview README instructions updated for project %d",
+                project_id,
+            )
+        elif wrote is None:
+            logger.debug(
+                "Dev-preview README update for project %d did not "
+                "complete — will retry on the next preview start",
                 project_id,
             )
     except Exception as exc:  # noqa: BLE001
@@ -5503,6 +5525,18 @@ if __name__ == "__main__":
                     branch = _resolve_ticket_branch(server, ticket_id, provider)
                     repo_path = await _resolve_ticket_repo_path(server, project_id)
 
+                    # The repo's actual default branch — needed so the
+                    # README-update step (inside _determine_dev_preview_stack)
+                    # clones/pushes the right branch instead of silently
+                    # failing on any project whose Gitea default isn't
+                    # literally "main" (e.g. an externally-added repo).
+                    # Mirrors dev_env_main_view's identical lookup below.
+                    main_branch_name = "main"
+                    hgw = getattr(server, "_human_gated_workflow", None)
+                    branch_cfg = getattr(getattr(hgw, "_branch", None), "config", None)
+                    if branch_cfg is not None:
+                        main_branch_name = getattr(branch_cfg, "main_branch", "main")
+
                     # Resolve the stack to actually run this preview with:
                     # reconcile/correct a declared stack against the repo's
                     # own files, or — with no description at all — detect
@@ -5514,7 +5548,12 @@ if __name__ == "__main__":
                     # fallback order.
                     if pid is not None:
                         project_stack = await _determine_dev_preview_stack(
-                            server, desc_mgr, pid, project_stack, repo_path
+                            server,
+                            desc_mgr,
+                            pid,
+                            project_stack,
+                            repo_path,
+                            main_branch=main_branch_name,
                         )
                         if project_stack is None:
                             desc_url = f"/project-description?project_id={pid}"

@@ -160,14 +160,21 @@ async def _git_output(args: List[str], cwd: str, timeout: float = _GIT_READ_TIME
 
 async def update_dev_preview_readme_section(
     repo_path: str, stack: object, main_branch: str = "main"
-) -> bool:
+) -> Optional[bool]:
     """Write/update the "Dev Environment Preview" section in the repo's
     own README.md on *main_branch*, via a throwaway clone.
 
     Best-effort and defensive throughout — this must never break the
-    dev-environment preview it's describing. Any failure (no remote
-    configured, network error, nothing to commit) simply returns
-    ``False``; nothing here ever raises.
+    dev-environment preview it's describing; nothing here ever raises.
+    The return value is a tri-state specifically so the caller
+    (``_maybe_update_dev_preview_readme`` in server.py) can tell a
+    CONFIRMED no-op (the README already says this — safe to cache, no
+    need to try again until the stack itself changes) apart from a
+    genuine FAILURE (no remote configured, clone/push error) — caching
+    the latter as "done" the same way as the former would permanently
+    mask a transient failure: the next preview start for an unchanged
+    stack would see the cached hash, assume the README is current, and
+    never retry.
 
     Parameters
     ----------
@@ -182,12 +189,15 @@ async def update_dev_preview_readme_section(
 
     Returns
     -------
-    bool
-        ``True`` if a commit was actually pushed, ``False`` otherwise
-        (nothing changed, or the update failed).
+    Optional[bool]
+        ``True`` if a commit was actually pushed. ``False`` if nothing
+        needed to change (confirmed via a real read of the current
+        content) — safe to treat as "up to date". ``None`` if the update
+        could not be attempted or failed (no repo path, no remote, git
+        error) — the caller should NOT treat this as "up to date".
     """
     if not repo_path or not os.path.isdir(repo_path):
-        return False
+        return None
     try:
         origin_url = await _git_output(
             ["git", "remote", "get-url", "origin"], cwd=repo_path
@@ -197,7 +207,7 @@ async def update_dev_preview_readme_section(
                 "No origin remote configured for %s — skipping README update",
                 repo_path,
             )
-            return False
+            return None
 
         with tempfile.TemporaryDirectory(prefix="marcus-readme-") as tmp_dir:
             clone_dir = os.path.join(tmp_dir, "repo")
@@ -256,4 +266,4 @@ async def update_dev_preview_readme_section(
         logger.warning(
             "Could not update dev-preview README section for %s: %s", repo_path, exc
         )
-        return False
+        return None

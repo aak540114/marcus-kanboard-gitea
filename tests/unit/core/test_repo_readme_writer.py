@@ -200,24 +200,28 @@ class TestUpdateDevPreviewReadmeSection:
         assert "Django" not in Path(working, "README.md").read_text()
 
     @pytest.mark.asyncio
-    async def test_nonexistent_repo_path_returns_false(self, tmp_path):
+    async def test_nonexistent_repo_path_returns_none_not_false(self, tmp_path):
+        """None (not False) on a real failure: the caller in server.py
+        caches the README hash only when the result isn't None, so a
+        genuine failure must be distinguishable from a confirmed no-op —
+        see _maybe_update_dev_preview_readme's docstring."""
         result = await update_dev_preview_readme_section(
             str(tmp_path / "does-not-exist"), _django_stack()
         )
-        assert result is False
+        assert result is None
 
     @pytest.mark.asyncio
-    async def test_no_origin_remote_returns_false_not_a_crash(self, tmp_path):
+    async def test_no_origin_remote_returns_none_not_a_crash(self, tmp_path):
         working = tmp_path / "no-remote"
         working.mkdir()
         _run(["git", "init", "-b", "main"], cwd=str(working))
 
         result = await update_dev_preview_readme_section(str(working), _django_stack())
 
-        assert result is False
+        assert result is None
 
     @pytest.mark.asyncio
-    async def test_unreachable_remote_returns_false_not_a_crash(self, tmp_path):
+    async def test_unreachable_remote_returns_none_not_a_crash(self, tmp_path):
         working = tmp_path / "bad-remote"
         working.mkdir()
         _run(["git", "init", "-b", "main"], cwd=str(working))
@@ -228,4 +232,4 @@ class TestUpdateDevPreviewReadmeSection:
 
         result = await update_dev_preview_readme_section(str(working), _django_stack())
 
-        assert result is False
+        assert result is None

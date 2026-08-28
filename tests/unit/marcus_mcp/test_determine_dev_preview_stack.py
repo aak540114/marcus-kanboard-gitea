@@ -387,6 +387,53 @@ class TestMaybeUpdateDevPreviewReadme:
             await _maybe_update_dev_preview_readme(server, 7, _django_stack(), str(repo))
         # no exception propagated — test passes just by reaching here
 
+    @pytest.mark.asyncio
+    async def test_failed_write_does_not_poison_the_cache(self, tmp_path):
+        """Regression: update_dev_preview_readme_section returning None
+        (a genuine failure — no remote, network error, push failure) must
+        NOT be cached as "up to date" the way a confirmed no-op (False)
+        is. Caching a failure would permanently mask it: the next preview
+        start for this same (unchanged) stack would see the cached hash
+        and never retry the write at all."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        server = _server(tmp_path)
+
+        with patch(
+            "src.core.repo_readme_writer.update_dev_preview_readme_section",
+            new=AsyncMock(return_value=None),
+        ) as fake_write:
+            await _maybe_update_dev_preview_readme(server, 7, _django_stack(), str(repo))
+
+            cache = _get_repo_stack_cache_mgr(server)
+            assert cache.get_readme_hash(7) is None
+
+            # And critically: the NEXT preview start for the same stack
+            # must retry, not skip — proving the failure wasn't silently
+            # cached.
+            fake_write.reset_mock()
+            fake_write.return_value = True
+            await _maybe_update_dev_preview_readme(server, 7, _django_stack(), str(repo))
+            fake_write.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_confirmed_noop_is_still_cached(self, tmp_path):
+        """The other half of the same distinction: a confirmed no-op
+        (False — the README already said this) IS safe to cache, unlike
+        a failure (None)."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        server = _server(tmp_path)
+
+        with patch(
+            "src.core.repo_readme_writer.update_dev_preview_readme_section",
+            new=AsyncMock(return_value=False),
+        ):
+            await _maybe_update_dev_preview_readme(server, 7, _django_stack(), str(repo))
+
+        cache = _get_repo_stack_cache_mgr(server)
+        assert cache.get_readme_hash(7) is not None
+
 
 class TestDetermineDevPreviewStack:
     @pytest.mark.asyncio
