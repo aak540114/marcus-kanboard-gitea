@@ -991,17 +991,24 @@ $cloneProjectStatusUrl = $marcusUrl . '/api/clone-project-status';
     /* ── Project-level main-branch preview (Start/Stop) ─────────────────
        Deploys the project's `main` branch instead of a ticket's branch —
        distinct from the per-ticket Start/Stop Preview buttons in the task
-       sidebar. Auto-reloads on every push to main via the same Gitea
-       webhook mechanism that refreshes ticket previews; this widget only
-       needs to reflect whether one is currently running. One-shot check
-       on load (no polling loop), matching the task sidebar's own
-       Start/Stop Preview widget — the board already reloads on relevant
-       events via the EventSource block above, which re-runs this check. */
+       sidebar. "Start Main Preview" is a plain <a target="_blank">
+       navigation to a NEW tab, so this tab gets no click event and no
+       signal that a preview was started — starting one doesn't touch any
+       Kanboard board/ticket state, so it never fires the EventSource
+       "refresh" push either. Polling STATUS_URL is what actually notices
+       the state change and swaps the buttons in, without requiring a
+       manual page reload. lastState dedupes so an unchanged poll result
+       never re-renders (no flicker, no risk of clobbering an in-flight
+       "Stopping…" click). */
     (function () {
         var wrap = document.getElementById('marcus-main-preview-wrap');
         if (!wrap || !PROJECT_ID) { return; }
 
+        var POLL_MS = 4000;
+        var lastState = null; // null (unknown yet) | 'running' | 'stopped' | 'stopping'
+
         function renderStopped() {
+            lastState = 'stopped';
             wrap.innerHTML =
                 '<a href="' + DEV_ENV_MAIN_VIEW_URL + '" target="_blank" '
                 + 'rel="noopener noreferrer" class="marcus-main-preview-btn start">'
@@ -1010,6 +1017,7 @@ $cloneProjectStatusUrl = $marcusUrl . '/api/clone-project-status';
         }
 
         function renderRunning(previewUrl) {
+            lastState = 'running';
             wrap.innerHTML =
                 '<a href="' + mEsc(previewUrl) + '" target="_blank" '
                 + 'rel="noopener noreferrer" class="marcus-main-preview-btn open">'
@@ -1027,6 +1035,7 @@ $cloneProjectStatusUrl = $marcusUrl . '/api/clone-project-status';
             document.getElementById('marcus-main-stop-btn').addEventListener('click', function () {
                 this.disabled = true;
                 this.textContent = 'Stopping…';
+                lastState = 'stopping'; // hold the poll off while this is in flight
                 fetch(DEV_ENV_MAIN_STOP_URL, {
                     method: 'POST', cache: 'no-store', headers: marcusHeaders(),
                 })
@@ -1036,13 +1045,26 @@ $cloneProjectStatusUrl = $marcusUrl . '/api/clone-project-status';
             });
         }
 
-        fetch(DEV_ENV_MAIN_STATUS_URL, { cache: 'no-store', headers: marcusHeaders() })
-            .then(function (r) { return r.json(); })
-            .then(function (data) {
-                if (data.running && data.url) { renderRunning(data.url); }
-                else { renderStopped(); }
-            })
-            .catch(function () { renderStopped(); });
+        function checkStatus() {
+            if (lastState === 'stopping') { return; } // a stop click owns the UI right now
+            fetch(DEV_ENV_MAIN_STATUS_URL, { cache: 'no-store', headers: marcusHeaders() })
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    var running = !!(data.running && data.url);
+                    var newState = running ? 'running' : 'stopped';
+                    if (newState === lastState) { return; } // nothing changed — skip re-render
+                    if (running) { renderRunning(data.url); } else { renderStopped(); }
+                })
+                .catch(function () {
+                    // Transient network hiccup: keep whatever is currently shown
+                    // rather than flashing to "stopped" — except on the very
+                    // first check, where SOMETHING must render.
+                    if (lastState === null) { renderStopped(); }
+                });
+        }
+
+        checkStatus();
+        setInterval(checkStatus, POLL_MS);
     }());
 
     /* ── Clone this project ──────────────────────────────────────────────

@@ -435,13 +435,25 @@ $agentsUrl = $marcusUrl . '/api/active-agents';
         }, 1000);
     }());
 
-    /* ── Dev-environment panel ───────────────────────────────────── */
+    /* ── Dev-environment panel ───────────────────────────────────────
+       "Start Preview" is a plain <a target="_blank"> navigation to a
+       NEW tab, so this tab never gets a click event or any other signal
+       that a preview was started — starting one doesn't touch any
+       Kanboard ticket/board state, so it never fires the EventSource
+       "refresh" push either. Poll STATUS_URL so the buttons update on
+       their own once the preview is actually up, no manual reload
+       needed. lastState dedupes so an unchanged poll never re-renders
+       (no flicker, no risk of clobbering an in-flight "Stopping…"
+       click). */
     var devPanel  = document.getElementById('marcus-dev-env-panel');
     var statusMsg = document.getElementById('marcus-dev-env-status-msg');
+    var DEV_ENV_POLL_MS = 4000;
+    var devEnvLastState = null; // null (unknown yet) | 'running' | 'stopped' | 'stopping'
 
     function setMsg(text) { statusMsg.textContent = text; }
 
     function renderStopped() {
+        devEnvLastState = 'stopped';
         devPanel.innerHTML =
             '<a href="' + VIEW_URL + '" target="_blank" rel="noopener noreferrer" '
             + 'class="btn btn-info btn-block">'
@@ -451,6 +463,7 @@ $agentsUrl = $marcusUrl . '/api/active-agents';
     }
 
     function renderRunning(previewUrl) {
+        devEnvLastState = 'running';
         devPanel.innerHTML =
             '<a href="' + previewUrl + '" target="_blank" rel="noopener noreferrer" '
             + 'class="btn btn-success btn-block">'
@@ -468,6 +481,7 @@ $agentsUrl = $marcusUrl . '/api/active-agents';
         document.getElementById('marcus-stop-btn').addEventListener('click', function () {
             this.disabled = true;
             this.textContent = 'Stopping…';
+            devEnvLastState = 'stopping'; // hold the poll off while this is in flight
             fetch(STOP_URL, { method: 'POST', cache: 'no-store', headers: marcusHeaders() })
                 .then(function (r) { return r.json(); })
                 .then(function () { renderStopped(); setMsg('Preview stopped.'); })
@@ -478,16 +492,28 @@ $agentsUrl = $marcusUrl . '/api/active-agents';
         });
     }
 
-    fetch(STATUS_URL, { cache: 'no-store', headers: marcusHeaders() })
-        .then(function (r) { return r.json(); })
-        .then(function (data) {
-            if (data.running && data.url) { renderRunning(data.url); }
-            else { renderStopped(); }
-        })
-        .catch(function () {
-            renderStopped();
-            setMsg('Marcus is unreachable. Start anyway to launch a new preview.');
-        });
+    function checkDevEnvStatus() {
+        if (devEnvLastState === 'stopping') { return; } // a stop click owns the UI right now
+        fetch(STATUS_URL, { cache: 'no-store', headers: marcusHeaders() })
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                var running = !!(data.running && data.url);
+                var newState = running ? 'running' : 'stopped';
+                if (newState === devEnvLastState) { return; } // nothing changed — skip re-render
+                if (running) { renderRunning(data.url); } else { renderStopped(); }
+            })
+            .catch(function () {
+                if (devEnvLastState === null) {
+                    renderStopped();
+                    setMsg('Marcus is unreachable. Start anyway to launch a new preview.');
+                }
+                // Otherwise: transient hiccup — keep whatever is currently shown
+                // and try again next tick, rather than flashing to "stopped".
+            });
+    }
+
+    checkDevEnvStatus();
+    setInterval(checkDevEnvStatus, DEV_ENV_POLL_MS);
 
     /* ── Gate mode panel ─────────────────────────────────────────── */
     var saving        = document.getElementById('marcus-tg-saving');
