@@ -911,6 +911,49 @@ class DevEnvironmentManager:
         """
         return self._exit_logs.get(f"{provider}:{ticket_id}") or None
 
+    async def get_live_logs(
+        self, ticket_id: str, provider: str, tail: int = 300
+    ) -> Optional[str]:
+        """Return the CURRENT docker logs for a ticket's preview container.
+
+        Unlike :meth:`get_last_logs` (a snapshot captured only once, at
+        the moment a container was found dead), this fetches fresh
+        output straight from ``docker logs`` every call — so it works for
+        a container that is still running and just serving the wrong
+        thing (e.g. silently degraded to the static-file fallback because
+        its real dev command failed — see :data:`_STATIC_FALLBACK`'s
+        docstring), not only one that has already exited. ``docker logs``
+        itself works the same whether the container is running or merely
+        stopped-but-not-removed, so this needs no running/exited branch
+        of its own.
+
+        Falls back to the last captured exit-log snapshot when the
+        container is no longer tracked at all (pruned/removed) — better
+        than showing nothing for a container that died and was already
+        cleaned up before someone thought to check its logs.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Provider ticket identifier.
+        provider : str
+            Kanban provider name.
+        tail : int
+            Maximum number of trailing log lines to fetch.
+
+        Returns
+        -------
+        Optional[str]
+            The captured log tail, or ``None`` if there is nothing to
+            show (never started, or Docker itself is unreachable).
+        """
+        info = self.get_info(ticket_id, provider)
+        if info is not None:
+            logs = await self._capture_logs(info.container_name, tail=tail)
+            if logs:
+                return logs
+        return self.get_last_logs(ticket_id, provider)
+
     def is_serving(self, ticket_id: str, provider: str) -> bool:
         """Return ``True`` only once the app actually accepts connections.
 

@@ -4832,6 +4832,137 @@ def _dev_env_starting_page(
 </html>"""
 
 
+def _dev_env_logs_page(ticket_id: str, provider: str, *, token: str = "") -> str:
+    """Build the auto-refreshing docker-logs viewer page for
+    ``/dev-env/logs``.
+
+    A dev-environment preview container can be fully "up" (its port
+    accepts connections — ``/api/dev-env/status`` reports ``serving:
+    true``) while showing 404s or the wrong content entirely: the
+    generated entrypoint script runs the real dev command, and if THAT
+    fails, falls through to serving the raw repo directory as static
+    files instead (see ``_STATIC_FALLBACK`` in dev_environment.py) —
+    the container never actually exits, so nothing in the preview URL
+    itself hints at what went wrong. This page polls
+    ``/api/dev-env/logs`` (fresh ``docker logs`` output, not a one-time
+    exit snapshot) so that failure — a missing npm script, a Python
+    import error, a wrong working directory — is visible immediately.
+
+    Parameters
+    ----------
+    ticket_id : str
+        Provider ticket identifier.
+    provider : str
+        Kanban provider name.
+    token : str
+        ``MARCUS_AGENT_TOKEN`` value, if any — this page's own poll
+        requests carry it as ``?token=`` (the same mechanism the
+        Kanboard sidebar's links use) since a freshly opened tab has no
+        other way to authenticate against a token-protected Marcus.
+
+    Returns
+    -------
+    str
+        A complete, self-contained HTML document.
+    """
+    ticket_js = json.dumps(ticket_id)
+    provider_js = json.dumps(provider)
+    token_js = json.dumps(token)
+    display_html = html.escape(ticket_id)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Preview logs — {display_html}</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  body {{ font-family: system-ui, -apple-system, sans-serif; margin: 0;
+          background: #0f172a; color: #e2e8f0; }}
+  header {{ display: flex; align-items: center; gap: 12px; padding: 14px 20px;
+            border-bottom: 1px solid #1e293b; position: sticky; top: 0;
+            background: #0f172a; }}
+  h1 {{ font-size: 1rem; margin: 0; font-weight: 600; flex: 1; }}
+  .pill {{ font-size: 0.75rem; padding: 3px 9px; border-radius: 999px;
+           font-weight: 600; }}
+  .pill.running {{ background: #14532d; color: #86efac; }}
+  .pill.stopped {{ background: #450a0a; color: #fca5a5; }}
+  button {{ font: inherit; font-size: 0.8rem; padding: 5px 12px;
+            border-radius: 6px; border: 1px solid #334155; background: #1e293b;
+            color: #e2e8f0; cursor: pointer; }}
+  button:hover {{ background: #334155; }}
+  #command {{ padding: 8px 20px; font-size: 0.8rem; color: #94a3b8;
+              border-bottom: 1px solid #1e293b; word-break: break-all; }}
+  #command code {{ color: #38bdf8; }}
+  main {{ padding: 16px 20px 40px; }}
+  pre {{ white-space: pre-wrap; word-break: break-word; font: 12px/1.6
+         ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0; }}
+  #empty {{ color: #64748b; font-style: italic; }}
+</style>
+</head>
+<body>
+<header>
+  <h1>Preview logs — ticket {display_html}</h1>
+  <span class="pill" id="status">checking&hellip;</span>
+  <button id="refresh">Refresh now</button>
+</header>
+<div id="command" style="display:none">Last dev-server command: <code id="cmd"></code></div>
+<main>
+  <pre id="log"><span id="empty">Waiting for logs&hellip;</span></pre>
+</main>
+<script>
+  var TICKET = {ticket_js}, PROVIDER = {provider_js}, TOKEN = {token_js};
+  var logEl = document.getElementById("log");
+  var statusEl = document.getElementById("status");
+  var cmdWrap = document.getElementById("command");
+  var cmdEl = document.getElementById("cmd");
+  var autoScroll = true;
+
+  window.addEventListener("scroll", function () {{
+    var atBottom = window.innerHeight + window.scrollY
+      >= document.body.offsetHeight - 40;
+    autoScroll = atBottom;
+  }});
+
+  function apiUrl() {{
+    var u = "/api/dev-env/logs?ticket_id=" + encodeURIComponent(TICKET)
+      + "&provider=" + encodeURIComponent(PROVIDER);
+    if (TOKEN) {{ u += "&token=" + encodeURIComponent(TOKEN); }}
+    return u;
+  }}
+
+  function refresh() {{
+    fetch(apiUrl(), {{ cache: "no-store" }})
+      .then(function (r) {{ return r.json(); }})
+      .then(function (data) {{
+        statusEl.textContent = data.running ? "container running" : "container not running";
+        statusEl.className = "pill " + (data.running ? "running" : "stopped");
+        if (data.command) {{
+          cmdWrap.style.display = "block";
+          cmdEl.textContent = data.command;
+        }}
+        if (data.logs) {{
+          logEl.textContent = data.logs;
+        }} else if (!logEl.textContent || logEl.querySelector("#empty")) {{
+          logEl.innerHTML = '<span id="empty">No logs yet — the container may still be starting, '
+            + "or no preview has been started for this ticket.</span>";
+        }}
+        if (autoScroll) {{ window.scrollTo(0, document.body.scrollHeight); }}
+      }})
+      .catch(function () {{
+        statusEl.textContent = "could not reach Marcus";
+        statusEl.className = "pill stopped";
+      }});
+  }}
+
+  document.getElementById("refresh").addEventListener("click", refresh);
+  refresh();
+  setInterval(refresh, 3000);
+</script>
+</body>
+</html>"""
+
+
 async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
     """Construct and start the human-gated ticket workflow subsystem.
 
@@ -6442,6 +6573,89 @@ setInterval(refresh, 30000);
             response.headers["Access-Control-Allow-Origin"] = "*"
             return response
 
+        async def dev_env_logs_api(request: Request) -> JSONResponse:
+            """Return the CURRENT docker logs for a ticket's preview container.
+
+            Query params:
+                ticket_id  (required)
+                provider   (optional, default 'kanboard')
+
+            Response body
+            -------------
+            ``{"running": true, "logs": "...", "command": "..."}``
+            ``{"running": false, "logs": null, "command": null}``
+
+            Unlike ``/api/dev-env/status``'s ``logs`` field (a one-time
+            snapshot captured only when a container is found dead), this
+            fetches fresh output straight from ``docker logs`` on every
+            call — so it works for a container that's still running but
+            serving the wrong thing (its real dev command failed and it
+            silently degraded to the static-file fallback), not only one
+            that has already exited. Backs the ``/dev-env/logs`` page's
+            auto-refreshing viewer.
+            """
+            ticket_id = request.query_params.get("ticket_id", "")
+            provider = request.query_params.get("provider", server.provider)
+
+            dev_mgr = getattr(server, "_dev_env_manager", None)
+            logs = None
+            running = False
+            last_command = None
+            if dev_mgr is not None and ticket_id:
+                running = dev_mgr.get_info(ticket_id, provider) is not None
+                get_live_logs = getattr(dev_mgr, "get_live_logs", None)
+                if get_live_logs is not None:
+                    try:
+                        logs = await get_live_logs(ticket_id, provider)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "dev_env_logs_api: could not fetch logs for "
+                            "ticket %s: %s",
+                            ticket_id,
+                            exc,
+                        )
+                get_cmd = getattr(dev_mgr, "get_last_command", None)
+                if get_cmd is not None:
+                    last_command = get_cmd(ticket_id, provider)
+
+            response = JSONResponse(
+                {"running": running, "logs": logs, "command": last_command}
+            )
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            return response
+
+        async def dev_env_logs_view(request: Request) -> Response:
+            """Serve a live, auto-refreshing docker-logs viewer page for a
+            ticket's dev-environment preview container.
+
+            Query params:
+                ticket_id  (required)
+                provider   (optional, default 'kanboard')
+
+            Linked from the Kanboard sidebar's dev-environment panel next
+            to "Open Preview" — the direct diagnostic for "the preview
+            loads but 404s/shows the wrong thing": the container can be
+            fully "serving" (its port is open) while running nothing but
+            the static-file fallback, because the actual dev command
+            Marcus resolved failed inside the entrypoint script. That
+            failure is invisible from the preview URL itself but shows up
+            immediately in these logs (e.g. `npm error Missing script`,
+            `ModuleNotFoundError`, `pip: command not found`).
+            """
+            ticket_id = request.query_params.get("ticket_id", "")
+            provider = request.query_params.get("provider", server.provider)
+
+            if not ticket_id:
+                return HTMLResponse(
+                    "<h1>Missing ticket_id</h1>"
+                    "<p>Add <code>?ticket_id=&lt;id&gt;</code> to the URL.</p>",
+                    status_code=400,
+                )
+
+            token = request.query_params.get("token", "")
+            html_page = _dev_env_logs_page(ticket_id, provider, token=token)
+            return HTMLResponse(html_page)
+
         async def dev_env_main_view(request: Request) -> Response:
             """
             Start (or look up) the hot-reload preview of a project's MAIN
@@ -7448,6 +7662,8 @@ setInterval(refresh, 30000);
                 Route("/dev-env/view", dev_env_view, methods=["GET"]),
                 Route("/dev-env/stop", dev_env_stop, methods=["GET", "POST"]),
                 Route("/api/dev-env/status", dev_env_status, methods=["GET"]),
+                Route("/api/dev-env/logs", dev_env_logs_api, methods=["GET"]),
+                Route("/dev-env/logs", dev_env_logs_view, methods=["GET"]),
                 Route("/dev-env/main/view", dev_env_main_view, methods=["GET"]),
                 Route(
                     "/dev-env/main/stop", dev_env_main_stop, methods=["GET", "POST"]

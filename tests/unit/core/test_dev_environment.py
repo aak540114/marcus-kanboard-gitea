@@ -1819,3 +1819,86 @@ class TestExitDiagnostics:
 
         assert pruned in (True, False)  # must not raise KeyError
         assert docker_manager.get_info("T-41", "kanboard") is None
+
+
+class TestGetLiveLogs:
+    """get_live_logs() — fresh `docker logs` output for the /dev-env/logs
+    viewer, not a one-time exit snapshot. Must work for a container that's
+    still running (the common case: it's "up" but silently degraded to
+    the static-file fallback because its real dev command failed)."""
+
+    @pytest.fixture
+    def docker_manager(self, tmp_path):
+        config = DevEnvironmentConfig(
+            repo_path=str(tmp_path),
+            use_docker=True,
+            auto_detect=False,
+            dev_command="npm run dev -- --port {port}",
+            port_range=(19970, 19990),
+        )
+        return DevEnvironmentManager(
+            config=config, settings_manager=DevEnvSettingsManager(data_dir=tmp_path)
+        )
+
+    @pytest.mark.asyncio
+    async def test_fetches_fresh_logs_for_a_tracked_container(self, docker_manager):
+        """A container Marcus is still tracking (running or exited-but-
+        not-removed) gets its CURRENT docker logs, not a stale snapshot."""
+        with patch(
+            "subprocess.run", return_value=MagicMock(returncode=0, stderr="")
+        ):
+            await docker_manager.start("T-50", "kanboard", "feature/logs")
+
+        def _side_effect(cmd, **kwargs):
+            if cmd[:2] == ["docker", "logs"]:
+                return MagicMock(
+                    returncode=0, stdout="Server running on :3000\n", stderr=""
+                )
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("subprocess.run", side_effect=_side_effect):
+            logs = await docker_manager.get_live_logs("T-50", "kanboard")
+
+        assert logs is not None
+        assert "Server running on :3000" in logs
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_last_exit_logs_when_not_tracked(
+        self, docker_manager
+    ):
+        """A container already pruned/removed has nothing live to fetch —
+        falls back to whatever exit-log snapshot was captured, rather
+        than showing nothing for a preview that already crashed and was
+        cleaned up before someone thought to check its logs."""
+        docker_manager._exit_logs["kanboard:T-51"] = "ModuleNotFoundError: flask\n"
+
+        logs = await docker_manager.get_live_logs("T-51", "kanboard")
+
+        assert logs is not None
+        assert "ModuleNotFoundError" in logs
+
+    @pytest.mark.asyncio
+    async def test_none_when_nothing_ever_started(self, docker_manager):
+        """Never started at all -> nothing to show, not an error."""
+        logs = await docker_manager.get_live_logs("T-52", "kanboard")
+        assert logs is None
+
+    @pytest.mark.asyncio
+    async def test_tracked_but_docker_logs_empty_falls_back_to_exit_snapshot(
+        self, docker_manager
+    ):
+        """A tracked container whose live `docker logs` call comes back
+        empty (e.g. a transient docker error) still falls back to the
+        last captured exit-log snapshot, if one exists, rather than
+        returning nothing when something is available."""
+        with patch(
+            "subprocess.run", return_value=MagicMock(returncode=0, stderr="")
+        ):
+            await docker_manager.start("T-53", "kanboard", "feature/logs")
+        docker_manager._exit_logs["kanboard:T-53"] = "previous crash trace\n"
+
+        with patch("subprocess.run", side_effect=OSError("docker missing")):
+            logs = await docker_manager.get_live_logs("T-53", "kanboard")
+
+        assert logs is not None
+        assert "previous crash trace" in logs

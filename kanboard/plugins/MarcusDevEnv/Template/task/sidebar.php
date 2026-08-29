@@ -48,6 +48,12 @@ $stopUrl = $marcusUrl
     . '?ticket_id=' . urlencode((string) $ticketId)
     . '&provider='  . urlencode($provider);
 
+$logsUrl = $marcusUrl
+    . '/dev-env/logs'
+    . '?ticket_id=' . urlencode((string) $ticketId)
+    . '&provider='  . urlencode($provider)
+    . ($marcusToken !== '' ? '&token=' . urlencode($marcusToken) : '');
+
 $statusUrl = $marcusUrl
     . '/api/dev-env/status'
     . '?ticket_id=' . urlencode((string) $ticketId)
@@ -341,6 +347,7 @@ $agentsUrl = $marcusUrl . '/api/active-agents';
     /* ── URLs injected from PHP ──────────────────────────────────── */
     var VIEW_URL     = <?= json_encode($viewUrl) ?>;
     var STOP_URL     = <?= json_encode($stopUrl) ?>;
+    var LOGS_URL     = <?= json_encode($logsUrl) ?>;
     var STATUS_URL   = <?= json_encode($statusUrl) ?>;
     var LINKS_URL    = <?= json_encode($linksUrl) ?>;
     var AGENTS_URL   = <?= json_encode($agentsUrl) ?>;
@@ -448,6 +455,10 @@ $agentsUrl = $marcusUrl . '/api/active-agents';
             '<a href="' + previewUrl + '" target="_blank" rel="noopener noreferrer" '
             + 'class="btn btn-success btn-block">'
             + '&#127758; Open Preview'
+            + '</a>'
+            + '<a href="' + LOGS_URL + '" target="_blank" rel="noopener noreferrer" '
+            + 'class="btn btn-block" id="marcus-logs-btn">'
+            + '&#128220; View Logs'
             + '</a>'
             + '<button class="btn btn-danger btn-block" id="marcus-stop-btn">'
             + '&#9632; Stop Preview'
