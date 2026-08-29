@@ -4630,6 +4630,50 @@ def _ensure_pip_break_system_packages(stack: Any) -> bool:
     return True
 
 
+def _ensure_django_dev_server_noreload(stack: Any) -> bool:
+    """Auto-heal a Django ``dev_cmd`` that predates always appending
+    ``--noreload`` to ``manage.py runserver``, appending it in place.
+
+    Confirmed against a real, reported failure (via the ``/dev-env/logs``
+    viewer): a project's stored ``dev_cmd`` was ``python manage.py
+    runserver 0.0.0.0:3000`` — missing ``--noreload``, unlike
+    ``STACK_CONFIGS["python-django"]["start"]``, which has always
+    included it. Same root cause class as
+    :func:`_ensure_pip_break_system_packages`: language/framework already
+    match the repo, so :func:`_reconcile_stack_with_repo` never touches
+    the stored command text. Without the flag, Django's own StatReloader
+    autoreloader competes with Marcus's OWN inotify-based restart loop
+    (see ``_build_entrypoint`` in dev_environment.py) — both watch
+    ``/app`` for file changes and both try to rebind port 3000 on
+    restart, observed in the container's own logs as a burst of "That
+    port is already in use" / "httpd: bind: Address in use" errors while
+    the two reload mechanisms fight each other.
+
+    Safe to correct unconditionally: ``STACK_CONFIGS["python-django"]``
+    always uses ``--noreload`` for exactly this reason (Marcus's restart
+    loop already provides reload — see its ``"hm": False`` setting there
+    — so Django's own autoreloader is pure redundant conflict, never a
+    legitimate customization).
+
+    Parameters
+    ----------
+    stack : ProjectStack
+        The resolved stack to check (mutated in place if it needed
+        healing).
+
+    Returns
+    -------
+    bool
+        ``True`` if *stack* was modified, ``False`` if it already had
+        the flag or isn't a ``manage.py runserver`` command at all.
+    """
+    dev_cmd = getattr(stack, "dev_cmd", "") or ""
+    if "manage.py runserver" not in dev_cmd or "--noreload" in dev_cmd:
+        return False
+    stack.dev_cmd = dev_cmd.rstrip() + " --noreload"
+    return True
+
+
 async def _determine_dev_preview_stack(
     server: "MarcusServer",
     desc_mgr: Optional[Any],
@@ -4716,14 +4760,28 @@ async def _determine_dev_preview_stack(
             server, desc_mgr, project_id, resolved, repo_path
         )
 
-    if resolved is not None and _ensure_pip_break_system_packages(resolved):
-        logger.warning(
-            "Project %d's stored install command predates the "
-            "--break-system-packages fix — healed it in place",
-            project_id,
-        )
-        if desc_mgr is not None and desc_mgr.can_auto_update(project_id):
-            _persist_detected_stack(desc_mgr, project_id, resolved)
+    if resolved is not None:
+        healed_pip = _ensure_pip_break_system_packages(resolved)
+        healed_django = _ensure_django_dev_server_noreload(resolved)
+        if healed_pip or healed_django:
+            logger.warning(
+                "Project %d's stored stack predated a known fix (%s) — "
+                "healed it in place",
+                project_id,
+                ", ".join(
+                    filter(
+                        None,
+                        [
+                            "install_cmd missing --break-system-packages"
+                            if healed_pip
+                            else None,
+                            "dev_cmd missing --noreload" if healed_django else None,
+                        ],
+                    )
+                ),
+            )
+            if desc_mgr is not None and desc_mgr.can_auto_update(project_id):
+                _persist_detected_stack(desc_mgr, project_id, resolved)
 
     if resolved is not None and repo_path and os.path.isdir(repo_path):
         await _maybe_update_dev_preview_readme(
@@ -4976,6 +5034,13 @@ def _dev_env_logs_page(ticket_id: str, provider: str, *, token: str = "") -> str
   var cmdWrap = document.getElementById("command");
   var cmdEl = document.getElementById("cmd");
   var autoScroll = true;
+  // Auto-refresh runs only while the container is actually running — once
+  // it stops (the human clicked Stop Preview, or the container exited),
+  // polling stops too instead of hammering an endpoint with nothing new to
+  // say forever. "Refresh now" always works regardless, and re-arms
+  // auto-refresh the moment it observes running:true again (e.g. a new
+  // preview was started for the same ticket).
+  var pollTimer = null;
 
   window.addEventListener("scroll", function () {{
     var atBottom = window.innerHeight + window.scrollY
@@ -4988,6 +5053,13 @@ def _dev_env_logs_page(ticket_id: str, provider: str, *, token: str = "") -> str
       + "&provider=" + encodeURIComponent(PROVIDER);
     if (TOKEN) {{ u += "&token=" + encodeURIComponent(TOKEN); }}
     return u;
+  }}
+
+  function startPolling() {{
+    if (pollTimer === null) {{ pollTimer = setInterval(refresh, 3000); }}
+  }}
+  function stopPolling() {{
+    if (pollTimer !== null) {{ clearInterval(pollTimer); pollTimer = null; }}
   }}
 
   function refresh() {{
@@ -5007,16 +5079,17 @@ def _dev_env_logs_page(ticket_id: str, provider: str, *, token: str = "") -> str
             + "or no preview has been started for this ticket.</span>";
         }}
         if (autoScroll) {{ window.scrollTo(0, document.body.scrollHeight); }}
+        if (data.running) {{ startPolling(); }} else {{ stopPolling(); }}
       }})
       .catch(function () {{
         statusEl.textContent = "could not reach Marcus";
         statusEl.className = "pill stopped";
+        stopPolling();
       }});
   }}
 
   document.getElementById("refresh").addEventListener("click", refresh);
   refresh();
-  setInterval(refresh, 3000);
 </script>
 </body>
 </html>"""

@@ -62,3 +62,19 @@ class TestDevEnvLogsPage:
         page = _dev_env_logs_page("7", "kanboard", token="secret123")
         # It appears exactly once: inside the JS var assignment.
         assert page.count("secret123") == 1
+
+    def test_stops_polling_once_the_container_is_not_running(self) -> None:
+        """Regression: the page used to poll forever via a single
+        unconditional setInterval, even after the human clicked Stop
+        Preview — so it kept hammering the API and showing a "container
+        not running" pill indefinitely. Polling must stop once running
+        is observed false, and only resume if running becomes true again
+        (e.g. a new preview was started for the same ticket)."""
+        page = _dev_env_logs_page("7", "kanboard")
+        assert "function stopPolling" in page
+        assert "function startPolling" in page
+        assert "clearInterval" in page
+        # The decision to start/stop lives in refresh()'s own callback,
+        # driven by data.running — not a single unconditional interval
+        # set up once at page load.
+        assert "if (data.running) { startPolling(); } else { stopPolling(); }" in page

@@ -69,6 +69,14 @@ $devEnvMainStopUrl = $marcusUrl . '/dev-env/main/stop'
 $devEnvMainStatusUrl = $marcusUrl . '/api/dev-env/main/status'
                   . '?project_id=' . urlencode((string) $projectId)
                   . '&provider='   . urlencode('kanboard');
+// /dev-env/logs is generic over ticket_id — the main-branch preview's
+// DevEnvironmentManager identity is the synthetic "main-<project_id>"
+// (see _main_preview_ticket_id in server.py), so it needs no dedicated
+// route of its own, just this one query param.
+$devEnvMainLogsUrl = $marcusUrl . '/dev-env/logs'
+                  . '?ticket_id=' . urlencode('main-' . (string) $projectId)
+                  . '&provider='  . urlencode('kanboard')
+                  . ($marcusToken !== '' ? '&token=' . urlencode($marcusToken) : '');
 $cloneProjectUrl       = $marcusUrl . '/api/clone-project';
 $cloneProjectStatusUrl = $marcusUrl . '/api/clone-project-status';
 ?>
@@ -293,6 +301,9 @@ $cloneProjectStatusUrl = $marcusUrl . '/api/clone-project-status';
 .marcus-main-preview-btn.stop {
     background: #fef2f2; color: #b91c1c; border-color: #fca5a5;
 }
+.marcus-main-preview-btn.logs {
+    background: #f9fafb; color: #374151; border-color: #d1d5db;
+}
 .marcus-main-preview-btn:disabled { opacity: 0.6; cursor: default; }
 
 /* ── Controls row ─────────────────────────────────────────────────────
@@ -478,6 +489,7 @@ $cloneProjectStatusUrl = $marcusUrl . '/api/clone-project-status';
     var DEV_ENV_MAIN_VIEW_URL   = <?= json_encode($devEnvMainViewUrl) ?>;
     var DEV_ENV_MAIN_STOP_URL   = <?= json_encode($devEnvMainStopUrl) ?>;
     var DEV_ENV_MAIN_STATUS_URL = <?= json_encode($devEnvMainStatusUrl) ?>;
+    var DEV_ENV_MAIN_LOGS_URL   = <?= json_encode($devEnvMainLogsUrl) ?>;
     var CLONE_PROJECT_URL        = <?= json_encode($cloneProjectUrl) ?>;
     var CLONE_PROJECT_STATUS_URL = <?= json_encode($cloneProjectStatusUrl) ?>;
     var PROJECT_ID       = <?= json_encode((int) $projectId) ?>;
@@ -1002,6 +1014,11 @@ $cloneProjectStatusUrl = $marcusUrl . '/api/clone-project-status';
                 '<a href="' + mEsc(previewUrl) + '" target="_blank" '
                 + 'rel="noopener noreferrer" class="marcus-main-preview-btn open">'
                 + '&#127758; Open Main Preview'
+                + '</a>'
+                + '<a href="' + DEV_ENV_MAIN_LOGS_URL + '" target="_blank" '
+                + 'rel="noopener noreferrer" class="marcus-main-preview-btn logs" '
+                + 'id="marcus-main-logs-btn">'
+                + '&#128220; View Logs'
                 + '</a>'
                 + '<button class="marcus-main-preview-btn stop" id="marcus-main-stop-btn">'
                 + '&#9632; Stop Main Preview'

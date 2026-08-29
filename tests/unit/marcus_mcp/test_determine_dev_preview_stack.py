@@ -39,6 +39,7 @@ from src.core.repo_stack_cache import RepoStackCache
 from src.marcus_mcp.server import (
     _detect_stack_from_repo_only,
     _determine_dev_preview_stack,
+    _ensure_django_dev_server_noreload,
     _ensure_pip_break_system_packages,
     _get_repo_stack_cache_mgr,
     _maybe_ai_infer_stack,
@@ -620,6 +621,65 @@ class TestEnsurePipBreakSystemPackages:
         assert stack.install_cmd == ""
 
 
+class TestEnsureDjangoDevServerNoreload:
+    """Regression: a second real, reported failure on the SAME project as
+    TestEnsurePipBreakSystemPackages — after healing install_cmd, the
+    container's own logs showed "Watching for file changes with
+    StatReloader" (Django's own autoreloader — only active without
+    --noreload) followed by a burst of "That port is already in use" /
+    "httpd: bind: Address in use" errors: Django's autoreloader and
+    Marcus's own inotify-based restart loop both watch /app and both try
+    to rebind port 3000 on a change, so they fight each other. Same root
+    cause class as the pip fix: the stored dev_cmd predates
+    STACK_CONFIGS["python-django"] always including --noreload, and
+    since language/framework already match the repo, _reconcile_stack_
+    with_repo never re-validates the command text itself."""
+
+    def test_appends_noreload_to_a_bare_runserver_command(self):
+        stack = ProjectStack(
+            language="python", framework="Django",
+            install_cmd="pip install --break-system-packages -r requirements.txt",
+            dev_cmd="python manage.py runserver 0.0.0.0:3000",
+        )
+
+        changed = _ensure_django_dev_server_noreload(stack)
+
+        assert changed is True
+        assert stack.dev_cmd == "python manage.py runserver 0.0.0.0:3000 --noreload"
+
+    def test_leaves_a_command_that_already_has_noreload_untouched(self):
+        stack = ProjectStack(
+            language="python", framework="Django",
+            install_cmd="pip install --break-system-packages -r requirements.txt",
+            dev_cmd="python manage.py runserver 0.0.0.0:3000 --noreload",
+        )
+
+        changed = _ensure_django_dev_server_noreload(stack)
+
+        assert changed is False
+        assert stack.dev_cmd == "python manage.py runserver 0.0.0.0:3000 --noreload"
+
+    def test_leaves_non_django_dev_commands_untouched(self):
+        stack = ProjectStack(
+            language="python", framework="Flask",
+            install_cmd="pip install --break-system-packages -r requirements.txt",
+            dev_cmd="flask run --host 0.0.0.0 --port 3000",
+        )
+
+        changed = _ensure_django_dev_server_noreload(stack)
+
+        assert changed is False
+        assert stack.dev_cmd == "flask run --host 0.0.0.0 --port 3000"
+
+    def test_leaves_an_empty_dev_cmd_untouched(self):
+        stack = ProjectStack(language="python", framework="", install_cmd="", dev_cmd="")
+
+        changed = _ensure_django_dev_server_noreload(stack)
+
+        assert changed is False
+        assert stack.dev_cmd == ""
+
+
 class TestDetermineDevPreviewStackHealsStaleInstallCmd:
     @pytest.mark.asyncio
     async def test_heals_and_persists_a_stale_declared_install_cmd(self, tmp_path):
@@ -653,14 +713,17 @@ class TestDetermineDevPreviewStackHealsStaleInstallCmd:
 
         assert result is not None
         assert "--break-system-packages" in result.install_cmd
+        assert "--noreload" in result.dev_cmd
 
         # And persisted back to disk — fixed for every future preview too.
         text = mgr.get_description(104)
         assert "--break-system-packages" in text
+        assert "--noreload" in text
 
     @pytest.mark.asyncio
     async def test_already_healthy_install_cmd_is_not_rewritten(self, tmp_path):
-        """No stale command -> no spurious persist/history entry."""
+        """No stale command (install_cmd OR dev_cmd) -> no spurious
+        persist/history entry."""
         repo = tmp_path / "repo"
         repo.mkdir()
         (repo / "requirements.txt").write_text("Django>=4.2\n")
@@ -670,7 +733,8 @@ class TestDetermineDevPreviewStackHealsStaleInstallCmd:
         mgr.update_description(
             104,
             "## Tech Stack\n- **Language**: Python\n- **Framework**: Django\n"
-            "- **Dev server command**: python manage.py runserver 0.0.0.0:3000\n"
+            "- **Dev server command**: python manage.py runserver 0.0.0.0:3000 "
+            "--noreload\n"
             "- **Install command**: pip install --break-system-packages "
             "-r requirements.txt\n",
             source=SOURCE_INFERRED,
@@ -719,4 +783,5 @@ class TestDetermineDevPreviewStackHealsStaleInstallCmd:
 
         assert result is not None
         assert "--break-system-packages" in result.install_cmd  # healed for THIS preview
+        assert "--noreload" in result.dev_cmd  # healed for THIS preview too
         assert mgr.get_description(104) == original_text  # but never rewritten on disk
