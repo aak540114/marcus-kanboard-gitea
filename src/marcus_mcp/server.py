@@ -4580,6 +4580,56 @@ async def _maybe_update_dev_preview_readme(
         )
 
 
+def _ensure_pip_break_system_packages(stack: Any) -> bool:
+    """Auto-heal a Python stack's ``install_cmd`` that predates the
+    ``--break-system-packages`` fix, appending the flag in place.
+
+    Confirmed against a real, reported failure: a project's Tech Stack
+    was declared (and its ``install_cmd`` stored verbatim) before this
+    flag was added anywhere in this codebase. Its language/framework
+    ("python"/"Django") match what the repo's own files say, so
+    :func:`_reconcile_stack_with_repo` treats it as "no mismatch" and
+    returns it completely unchanged — that function only ever compares
+    LANGUAGE/FRAMEWORK, never re-validates the stored COMMAND TEXT
+    itself. The stale command then fails every single preview start with
+    PEP 668's "externally-managed-environment" error (Alpine 3.20's
+    ``python3`` is 3.12+, which enforces it), pip installs nothing, and
+    the app then fails to import its own framework (e.g. ``ModuleNotFound
+    Error: No module named 'django'``) — invisible from the preview URL,
+    only visible in the container's logs.
+
+    Unlike other stack fields, this is safe to correct unconditionally
+    rather than only on a declared/detected mismatch: no valid custom
+    ``pip install`` invocation can ever succeed on this container without
+    the flag, so there is no legitimate customization this could clobber
+    — it only ever turns a guaranteed failure into a working install.
+
+    Parameters
+    ----------
+    stack : ProjectStack
+        The resolved stack to check (mutated in place if it needed
+        healing).
+
+    Returns
+    -------
+    bool
+        ``True`` if *stack* was modified (so the caller knows whether to
+        persist the correction), ``False`` if it already had the flag or
+        isn't a ``pip install`` command at all.
+    """
+    install_cmd = getattr(stack, "install_cmd", "") or ""
+    if (
+        (getattr(stack, "language", "") or "").lower() != "python"
+        or "pip install" not in install_cmd
+        or "--break-system-packages" in install_cmd
+    ):
+        return False
+    stack.install_cmd = install_cmd.replace(
+        "pip install", "pip install --break-system-packages", 1
+    )
+    return True
+
+
 async def _determine_dev_preview_stack(
     server: "MarcusServer",
     desc_mgr: Optional[Any],
@@ -4665,6 +4715,15 @@ async def _determine_dev_preview_stack(
         resolved = await _maybe_ai_infer_stack(
             server, desc_mgr, project_id, resolved, repo_path
         )
+
+    if resolved is not None and _ensure_pip_break_system_packages(resolved):
+        logger.warning(
+            "Project %d's stored install command predates the "
+            "--break-system-packages fix — healed it in place",
+            project_id,
+        )
+        if desc_mgr is not None and desc_mgr.can_auto_update(project_id):
+            _persist_detected_stack(desc_mgr, project_id, resolved)
 
     if resolved is not None and repo_path and os.path.isdir(repo_path):
         await _maybe_update_dev_preview_readme(

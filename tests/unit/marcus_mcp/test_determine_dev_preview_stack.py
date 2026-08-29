@@ -30,11 +30,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.core.project_description import ProjectDescriptionManager, ProjectStack
+from src.core.project_description import (
+    SOURCE_INFERRED,
+    ProjectDescriptionManager,
+    ProjectStack,
+)
 from src.core.repo_stack_cache import RepoStackCache
 from src.marcus_mcp.server import (
     _detect_stack_from_repo_only,
     _determine_dev_preview_stack,
+    _ensure_pip_break_system_packages,
     _get_repo_stack_cache_mgr,
     _maybe_ai_infer_stack,
     _maybe_update_dev_preview_readme,
@@ -541,3 +546,177 @@ class TestDetermineDevPreviewStack:
         )
 
         assert result is None
+
+
+class TestEnsurePipBreakSystemPackages:
+    """Regression: a real, reported production failure. A project's
+    Tech Stack was declared before --break-system-packages existed in
+    this codebase; its stored install_cmd lacks it. Because language and
+    framework both already match the repo (python/Django), _reconcile_
+    stack_with_repo treats it as "no mismatch" and never touches it — so
+    every preview start failed with PEP 668's "externally-managed-
+    environment" error, pip installed nothing, and the app failed to
+    import its own framework. Confirmed from the actual container logs:
+    "ModuleNotFoundError: No module named 'django'"."""
+
+    def test_appends_flag_to_a_bare_pip_install(self):
+        stack = ProjectStack(
+            language="python", framework="Django",
+            install_cmd="pip install -r requirements.txt",
+            dev_cmd="python manage.py runserver 0.0.0.0:3000",
+        )
+
+        changed = _ensure_pip_break_system_packages(stack)
+
+        assert changed is True
+        assert stack.install_cmd == (
+            "pip install --break-system-packages -r requirements.txt"
+        )
+
+    def test_leaves_a_command_that_already_has_the_flag_untouched(self):
+        stack = ProjectStack(
+            language="python", framework="Django",
+            install_cmd="pip install --break-system-packages -r requirements.txt",
+            dev_cmd="python manage.py runserver 0.0.0.0:3000",
+        )
+
+        changed = _ensure_pip_break_system_packages(stack)
+
+        assert changed is False
+        assert stack.install_cmd == (
+            "pip install --break-system-packages -r requirements.txt"
+        )
+
+    def test_leaves_non_python_stacks_untouched(self):
+        stack = ProjectStack(
+            language="nodejs", framework="Express",
+            install_cmd="npm install", dev_cmd="npm start",
+        )
+
+        changed = _ensure_pip_break_system_packages(stack)
+
+        assert changed is False
+        assert stack.install_cmd == "npm install"
+
+    def test_leaves_a_python_stack_with_no_pip_install_untouched(self):
+        """e.g. a Poetry/uv-based project with a different install
+        command entirely — nothing here to "fix"."""
+        stack = ProjectStack(
+            language="python", framework="Django",
+            install_cmd="poetry install", dev_cmd="python manage.py runserver",
+        )
+
+        changed = _ensure_pip_break_system_packages(stack)
+
+        assert changed is False
+        assert stack.install_cmd == "poetry install"
+
+    def test_leaves_an_empty_install_cmd_untouched(self):
+        stack = ProjectStack(language="python", framework="", install_cmd="", dev_cmd="x")
+
+        changed = _ensure_pip_break_system_packages(stack)
+
+        assert changed is False
+        assert stack.install_cmd == ""
+
+
+class TestDetermineDevPreviewStackHealsStaleInstallCmd:
+    @pytest.mark.asyncio
+    async def test_heals_and_persists_a_stale_declared_install_cmd(self, tmp_path):
+        """The exact reported scenario: declared stack's language/
+        framework already match the repo (no reconciliation mismatch),
+        but its stored install_cmd predates the flag. Must be healed for
+        THIS preview and persisted so it's fixed for good."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "requirements.txt").write_text("Django>=4.2\n")
+        (repo / "manage.py").write_text("#!/usr/bin/env python\n")
+        server = _server(tmp_path, ai_engine=None)
+        mgr = _mgr(tmp_path)
+        mgr.update_description(
+            104,
+            "## Tech Stack\n- **Language**: Python\n- **Framework**: Django\n"
+            "- **Dev server command**: python manage.py runserver 0.0.0.0:3000\n"
+            "- **Install command**: pip install -r requirements.txt\n",
+            source=SOURCE_INFERRED,
+        )
+        declared = mgr.get_stack(104)
+        assert declared is not None  # sanity: the fixture text parses
+
+        with patch(
+            "src.core.repo_readme_writer.update_dev_preview_readme_section",
+            new=AsyncMock(return_value=False),
+        ):
+            result = await _determine_dev_preview_stack(
+                server, mgr, 104, declared, str(repo)
+            )
+
+        assert result is not None
+        assert "--break-system-packages" in result.install_cmd
+
+        # And persisted back to disk — fixed for every future preview too.
+        text = mgr.get_description(104)
+        assert "--break-system-packages" in text
+
+    @pytest.mark.asyncio
+    async def test_already_healthy_install_cmd_is_not_rewritten(self, tmp_path):
+        """No stale command -> no spurious persist/history entry."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "requirements.txt").write_text("Django>=4.2\n")
+        (repo / "manage.py").write_text("#!/usr/bin/env python\n")
+        server = _server(tmp_path, ai_engine=None)
+        mgr = _mgr(tmp_path)
+        mgr.update_description(
+            104,
+            "## Tech Stack\n- **Language**: Python\n- **Framework**: Django\n"
+            "- **Dev server command**: python manage.py runserver 0.0.0.0:3000\n"
+            "- **Install command**: pip install --break-system-packages "
+            "-r requirements.txt\n",
+            source=SOURCE_INFERRED,
+        )
+        declared = mgr.get_stack(104)
+        before_history_len = len(mgr.get_history(104))
+
+        with patch(
+            "src.core.repo_readme_writer.update_dev_preview_readme_section",
+            new=AsyncMock(return_value=False),
+        ):
+            await _determine_dev_preview_stack(server, mgr, 104, declared, str(repo))
+
+        assert len(mgr.get_history(104)) == before_history_len
+
+    @pytest.mark.asyncio
+    async def test_heals_in_memory_even_over_a_human_lock_but_does_not_persist(
+        self, tmp_path
+    ):
+        """A human's own description always wins on disk — same rule as
+        every other correction in this file (e.g. a language/framework
+        mismatch). But THIS preview must still work: the in-memory stack
+        used to actually start the container is healed regardless, only
+        the on-disk persistence is skipped."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "requirements.txt").write_text("Django>=4.2\n")
+        (repo / "manage.py").write_text("#!/usr/bin/env python\n")
+        server = _server(tmp_path, ai_engine=None)
+        mgr = _mgr(tmp_path)
+        original_text = (
+            "## Tech Stack\n- **Language**: Python\n- **Framework**: Django\n"
+            "- **Dev server command**: python manage.py runserver 0.0.0.0:3000\n"
+            "- **Install command**: pip install -r requirements.txt\n"
+        )
+        mgr.update_description(104, original_text)  # default source=SOURCE_HUMAN
+        declared = mgr.get_stack(104)
+
+        with patch(
+            "src.core.repo_readme_writer.update_dev_preview_readme_section",
+            new=AsyncMock(return_value=False),
+        ):
+            result = await _determine_dev_preview_stack(
+                server, mgr, 104, declared, str(repo)
+            )
+
+        assert result is not None
+        assert "--break-system-packages" in result.install_cmd  # healed for THIS preview
+        assert mgr.get_description(104) == original_text  # but never rewritten on disk
