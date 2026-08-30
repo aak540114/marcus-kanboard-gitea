@@ -574,6 +574,30 @@ class TestEnsurePipBreakSystemPackages:
             "pip install --break-system-packages -r requirements.txt"
         )
 
+    def test_heals_every_pip_install_in_a_chained_command(self):
+        """Regression: a chained/monorepo install_cmd (e.g. separate
+        backend/frontend requirements) has more than one real `pip
+        install` invocation. Healing only the first would leave the
+        second hitting the exact same PEP 668 failure that was just
+        fixed for the first — confirmed empirically before this fix
+        existed (str.replace(..., 1) only touches the first match)."""
+        stack = ProjectStack(
+            language="python", framework="Django",
+            install_cmd=(
+                "pip install -r backend/requirements.txt "
+                "&& pip install -r frontend/requirements.txt"
+            ),
+            dev_cmd="python manage.py runserver 0.0.0.0:3000",
+        )
+
+        changed = _ensure_pip_break_system_packages(stack)
+
+        assert changed is True
+        assert stack.install_cmd == (
+            "pip install --break-system-packages -r backend/requirements.txt "
+            "&& pip install --break-system-packages -r frontend/requirements.txt"
+        )
+
     def test_leaves_a_command_that_already_has_the_flag_untouched(self):
         stack = ProjectStack(
             language="python", framework="Django",

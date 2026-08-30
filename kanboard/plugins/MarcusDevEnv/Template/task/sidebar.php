@@ -497,6 +497,15 @@ $agentsUrl = $marcusUrl . '/api/active-agents';
         fetch(STATUS_URL, { cache: 'no-store', headers: marcusHeaders() })
             .then(function (r) { return r.json(); })
             .then(function (data) {
+                // Re-check here, not just before issuing the fetch above: a
+                // poll already in flight when Stop is clicked resolves with
+                // STALE data (still running:true) after devEnvLastState has
+                // since moved to 'stopping' — without this second check that
+                // stale response would call renderRunning() and silently
+                // replace the "Stopping…" button with a fresh, enabled one
+                // while the actual stop request is still pending
+                // server-side.
+                if (devEnvLastState === 'stopping') { return; }
                 var running = !!(data.running && data.url);
                 var newState = running ? 'running' : 'stopped';
                 if (newState === devEnvLastState) { return; } // nothing changed — skip re-render

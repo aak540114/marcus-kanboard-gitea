@@ -4624,8 +4624,14 @@ def _ensure_pip_break_system_packages(stack: Any) -> bool:
         or "--break-system-packages" in install_cmd
     ):
         return False
+    # Every occurrence, not just the first: a chained install_cmd (e.g. a
+    # monorepo's "pip install -r backend/requirements.txt && pip install
+    # -r frontend/requirements.txt") has more than one real `pip install`
+    # invocation, and each one independently hits the same PEP 668 error
+    # without the flag — healing only the first would still leave the
+    # install step (and therefore the whole preview) failing.
     stack.install_cmd = install_cmd.replace(
-        "pip install", "pip install --break-system-packages", 1
+        "pip install", "pip install --break-system-packages"
     )
     return True
 

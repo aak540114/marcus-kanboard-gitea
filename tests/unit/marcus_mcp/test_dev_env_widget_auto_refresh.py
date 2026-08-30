@@ -55,8 +55,24 @@ class TestSidebarDevEnvPanelPolls:
         rebuild the DOM (flicker, lost focus) every 4 seconds."""
         src = SIDEBAR.read_text()
         idx = src.index("function checkDevEnvStatus")
-        block = src[idx : idx + 700]
+        block = src[idx : idx + 1200]
         assert "newState === devEnvLastState" in block
+
+    def test_stopping_guard_is_rechecked_after_the_fetch_resolves(self):
+        """Regression: checking 'stopping' only BEFORE issuing the fetch
+        is not enough — a poll already in flight when Stop is clicked
+        resolves with stale running:true data after devEnvLastState has
+        since moved to 'stopping', which used to slip past the (now
+        mismatched) newState-vs-devEnvLastState check and call
+        renderRunning(), silently replacing the "Stopping…" button with
+        a fresh, enabled one mid-request. Confirmed by an isolated JS
+        repro before this fix existed. The guard must appear a SECOND
+        time, inside the .then(function (data) {...}) callback itself —
+        not just once, before the fetch call."""
+        src = SIDEBAR.read_text()
+        idx = src.index("function checkDevEnvStatus")
+        block = src[idx : idx + 1200]
+        assert block.count("devEnvLastState === 'stopping'") >= 2
 
 
 class TestMainPreviewWidgetPolls:
@@ -77,5 +93,15 @@ class TestMainPreviewWidgetPolls:
     def test_unchanged_status_does_not_force_a_rerender(self):
         src = HEADER.read_text()
         idx = src.index("function checkStatus")
-        block = src[idx : idx + 700]
+        block = src[idx : idx + 1200]
         assert "newState === lastState" in block
+
+    def test_stopping_guard_is_rechecked_after_the_fetch_resolves(self):
+        """Regression: same race as the sidebar panel's checkDevEnvStatus
+        — see its identical test for the full trace. The guard must
+        appear a SECOND time, inside the .then(function (data) {...})
+        callback, not just once before the fetch call."""
+        src = HEADER.read_text()
+        idx = src.index("function checkStatus")
+        block = src[idx : idx + 1200]
+        assert block.count("lastState === 'stopping'") >= 2
