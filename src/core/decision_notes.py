@@ -24,14 +24,24 @@ get_project_decision_notes
 """
 
 import re
-from typing import Any, Dict, List
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 # Matches "🏗️ Note: <text>", case-insensitive on "Note", capturing
-# everything up to the "\n\n---" footer separator that CommentFormatter
-# appends (see ``_FOOTER`` in src/core/comment_protocol.py) or the end of
-# the comment if there's no footer (e.g. a hand-typed comment).
+# everything up to whichever comes first: the "\n\n---" footer separator
+# that CommentFormatter appends (see ``_FOOTER`` in
+# src/core/comment_protocol.py), the START of another "🏗️ Note:" later in
+# the SAME comment, or the end of the comment (no footer, e.g. a
+# hand-typed comment). The lookahead (rather than a consuming
+# alternation) is what makes the second case work: it stops the capture
+# without consuming the next "🏗️ Note:", so finditer's next scan starts
+# right there and finds it as its own match — without it, one comment
+# containing two notes (nothing stops an agent from flagging two
+# decisions in a single post_ticket_progress call) merges into a single
+# match spanning both, embedding a stray "🏗️ Note:" fragment inside the
+# first note's captured text instead of splitting them.
 _NOTE_RE = re.compile(
-    r"🏗️\s*note:[ \t]*(.*?)(?:\n\n---|\Z)",
+    r"🏗️\s*note:[ \t]*(.*?)(?=\n\n---|\n\n🏗️\s*note:|\Z)",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -62,6 +72,55 @@ def extract_notes_from_comment(content: str) -> List[str]:
     return notes
 
 
+def _normalize_comment_date(raw: Any) -> Optional[str]:
+    """Normalize a comment's raw ``date`` value to a sortable ISO 8601 string.
+
+    ``KanboardKanban.get_comments`` passes ``date_creation`` straight
+    through from Kanboard's JSON-RPC response as a raw Unix epoch integer
+    (confirmed by ``TestGetComments.test_normalizes_comment_fields`` in
+    ``tests/unit/integrations/test_kanboard_kanban.py``, e.g.
+    ``{"date": 1700000001}``) despite that method's own docstring
+    describing it as "ISO 8601". Sorting or displaying that integer
+    directly is wrong: mixing it with ``None`` (falls back to ``""`` in
+    the sort key) across different comments raises ``TypeError: '<' not
+    supported between instances of 'int' and 'str'`` in
+    :func:`get_project_decision_notes`'s sort, and even when it doesn't
+    crash, a raw epoch int (e.g. ``1700000001``) is unreadable in the UI.
+    ``0``/``"0"`` is Kanboard's convention for "unset" (see
+    ``_parse_kanboard_ts`` in
+    ``src/integrations/providers/kanboard_kanban.py``) and normalizes to
+    ``None`` here too. A non-numeric value (e.g. another provider already
+    returning an ISO string) passes through unchanged.
+
+    Parameters
+    ----------
+    raw : Any
+        The raw ``"date"`` value from a comment dict.
+
+    Returns
+    -------
+    Optional[str]
+        A UTC ISO 8601 string, the original string unchanged if it wasn't
+        numeric, or ``None`` if there's nothing usable.
+    """
+    if not raw:
+        return None
+    if isinstance(raw, (int, float)) or (
+        isinstance(raw, str) and raw.lstrip("-").isdigit()
+    ):
+        try:
+            ts = int(raw)
+        except (TypeError, ValueError):
+            return None
+        if ts == 0:
+            return None
+        try:
+            return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+        except (OSError, OverflowError, ValueError):
+            return None
+    return str(raw)
+
+
 async def get_project_decision_notes(
     kanban_client: Any, project_id: int
 ) -> List[Dict[str, Any]]:
@@ -80,10 +139,12 @@ async def get_project_decision_notes(
     -------
     List[Dict[str, Any]]
         One entry per flagged note, each with keys ``ticket_id``,
-        ``ticket_title``, ``note``, ``author`` and ``date``. Sorted
-        newest first by comment date; notes without a date sort last.
-        Empty list if the project has no tickets, no comments, or no
-        flagged notes.
+        ``ticket_title``, ``note``, ``author`` and ``date`` (a UTC ISO
+        8601 string, normalized via :func:`_normalize_comment_date` from
+        Kanboard's raw Unix-epoch comment timestamp — never the raw
+        int). Sorted newest first by comment date; notes without a date
+        sort last. Empty list if the project has no tickets, no
+        comments, or no flagged notes.
     """
     tasks = await kanban_client.get_all_tasks()
     project_id_str = str(project_id)
@@ -101,7 +162,7 @@ async def get_project_decision_notes(
                         "ticket_title": task.name,
                         "note": note_text,
                         "author": comment.get("author"),
-                        "date": comment.get("date"),
+                        "date": _normalize_comment_date(comment.get("date")),
                     }
                 )
 

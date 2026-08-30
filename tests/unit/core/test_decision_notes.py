@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from src.core.decision_notes import (
+    _normalize_comment_date,
     extract_notes_from_comment,
     get_project_decision_notes,
 )
@@ -81,6 +82,35 @@ class TestExtractNotesFromComment:
     def test_whitespace_only_note_text_not_included(self):
         content = "🏗️ Note:    \n\n---\n*footer*"
         assert extract_notes_from_comment(content) == []
+
+    def test_two_notes_in_a_single_progress_comment_are_split_not_merged(self):
+        """Regression: nothing stops an agent from flagging two decisions
+        in ONE post_ticket_progress call, e.g. message="🏗️ Note: A.\\n\\n
+        🏗️ Note: B.". Before this fix, the lazy capture only stopped at
+        the comment's single trailing "\\n\\n---" footer (CommentFormatter
+        appends it once, at the very end) — so both notes matched as ONE
+        blob, with a stray "🏗️ Note:" fragment embedded inside the first
+        note's text instead of being split into two clean entries."""
+        content = (
+            "### Marcus Agent — Progress Update\n\n"
+            "**Progress:** [███░░░░░░░] 30%\n"
+            "**Branch:** `ticket/kanboard/42`\n\n"
+            "🏗️ Note: Chose httpx over requests for async support.\n\n"
+            "🏗️ Note: Also added a retry wrapper around the API client.\n"
+            "\n\n---\n"
+            "*Posted automatically by Marcus AI agent. Reply to this "
+            "ticket to interact with the agent.*"
+        )
+        notes = extract_notes_from_comment(content)
+        assert notes == [
+            "Chose httpx over requests for async support.",
+            "Also added a retry wrapper around the API client.",
+        ]
+        # Neither note's text should contain a leftover marker from the
+        # other — proof they were actually split, not just both present
+        # somewhere in one merged string.
+        for note in notes:
+            assert "🏗️" not in note
 
 
 # ── get_project_decision_notes ──────────────────────────────────────────────
@@ -187,3 +217,97 @@ class TestGetProjectDecisionNotes:
 
         result = await get_project_decision_notes(kanban, project_id=7)
         assert result == []
+
+    @pytest.mark.asyncio
+    async def test_does_not_crash_on_real_kanboard_shaped_dates(self):
+        """Regression: KanboardKanban.get_comments() actually returns
+        "date" as a raw Unix-epoch INT (confirmed by
+        TestGetComments.test_normalizes_comment_fields in
+        tests/unit/integrations/test_kanboard_kanban.py:
+        {"date": 1700000001}), not an ISO string as get_comments()'s own
+        docstring claims. Sorting a mix of int dates and the "" fallback
+        used for a missing date previously raised
+        "TypeError: '<' not supported between instances of 'int' and 'str'"
+        inside get_project_decision_notes, which project_decisions_api's
+        try/except silently swallowed — showing an EMPTY Decisions tab
+        even though real notes existed. Must not raise, and must return
+        every note."""
+        kanban = MagicMock()
+        kanban.get_all_tasks = AsyncMock(
+            return_value=[
+                _task("1", "7", "Ticket A"),
+                _task("2", "7", "Ticket B"),
+            ]
+        )
+
+        async def get_comments(task_id):
+            if task_id == "1":
+                return [
+                    {
+                        "content": "🏗️ Note: Has a real Kanboard timestamp.",
+                        "author": "a",
+                        "date": 1700000001,
+                    }
+                ]
+            return [
+                {
+                    "content": "🏗️ Note: Missing timestamp.",
+                    "author": "b",
+                    "date": None,
+                }
+            ]
+
+        kanban.get_comments = AsyncMock(side_effect=get_comments)
+
+        result = await get_project_decision_notes(kanban, project_id=7)
+        notes_text = {n["note"] for n in result}
+        assert notes_text == {
+            "Has a real Kanboard timestamp.",
+            "Missing timestamp.",
+        }
+
+    @pytest.mark.asyncio
+    async def test_raw_epoch_date_is_normalized_to_readable_iso_string(self):
+        """The Decisions tab UI must show a human-readable date, not a
+        raw Unix epoch integer like 1700000001."""
+        kanban = MagicMock()
+        kanban.get_all_tasks = AsyncMock(return_value=[_task("1", "7", "Ticket")])
+        kanban.get_comments = AsyncMock(
+            return_value=[
+                {"content": "🏗️ Note: Timestamped.", "author": "a", "date": 1700000001}
+            ]
+        )
+
+        result = await get_project_decision_notes(kanban, project_id=7)
+        assert result[0]["date"] == "2023-11-14T22:13:21+00:00"
+
+
+class TestNormalizeCommentDate:
+    """Unit tests for _normalize_comment_date, the helper that converts
+    Kanboard's raw Unix-epoch comment timestamps into sortable,
+    displayable ISO 8601 strings."""
+
+    def test_converts_int_epoch_to_iso_string(self):
+        assert _normalize_comment_date(1700000001) == "2023-11-14T22:13:21+00:00"
+
+    def test_converts_numeric_string_epoch_to_iso_string(self):
+        assert _normalize_comment_date("1700000001") == "2023-11-14T22:13:21+00:00"
+
+    def test_none_returns_none(self):
+        assert _normalize_comment_date(None) is None
+
+    def test_zero_int_returns_none(self):
+        """Kanboard's convention for "unset" (see _parse_kanboard_ts in
+        src/integrations/providers/kanboard_kanban.py)."""
+        assert _normalize_comment_date(0) is None
+
+    def test_zero_string_returns_none(self):
+        assert _normalize_comment_date("0") is None
+
+    def test_empty_string_returns_none(self):
+        assert _normalize_comment_date("") is None
+
+    def test_non_numeric_string_passes_through_unchanged(self):
+        """A provider that already returns an ISO string (or any other
+        non-numeric date format) must not be mangled."""
+        assert _normalize_comment_date("2026-01-01T00:00:00") == "2026-01-01T00:00:00"
