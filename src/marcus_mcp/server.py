@@ -6047,11 +6047,27 @@ if __name__ == "__main__":
   .diff-add {{ color: #15803d; background: #ecfdf3; }}
   .diff-remove {{ color: #b91c1c; background: #fef2f2; text-decoration: line-through; }}
   .diff-context {{ color: #64748b; }}
+  .tabs {{ display: flex; gap: 4px; border-bottom: 1px solid #e2e8f0; margin: 18px 0 20px; }}
+  .tab-btn {{ background: none; border: none; padding: 10px 16px; font-size: 14px; font-weight: 600;
+              color: #64748b; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; }}
+  .tab-btn:hover {{ color: #1e293b; }}
+  .tab-btn.active {{ color: #2563eb; border-bottom-color: #2563eb; }}
+  .tab-panel[hidden] {{ display: none; }}
+  .decision-card {{ border: 1px solid #e2e8f0; border-radius: 6px; padding: 10px 14px; margin-bottom: 10px; }}
+  .decision-note {{ font-size: 14px; color: #1e293b; margin: 0 0 6px; }}
+  .decision-meta {{ font-size: 12px; color: #64748b; }}
+  .decision-meta a {{ color: #2563eb; text-decoration: none; }}
+  .decision-meta a:hover {{ text-decoration: underline; }}
 </style>
 </head>
 <body>
-<h1>&#128203; Project Description — Project #{pid}</h1>
+<h1>&#128203; Project #{pid}</h1>
 {badge_html}
+<div class="tabs">
+  <button class="tab-btn active" id="tab-btn-description" onclick="showTab('description')">&#128203; Project Description</button>
+  <button class="tab-btn" id="tab-btn-decisions" onclick="showTab('decisions')">&#127959;&#65039; Silent Decisions</button>
+</div>
+<div class="tab-panel" id="tab-panel-description">
 <p class="hint">This document is the source of truth for the tech stack and project context.
 AI agents read and update it automatically — but once a
 <span class="src-tag src-human">&#128100; Human</span> edits this description, it is locked:
@@ -6067,7 +6083,62 @@ Docker container. Make sure to fill in <em>Language</em> and <em>Dev server comm
 <span class="src-tag src-human">&#128100; Human</span> = written by a person and locked against AI overwrite.
 <span class="src-tag src-ai">&#129302; AI</span> = written by an agent or Marcus. Click an entry to see what changed.</p>
 {history_html}
+</div>
+<div class="tab-panel" id="tab-panel-decisions" hidden>
+<p class="hint">Choices an AI agent flagged while working a ticket — a library or package pick, a
+design pattern, a tradeoff — that weren't already spelled out in that ticket's acceptance
+criteria. Agents post these as a "&#127959;&#65039; Note:" ticket comment; Marcus compiles them here so a
+human doesn't have to read every ticket's comment history to find them.</p>
+<div id="decisions-list"><p class="hint">Loading…</p></div>
+</div>
 <script>
+var decisionsUrl = '/api/project-decisions?project_id={pid}';
+var decisionsLoaded = false;
+
+function showTab(name) {{
+  document.getElementById('tab-panel-description').hidden = (name !== 'description');
+  document.getElementById('tab-panel-decisions').hidden = (name !== 'decisions');
+  document.getElementById('tab-btn-description').classList.toggle('active', name === 'description');
+  document.getElementById('tab-btn-decisions').classList.toggle('active', name === 'decisions');
+  if (name === 'decisions' && !decisionsLoaded) {{
+    loadDecisions();
+  }}
+}}
+
+function escapeHtml(s) {{
+  var d = document.createElement('div');
+  d.textContent = s == null ? '' : s;
+  return d.innerHTML;
+}}
+
+function loadDecisions() {{
+  fetch(decisionsUrl).then(function(r) {{ return r.json(); }}).then(function(data) {{
+    decisionsLoaded = true;
+    var list = document.getElementById('decisions-list');
+    var decisions = data.decisions || [];
+    if (decisions.length === 0) {{
+      list.innerHTML = '<p class="hint">No flagged decisions yet. Agents post one whenever they ' +
+        'make an implementation choice worth a human seeing — a library pick, a pattern, a tradeoff.</p>';
+      return;
+    }}
+    var html = '';
+    for (var i = 0; i < decisions.length; i++) {{
+      var d = decisions[i];
+      var when = d.date ? escapeHtml(d.date) : 'unknown time';
+      var who = d.author ? escapeHtml(d.author) : 'an agent';
+      html += '<div class="decision-card">' +
+        '<p class="decision-note">' + escapeHtml(d.note) + '</p>' +
+        '<p class="decision-meta">Ticket #' + escapeHtml(d.ticket_id) + ' — ' +
+        escapeHtml(d.ticket_title) + ' &middot; ' + who + ' &middot; ' + when + '</p>' +
+        '</div>';
+    }}
+    list.innerHTML = html;
+  }}).catch(function() {{
+    document.getElementById('decisions-list').innerHTML =
+      '<p class="hint">Could not load decisions right now.</p>';
+  }});
+}}
+
 function save() {{
   var text = document.getElementById('desc-text').value;
   fetch('{api_url}', {{
@@ -6124,6 +6195,51 @@ function save() {{
                 else:
                     response = PlainTextResponse(raw)  # type: ignore[assignment]
 
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            return response
+
+        async def project_decisions_api(request: Request) -> JSONResponse:
+            """GET /api/project-decisions?project_id=<id>
+
+            Returns every "🏗️ Note: ..." decision an agent flagged on a
+            ticket comment in this project (see
+            ``src/core/decision_notes.py`` and Layer 1.25 of
+            ``build_tiered_instructions`` in
+            ``src/marcus_mcp/tools/task.py``). Backs the Decisions tab on
+            ``/project-description``.
+
+            Returns
+            -------
+            JSON: ``{"project_id": int,
+                      "decisions": [{"ticket_id": str, "ticket_title": str,
+                                      "note": str, "author": str | null,
+                                      "date": str | null}, ...]}``
+                ``decisions`` is newest first. Empty when Marcus has no
+                kanban client wired up (nothing has been read yet) or the
+                project has no flagged notes.
+            """
+            project_id_str = request.query_params.get("project_id", "")
+            try:
+                pid = int(project_id_str)
+            except ValueError:
+                response = JSONResponse({"error": "invalid project_id"}, status_code=400)
+                response.headers["Access-Control-Allow-Origin"] = "*"
+                return response
+
+            decisions: List[Dict[str, Any]] = []
+            if server.kanban_client is not None:
+                from src.core.decision_notes import get_project_decision_notes
+
+                try:
+                    decisions = await get_project_decision_notes(
+                        server.kanban_client, pid
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "project_decisions_api failed for project %s: %s", pid, exc
+                    )
+
+            response = JSONResponse({"project_id": pid, "decisions": decisions})
             response.headers["Access-Control-Allow-Origin"] = "*"
             return response
 
@@ -7835,6 +7951,7 @@ setInterval(refresh, 30000);
                 Route("/api/events/stream", events_stream, methods=["GET"]),
                 Route("/project-description", project_description_page, methods=["GET"]),
                 Route("/api/project-description", project_description_api, methods=["GET", "PUT"]),
+                Route("/api/project-decisions", project_decisions_api, methods=["GET"]),
                 Route("/project-stats", project_stats_page, methods=["GET"]),
                 Route("/api/project-stats", project_stats_api, methods=["GET"]),
                 Route("/api/gate-setting", gate_setting_api, methods=["GET"]),

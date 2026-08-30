@@ -1293,6 +1293,10 @@ def build_tiered_instructions(
     0. Mandatory workflow (ONLY for implementation tasks - Issue #168)
     1. Base instructions (always included)
     1.1. Recovery handoff (if task was recovered from another agent)
+    1.2. Acceptance criteria (if the task has any)
+    1.25. Architectural notes prompt (always included) — asks the agent to
+          post a "🏗️ Note:" ticket comment via post_ticket_progress for any
+          library/pattern/tradeoff choice worth flagging.
     1.3. Contract responsibility (contract_first tasks only - GH-320)
     1.4. Feature-based design artifact framing (feature_based tasks with
          design deps — mirrors 1.3 but for the coordination-reference role)
@@ -1368,6 +1372,30 @@ def build_tiered_instructions(
             "constrain WHAT must be true, not HOW you build it; the "
             "implementation is still yours to design."
         )
+
+    # Layer 1.25: Architectural Notes.
+    # Marcus's board is the only channel between an agent and a human
+    # (Multi-Agency Proclamation, invariant #3) — a library pick, a chosen
+    # pattern, or a tradeoff the agent makes while implementing never
+    # reaches anyone unless the agent itself says so. Unlike Layer 4
+    # (below), which only fires for high-fan-out tasks and instructs a
+    # freeform "Marcus, log decision:" chat phrase that isn't wired to any
+    # tool, this always fires and points at ``post_ticket_progress`` — the
+    # comment tool the agent already has and that is already scoped to
+    # THIS ticket. The "🏗️ Note:" prefix is what the Decisions Log tab on
+    # the project description page (``/project-description``) scans for
+    # (see ``src/core/decision_notes.py``), so it must be used verbatim.
+    instructions_parts.append(
+        "\n\n🏗️ ARCHITECTURAL NOTES:\n"
+        "If you make a choice worth flagging while working this ticket — "
+        "a library or package pick, a design pattern, a tradeoff — that "
+        "isn't already spelled out in the acceptance criteria above, post "
+        "a short note so a human reviewer can see it later. Call "
+        "post_ticket_progress on THIS ticket with a message that starts "
+        "with '🏗️ Note:' followed by one or two sentences: what you chose "
+        "and why. Skip it for routine implementation details — use it "
+        "only for choices a reviewer would actually want visibility into."
+    )
 
     # Layer 1.1: Recovery Handoff (if task was recovered from another agent)
     recovery = getattr(task, "recovery_info", None)
