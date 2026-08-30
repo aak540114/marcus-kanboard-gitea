@@ -717,8 +717,11 @@ class CommentFormatter:
         total_rounds : int
             Total number of configured verification rounds.
         result : VerificationResult
-            Result from the AI verifier.  Expected to have ``passed`` (bool)
-            and ``findings`` (List[str]) attributes.
+            Result from the AI verifier.  Expected to have ``passed`` (bool),
+            ``findings`` (List[str]) and ``out_of_scope_changes``
+            (List[str]) attributes.  ``out_of_scope_changes`` is treated as
+            absent/empty when the object doesn't define it, so callers
+            passing an older-shaped result still work.
 
         Returns
         -------
@@ -726,6 +729,14 @@ class CommentFormatter:
             Full comment body.
         """
         round_label = f"Round {round_num} of {total_rounds}"
+
+        out_of_scope_changes = getattr(result, "out_of_scope_changes", None) or []
+        drift_section = (
+            "\n\n**Possible out-of-scope changes (intent drift):**\n"
+            + "\n".join(f"- {f}" for f in out_of_scope_changes)
+            if out_of_scope_changes
+            else ""
+        )
 
         if result.passed:
             comment_type = CommentType.VERIFICATION_ROUND_PASSED
@@ -749,6 +760,7 @@ class CommentFormatter:
                 f"{cls._header(comment_type, ticket_id)}\n"
                 f"### Marcus AI Verifier — {round_label}: PASSED ✓\n\n"
                 f"{body_text}"
+                f"{drift_section}"
                 f"{action}"
                 f"{_FOOTER}"
             )
@@ -777,6 +789,7 @@ class CommentFormatter:
                 f"### Marcus AI Verifier — {round_label}: Issues Found\n\n"
                 f"The AI code reviewer checked the branch and found problems:\n\n"
                 f"{items}"
+                f"{drift_section}"
                 f"{action}"
                 f"{_FOOTER}"
             )

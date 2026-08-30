@@ -19,8 +19,11 @@ def _make_provider(response: str) -> MagicMock:
     return provider
 
 
-def _json_response(passed: bool, findings=None) -> str:
-    return json.dumps({"passed": passed, "findings": findings or []})
+def _json_response(passed: bool, findings=None, out_of_scope_changes=None) -> str:
+    payload = {"passed": passed, "findings": findings or []}
+    if out_of_scope_changes is not None:
+        payload["out_of_scope_changes"] = out_of_scope_changes
+    return json.dumps(payload)
 
 
 # ── VerificationResult ─────────────────────────────────────────────────────
@@ -29,10 +32,11 @@ class TestVerificationResult:
     """Tests for the VerificationResult dataclass."""
 
     def test_defaults(self):
-        """passed=True, empty findings, empty raw_response."""
+        """passed=True, empty findings, empty out_of_scope_changes, empty raw_response."""
         r = VerificationResult(passed=True)
         assert r.passed is True
         assert r.findings == []
+        assert r.out_of_scope_changes == []
         assert r.raw_response == ""
 
     def test_failed_with_findings(self):
@@ -40,6 +44,16 @@ class TestVerificationResult:
         r = VerificationResult(passed=False, findings=["bug 1", "bug 2"])
         assert r.passed is False
         assert len(r.findings) == 2
+
+    def test_out_of_scope_changes_stored_independently_of_passed(self):
+        """A round can pass every acceptance criterion while still
+        carrying flagged out-of-scope changes — the two fields are
+        independent."""
+        r = VerificationResult(
+            passed=True, out_of_scope_changes=["Added an unrelated CLI flag"]
+        )
+        assert r.passed is True
+        assert r.out_of_scope_changes == ["Added an unrelated CLI flag"]
 
 
 # ── AIVerifier._parse ──────────────────────────────────────────────────────
@@ -114,6 +128,42 @@ class TestAIVerifierParse:
         assert result.passed is False
         assert result.findings == ["Use {} format in logger calls"]
 
+    def test_parse_extracts_out_of_scope_changes(self):
+        """out_of_scope_changes in the JSON response is extracted onto the result."""
+        raw = _json_response(
+            True, out_of_scope_changes=["Swapped requests for httpx unprompted"]
+        )
+        result = AIVerifier._parse(raw)
+        assert result.out_of_scope_changes == ["Swapped requests for httpx unprompted"]
+
+    def test_parse_defaults_out_of_scope_changes_to_empty_when_absent(self):
+        """LLM responses that omit out_of_scope_changes (e.g. older prompt
+        caching, or a model that ignores the field) must not crash and
+        must default to an empty list."""
+        raw = _json_response(True)
+        result = AIVerifier._parse(raw)
+        assert result.out_of_scope_changes == []
+
+    def test_parse_filters_empty_strings_from_out_of_scope_changes(self):
+        """Empty strings in out_of_scope_changes are stripped, matching the
+        existing behaviour for findings."""
+        raw = json.dumps(
+            {
+                "passed": True,
+                "findings": [],
+                "out_of_scope_changes": ["real drift", "", "another"],
+            }
+        )
+        result = AIVerifier._parse(raw)
+        assert result.out_of_scope_changes == ["real drift", "another"]
+
+    def test_parse_no_json_defaults_out_of_scope_changes_to_empty(self):
+        """The three early-return failure paths in _parse never populate
+        out_of_scope_changes — it must default to [] via the dataclass,
+        not raise."""
+        result = AIVerifier._parse("no json here")
+        assert result.out_of_scope_changes == []
+
 
 # ── AIVerifier.verify ──────────────────────────────────────────────────────
 
@@ -187,6 +237,44 @@ class TestAIVerifierVerify:
 
         assert result.passed is True  # fail-open
         assert "error" in result.raw_response.lower()
+        assert result.out_of_scope_changes == []
+
+    @pytest.mark.asyncio
+    async def test_verify_empty_diff_fails_immediately_no_drift_flagged(self):
+        """The empty-diff fail-fast path never flags drift — never
+        introduce a NEW blocking behaviour around drift that didn't
+        already exist for the pass/fail check."""
+        provider = _make_provider(_json_response(True))
+        verifier = AIVerifier(provider=provider)
+
+        result = await verifier.verify(
+            ticket_id="9",
+            ticket_title="Implement feature",
+            acceptance_criteria=["Feature works"],
+            diff_text="",
+        )
+
+        assert result.out_of_scope_changes == []
+
+    @pytest.mark.asyncio
+    async def test_verify_passes_through_out_of_scope_changes_from_llm(self):
+        """out_of_scope_changes flagged by the LLM flow through verify()
+        onto the returned VerificationResult."""
+        provider = _make_provider(
+            _json_response(
+                True, out_of_scope_changes=["Rewrote an unrelated config loader"]
+            )
+        )
+        verifier = AIVerifier(provider=provider)
+
+        result = await verifier.verify(
+            ticket_id="10",
+            ticket_title="Add login button",
+            acceptance_criteria=["Button is visible"],
+            diff_text="+ <button>Login</button>",
+        )
+
+        assert result.out_of_scope_changes == ["Rewrote an unrelated config loader"]
 
     @pytest.mark.asyncio
     async def test_verify_prompt_includes_ticket_title(self):
@@ -254,3 +342,31 @@ class TestAIVerifierVerify:
         )
 
         assert result.passed is True
+
+
+# ── _SYSTEM_PROMPT drift instructions ───────────────────────────────────────
+
+class TestSystemPromptDriftInstructions:
+    """The intent-drift instructions must actually be present in the prompt
+    sent to the LLM — otherwise the model has no reason to populate
+    out_of_scope_changes and _parse's extraction is dead code."""
+
+    def test_prompt_mentions_out_of_scope_changes_field(self):
+        from src.ai.verification.ai_verifier import _SYSTEM_PROMPT
+
+        assert "out_of_scope_changes" in _SYSTEM_PROMPT
+
+    def test_prompt_explains_drift_is_independent_of_passed(self):
+        from src.ai.verification.ai_verifier import _SYSTEM_PROMPT
+
+        assert "independent" in _SYSTEM_PROMPT.lower()
+
+    def test_prompt_warns_against_flagging_necessary_supporting_changes(self):
+        """The prompt must steer the LLM away from flagging a legitimate
+        refactor/helper that's actually needed to satisfy an AC — otherwise
+        every ticket touching more than the obvious file gets falsely
+        flagged as drift."""
+        from src.ai.verification.ai_verifier import _SYSTEM_PROMPT
+
+        normalized = " ".join(_SYSTEM_PROMPT.lower().split())
+        assert "is not out of scope" in normalized

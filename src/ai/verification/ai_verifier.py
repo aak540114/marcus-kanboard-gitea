@@ -7,9 +7,10 @@ review of the worker agent's branch before merging.  The verifier:
 1. Fetches the git diff between the ticket branch and main.
 2. Builds a prompt that includes the ticket title, acceptance criteria, and
    the full diff.
-3. Asks the LLM to act as a code reviewer and report issues.
-4. Returns a structured :class:`VerificationResult` — ``passed`` plus a list
-   of human-readable findings.
+3. Asks the LLM to act as a code reviewer and report issues, and to flag any
+   "intent drift" — changes not traceable to any acceptance criterion.
+4. Returns a structured :class:`VerificationResult` — ``passed`` plus lists
+   of human-readable findings and out-of-scope changes.
 
 If ``passed`` is ``False`` the caller (``HumanGatedWorkflow``) posts the
 findings as a comment, releases the ticket back to "In Progress", and the
@@ -39,13 +40,16 @@ _SYSTEM_PROMPT = """\
 You are a senior software engineer conducting a code review on behalf of Marcus,
 an AI multi-agent orchestration system.  Your job is to verify that the changes
 on a feature branch meet the acceptance criteria of its ticket and are free of
-obvious bugs, errors, or incomplete implementations.
+obvious bugs, errors, or incomplete implementations.  You must also flag any
+"intent drift" — changes in the diff that are not traceable to any stated
+acceptance criterion.
 
 Output ONLY a JSON object in this exact shape — no prose, no markdown fences:
 
 {
   "passed": true | false,
-  "findings": ["<finding 1>", "<finding 2>", ...]
+  "findings": ["<finding 1>", "<finding 2>", ...],
+  "out_of_scope_changes": ["<out-of-scope change 1>", ...]
 }
 
 Rules:
@@ -59,6 +63,17 @@ Rules:
   unless they represent a correctness risk.
 - If the diff is empty or contains only whitespace/comment changes, set
   "passed" to false and note that no meaningful implementation was found.
+- "out_of_scope_changes" lists each change in the diff that is NOT reasonably
+  necessary to satisfy any of the acceptance criteria — e.g. an unrelated
+  feature, an unrequested library or dependency swap, or edits to a module the
+  acceptance criteria never mention.  A refactor, helper, or supporting
+  change that is genuinely needed to satisfy an acceptance criterion is not
+  out of scope, even if it touches files beyond the obvious ones — do not
+  flag it.  Each entry should be a short, actionable sentence.  Empty list
+  when every change in the diff is traceable to an acceptance criterion.
+  This list is independent of "passed" — a change set can satisfy every
+  acceptance criterion (passed=true) while still containing out-of-scope
+  changes.
 """
 
 
@@ -73,12 +88,19 @@ class VerificationResult:
         and no blocking bugs were found.
     findings : List[str]
         Human-readable list of issues.  Empty when ``passed`` is ``True``.
+    out_of_scope_changes : List[str]
+        Human-readable list of changes in the diff that are not traceable to
+        any acceptance criterion (intent drift).  Empty when every change is
+        traceable.  Independent of ``passed`` — a change set can satisfy
+        every acceptance criterion while still containing out-of-scope
+        changes.
     raw_response : str
         The raw LLM response (for debugging).
     """
 
     passed: bool
     findings: List[str] = field(default_factory=list)
+    out_of_scope_changes: List[str] = field(default_factory=list)
     raw_response: str = ""
 
 
@@ -165,7 +187,7 @@ class AIVerifier:
         try:
             provider = await self._get_provider()
             full_prompt = f"{_SYSTEM_PROMPT}\n\n{user_prompt}"
-            raw = await provider.complete(full_prompt, max_tokens=1024)  # type: ignore[attr-defined]
+            raw = await provider.complete(full_prompt, max_tokens=1536)  # type: ignore[attr-defined]
             return self._parse(raw)
         except Exception as exc:  # noqa: BLE001
             logger.error(
@@ -246,4 +268,12 @@ class AIVerifier:
 
         passed = bool(obj.get("passed", False))
         findings = [str(f) for f in obj.get("findings", []) if f]
-        return VerificationResult(passed=passed, findings=findings, raw_response=raw)
+        out_of_scope_changes = [
+            str(f) for f in obj.get("out_of_scope_changes", []) if f
+        ]
+        return VerificationResult(
+            passed=passed,
+            findings=findings,
+            out_of_scope_changes=out_of_scope_changes,
+            raw_response=raw,
+        )

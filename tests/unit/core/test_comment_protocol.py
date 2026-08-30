@@ -258,6 +258,66 @@ class TestCommentFormatter:
         assert "Action needed" not in body
 
 
+class TestVerificationRoundResultDrift:
+    """Tests for the intent-drift ("out_of_scope_changes") section that
+    verification_round_result renders inside the AI Verify comment.
+
+    Background: the AI Verifier can flag changes in a diff that aren't
+    traceable to any acceptance criterion (see src/ai/verification/ai_verifier.py).
+    This is independent of pass/fail — a round can pass every acceptance
+    criterion while still containing out-of-scope changes, so the drift
+    section must render in BOTH the passed and failed comment bodies, and
+    must stay absent when the list is empty (including for callers whose
+    result object predates the out_of_scope_changes attribute).
+    """
+
+    def test_drift_section_appears_when_passed_with_out_of_scope_changes(self):
+        result = SimpleNamespace(
+            passed=True,
+            findings=[],
+            out_of_scope_changes=["Added an unrelated logging library"],
+        )
+        body = CommentFormatter.verification_round_result("T-20", 1, 1, result)
+        assert "out-of-scope" in body.lower()
+        assert "Added an unrelated logging library" in body
+
+    def test_drift_section_appears_when_failed_with_out_of_scope_changes(self):
+        result = SimpleNamespace(
+            passed=False,
+            findings=["Missing null check"],
+            out_of_scope_changes=["Refactored an unrelated module"],
+        )
+        body = CommentFormatter.verification_round_result("T-21", 1, 2, result)
+        assert "out-of-scope" in body.lower()
+        assert "Refactored an unrelated module" in body
+        # The existing findings section must still render too.
+        assert "Missing null check" in body
+
+    def test_no_drift_section_when_out_of_scope_changes_is_empty(self):
+        result = SimpleNamespace(passed=True, findings=[], out_of_scope_changes=[])
+        body = CommentFormatter.verification_round_result("T-22", 1, 1, result)
+        assert "out-of-scope" not in body.lower()
+
+    def test_no_drift_section_when_attribute_is_absent(self):
+        """A result object without out_of_scope_changes (e.g. an older
+        caller or test double) must not crash and must render no drift
+        section — getattr(..., None) defaults it to empty."""
+        result = SimpleNamespace(passed=True, findings=[])
+        body = CommentFormatter.verification_round_result("T-23", 1, 1, result)
+        assert "out-of-scope" not in body.lower()
+
+    def test_drift_section_still_recognised_as_marcus_own_comment(self):
+        from src.core.comment_protocol import CommentParser
+
+        result = SimpleNamespace(
+            passed=False,
+            findings=["issue"],
+            out_of_scope_changes=["unrelated change"],
+        )
+        body = CommentFormatter.verification_round_result("T-24", 1, 1, result)
+        assert CommentParser.is_marcus_comment(body) is True
+
+
 class TestCommentParser:
     """Tests for CommentParser class methods."""
 
