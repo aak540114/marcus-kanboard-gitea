@@ -416,7 +416,13 @@ class WorkAnalyzer:
         # If the agent has an isolated worktree, validate there
         # instead of the main implementation/ directory.
         if hasattr(state, "kanban_client") and state.kanban_client:
-            workspace_state = state.kanban_client._load_workspace_state()
+            _load_state = getattr(state.kanban_client, "_load_workspace_state", None)
+            workspace_state = None
+            if callable(_load_state):
+                try:
+                    workspace_state = _load_state()
+                except Exception:
+                    workspace_state = None
             if workspace_state and "project_root" in workspace_state:
                 project_root = workspace_state["project_root"]
 

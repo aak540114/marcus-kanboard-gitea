@@ -2425,9 +2425,16 @@ async def request_next_task(agent_id: str, state: Any) -> Any:
                 # files this agent changed, not the entire merged codebase.
                 _project_root_for_baseline: Optional[str] = None
                 if hasattr(state, "kanban_client") and state.kanban_client:
-                    _ws = state.kanban_client._load_workspace_state()
-                    if _ws and "project_root" in _ws:
-                        _project_root_for_baseline = _ws["project_root"]
+                    _load_state = getattr(
+                        state.kanban_client, "_load_workspace_state", None
+                    )
+                    if callable(_load_state):
+                        try:
+                            _ws = _load_state()
+                        except Exception:
+                            _ws = None
+                        if _ws and "project_root" in _ws:
+                            _project_root_for_baseline = _ws["project_root"]
                 if not _project_root_for_baseline and (
                     hasattr(state, "workspace_manager")
                     and state.workspace_manager
@@ -3454,9 +3461,14 @@ async def _merge_agent_branch_to_main(
     # of whether we're in a worktree or the main repo.
     project_root = None
     if hasattr(state, "kanban_client") and state.kanban_client:
-        ws_state = state.kanban_client._load_workspace_state()
-        if ws_state and "project_root" in ws_state:
-            project_root = ws_state["project_root"]
+        _load_state = getattr(state.kanban_client, "_load_workspace_state", None)
+        if callable(_load_state):
+            try:
+                ws_state = _load_state()
+            except Exception:
+                ws_state = None
+            if ws_state and "project_root" in ws_state:
+                project_root = ws_state["project_root"]
 
     if not project_root:
         return None
@@ -4417,7 +4429,14 @@ async def report_task_progress(
             # when no branch → agent worked on main → skip check).
             _ws_state = None
             if hasattr(state, "kanban_client") and state.kanban_client:
-                _ws_state = state.kanban_client._load_workspace_state()
+                _load_state = getattr(
+                    state.kanban_client, "_load_workspace_state", None
+                )
+                if callable(_load_state):
+                    try:
+                        _ws_state = _load_state()
+                    except Exception:
+                        _ws_state = None
             _project_root = _ws_state.get("project_root") if _ws_state else None
             if _project_root:
                 _commit_ok = _verify_agent_has_commits(agent_id, _project_root)

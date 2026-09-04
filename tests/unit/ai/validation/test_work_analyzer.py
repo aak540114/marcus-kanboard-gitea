@@ -1918,3 +1918,56 @@ class TestWorktreeResolutionOnRecovery:
 
         assert evidence.project_root == str(wt)
         assert any(f.path.endswith("app.py") for f in evidence.source_files)
+
+
+class TestGetProjectRootWithoutWorkspaceState:
+    """Regression: KanboardKanban (KanbanInterface, not KanbanClient) has
+    no _load_workspace_state method at all -- unlike sqlite_kanban.py's
+    provider, which does. _get_project_root called it unconditionally,
+    so every real Kanboard-backed deployment crashed here with
+    AttributeError: 'KanboardKanban' object has no attribute
+    '_load_workspace_state' the moment validation needed a project root.
+
+    Existing tests never caught this because Mock()/MagicMock()
+    auto-vivifies ANY attribute access, including this one -- a mocked
+    kanban_client can never reproduce "this method doesn't exist".
+    Reproduced live against a real KanboardKanban instance before this
+    fix; these tests pin the fix with a double shaped like the real
+    class (no such attribute) instead of an auto-attributing Mock.
+    """
+
+    @pytest.fixture
+    def analyzer(self) -> WorkAnalyzer:
+        with patch("src.ai.validation.work_analyzer.LLMAbstraction"):
+            return WorkAnalyzer()
+
+    def test_no_crash_when_kanban_client_lacks_load_workspace_state(
+        self, analyzer: WorkAnalyzer
+    ) -> None:
+        """A kanban_client double with no _load_workspace_state attribute
+        (KanboardKanban's real shape) must not raise AttributeError."""
+
+        class KanboardLikeClient:
+            """No _load_workspace_state — matches KanboardKanban exactly."""
+
+        state = Mock()
+        state.task_artifacts = {}
+        state.kanban_client = KanboardLikeClient()
+        state.workspace_manager = None
+
+        task = Mock()
+        task.id = "task-1"
+        task.name = "Impl"
+        task.assigned_to = None
+
+        # Must not raise; falls through to whatever the non-workspace-state
+        # resolution path returns (asserted only to not be a crash here —
+        # other tests in this file cover the workspace_manager fallback).
+        from src.core.error_framework import ProjectRootNotFoundError
+
+        try:
+            analyzer._get_project_root(task, state)
+        except AttributeError as exc:
+            pytest.fail(f"_get_project_root crashed on a real-shaped kanban_client: {exc}")
+        except ProjectRootNotFoundError:
+            pass  # No project root resolvable at all — a legitimate outcome, not a crash.
