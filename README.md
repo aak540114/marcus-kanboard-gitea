@@ -4,6 +4,10 @@
 
 > **What Marcus is:** see the [Marcus README](https://github.com/lwgray/marcus) and [docs](https://marcus-ai.dev). This repo is an opinionated deployment of it, not a fork.
 
+> **What Kanboard is:** [Kanboard](https://kanboard.org) is a free, open-source, self-hosted kanban board — plain columns and cards for tracking tickets, with no dependency on a third-party SaaS. This repo runs a stock, unmodified Kanboard instance plus one custom plugin, **MarcusDevEnv** (see below), that adds AI-aware controls to the board UI.
+
+> **What Gitea is:** [Gitea](https://about.gitea.com) is a lightweight, self-hosted git server — repositories, branches, pull requests, and a REST API, GitHub-like but running entirely on your own infrastructure. This repo runs a stock, unmodified Gitea instance purely as the git host for each Kanboard project's code.
+
 ---
 
 ## What this repo adds
