@@ -1,6 +1,12 @@
 MIT License
 
-Copyright (c) 2025 Larry Gray
+Copyright (c) 2026 @aak540114
+
+This repository deploys and integrates the following third-party projects,
+each under its own MIT license:
+- Marcus — Copyright (c) 2025 Larry Gray
+- Kanboard — Copyright (c) Frédéric Guillot
+- Gitea — Copyright (c) 2016 The Gitea Authors, Copyright (c) 2015 The Gogs Authors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
