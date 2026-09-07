@@ -4,11 +4,18 @@ Unit tests for the Context system
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
-from src.core.context import Context, Decision, DependentTask, TaskContext
+from src.core.context import (
+    Context,
+    Decision,
+    DependentTask,
+    TaskContext,
+    sweep_context_retention,
+)
 from src.core.events import Events, EventTypes
 from src.core.models import Priority, Task, TaskStatus
 
@@ -446,3 +453,212 @@ class TestContext:
         assert "api" in context.patterns
         assert len(context.patterns["auth"]) == 2
         assert len(context.patterns["api"]) == 2
+
+
+class TestDecisionsByTaskIdIndex:
+    """Test suite for Context._decisions_by_task_id staying in sync with
+    self.decisions across every mutation site."""
+
+    @pytest.fixture
+    def context(self):
+        """Create a Context instance for testing"""
+        return Context()
+
+    @pytest.mark.asyncio
+    async def test_log_decision_populates_index(self, context):
+        """log_decision must add the new Decision to the task_id index,
+        not just to self.decisions."""
+        decision = await context.log_decision(
+            "agent_1", "task_1", "Use REST", "Standard", "All"
+        )
+
+        assert context._decisions_by_task_id["task_1"] == [decision]
+
+    @pytest.mark.asyncio
+    async def test_index_groups_multiple_decisions_for_same_task(self, context):
+        """Two decisions logged against the same task_id must both appear
+        under that key, in logging order."""
+        d1 = await context.log_decision("agent_1", "task_1", "A", "why A", "x")
+        d2 = await context.log_decision("agent_2", "task_1", "B", "why B", "y")
+
+        assert context._decisions_by_task_id["task_1"] == [d1, d2]
+
+    @pytest.mark.asyncio
+    async def test_clear_old_data_rebuilds_index_dropping_pruned_decisions(
+        self, context
+    ):
+        """The staleness bug this test guards against: clear_old_data used
+        to prune self.decisions without touching
+        self._decisions_by_task_id, leaving the index pointing at
+        decisions that no longer exist in self.decisions. If that
+        regresses, get_decisions_for_task (which reads only the index)
+        would keep returning an old decision forever, no matter how many
+        days are passed to clear_old_data.
+        """
+        old_decision = Decision(
+            decision_id="old_1",
+            task_id="old_task",
+            agent_id="agent_1",
+            timestamp=datetime.now(timezone.utc) - timedelta(days=40),
+            what="Old decision",
+            why="Old reason",
+            impact="Old impact",
+        )
+        context.decisions.append(old_decision)
+        context._decisions_by_task_id.setdefault("old_task", []).append(old_decision)
+
+        recent = await context.log_decision(
+            "agent_2", "task_2", "Recent decision", "Recent reason", "Recent impact"
+        )
+
+        await context.clear_old_data(days=30)
+
+        assert context._decisions_by_task_id.get("old_task", []) == []
+        assert context._decisions_by_task_id["task_2"] == [recent]
+        assert await context.get_decisions_for_task("old_task") == []
+        assert await context.get_decisions_for_task("task_2") == [recent]
+
+    @pytest.mark.asyncio
+    async def test_get_decisions_for_task_reads_from_index(self, context):
+        """get_decisions_for_task must reflect the index, not a fresh scan
+        of self.decisions — proven by mutating self.decisions directly
+        (bypassing log_decision) and confirming the index is unaffected."""
+        await context.log_decision("agent_1", "task_1", "A", "why", "impact")
+
+        stray = Decision(
+            decision_id="stray_1",
+            task_id="task_1",
+            agent_id="agent_2",
+            timestamp=datetime.now(timezone.utc),
+            what="Stray",
+            why="Bypassed the index on purpose",
+            impact="none",
+        )
+        context.decisions.append(stray)
+
+        result = await context.get_decisions_for_task("task_1")
+
+        assert stray not in result
+
+    @pytest.mark.asyncio
+    async def test_get_context_dependency_decisions_use_index(self, context):
+        """get_context's dependency-decision lookup must find decisions
+        logged against a dependency task_id via the index."""
+        await context.log_decision(
+            "agent_1", "dep_task", "Use REST", "Standard approach", "n/a"
+        )
+
+        task_context = await context.get_context("task_123", ["dep_task"])
+
+        assert len(task_context.architectural_decisions) == 1
+        assert task_context.architectural_decisions[0]["what"] == "Use REST"
+
+    @pytest.mark.asyncio
+    async def test_get_context_loads_persisted_decisions_before_first_call(self):
+        """get_context must trigger the lazy persisted-data load itself.
+
+        Before this fix, get_context never called
+        _ensure_persisted_data_loaded, so a Context backed by persistence
+        would silently scan an empty self.decisions/index on its very
+        first get_context call — missing every decision from a previous
+        run — until some other method (get_decisions_for_task,
+        clear_old_data, ...) happened to trigger the load first.
+        """
+        persisted_decision = Decision(
+            decision_id="dec_1",
+            task_id="dep_task",
+            agent_id="agent_1",
+            timestamp=datetime.now(timezone.utc),
+            what="Persisted decision",
+            why="From a previous run",
+            impact="n/a",
+        )
+        persistence = AsyncMock()
+        persistence.get_decisions = AsyncMock(return_value=[persisted_decision])
+        context = Context(persistence=persistence)
+
+        task_context = await context.get_context("task_123", ["dep_task"])
+
+        assert len(task_context.architectural_decisions) == 1
+        assert (
+            task_context.architectural_decisions[0]["what"] == "Persisted decision"
+        )
+
+
+class TestSweepContextRetention:
+    """Test suite for sweep_context_retention, the periodic-sweep entry
+    point that prunes every Context a MarcusServer holds."""
+
+    @pytest.mark.asyncio
+    async def test_sweeps_the_global_context(self):
+        global_context = AsyncMock()
+        server = SimpleNamespace(context=global_context, project_manager=None)
+
+        swept = await sweep_context_retention(server, days=30)
+
+        global_context.clear_old_data.assert_awaited_once_with(days=30)
+        assert swept == 1
+
+    @pytest.mark.asyncio
+    async def test_sweeps_every_project_context(self):
+        project_context_1 = AsyncMock()
+        project_context_2 = AsyncMock()
+        project_manager = SimpleNamespace(
+            contexts={
+                "p1": SimpleNamespace(context=project_context_1),
+                "p2": SimpleNamespace(context=project_context_2),
+            }
+        )
+        server = SimpleNamespace(context=None, project_manager=project_manager)
+
+        swept = await sweep_context_retention(server, days=14)
+
+        project_context_1.clear_old_data.assert_awaited_once_with(days=14)
+        project_context_2.clear_old_data.assert_awaited_once_with(days=14)
+        assert swept == 2
+
+    @pytest.mark.asyncio
+    async def test_dedups_when_global_and_project_context_are_the_same_object(self):
+        """server.context and a per-project ProjectContext.context can be
+        the SAME Context instance (set_global_context aliases them) — the
+        sweep must not call clear_old_data on it twice."""
+        shared_context = AsyncMock()
+        project_manager = SimpleNamespace(
+            contexts={"p1": SimpleNamespace(context=shared_context)}
+        )
+        server = SimpleNamespace(context=shared_context, project_manager=project_manager)
+
+        swept = await sweep_context_retention(server)
+
+        shared_context.clear_old_data.assert_awaited_once()
+        assert swept == 1
+
+    @pytest.mark.asyncio
+    async def test_handles_missing_attributes_gracefully(self):
+        """A server-like object missing context/project_manager entirely
+        (e.g. a bare test double) must not raise."""
+        server = SimpleNamespace()
+
+        swept = await sweep_context_retention(server)
+
+        assert swept == 0
+
+    @pytest.mark.asyncio
+    async def test_handles_none_project_context_values_gracefully(self):
+        project_manager = SimpleNamespace(
+            contexts={"p1": SimpleNamespace(context=None)}
+        )
+        server = SimpleNamespace(context=None, project_manager=project_manager)
+
+        swept = await sweep_context_retention(server)
+
+        assert swept == 0
+
+    @pytest.mark.asyncio
+    async def test_default_retention_days_is_30(self):
+        global_context = AsyncMock()
+        server = SimpleNamespace(context=global_context, project_manager=None)
+
+        await sweep_context_retention(server)
+
+        global_context.clear_old_data.assert_awaited_once_with(days=30)

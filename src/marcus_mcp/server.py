@@ -47,7 +47,7 @@ from src.core.assignment_lease import (  # noqa: E402
 )
 from src.core.assignment_persistence import AssignmentPersistence  # noqa: E402
 from src.core.code_analyzer import CodeAnalyzer  # noqa: E402
-from src.core.context import Context  # noqa: E402
+from src.core.context import Context, sweep_context_retention  # noqa: E402
 from src.core.event_loop_utils import EventLoopLockManager  # noqa: E402
 from src.core.events import Events  # noqa: E402
 from src.core.models import (  # noqa: E402
@@ -537,6 +537,16 @@ class MarcusServer:
             if human_gated_workflow is not None:
                 await human_gated_workflow.stop()
 
+            # Stop the Context-retention sweep loop
+            self._context_retention_sweep_running = False
+            context_retention_task = getattr(self, "_context_retention_task", None)
+            if context_retention_task is not None and not context_retention_task.done():
+                context_retention_task.cancel()
+                try:
+                    await context_retention_task
+                except asyncio.CancelledError:
+                    pass
+
             # Close realtime log
             if hasattr(self, "realtime_log") and self.realtime_log:
                 self.realtime_log.close()
@@ -638,6 +648,61 @@ class MarcusServer:
 
         # Pattern learning components removed (API infrastructure cleanup)
         # Don't print during initialization - it interferes with MCP stdio
+
+        # Periodically prune old Context decisions/implementations (see
+        # sweep_context_retention). Unlike ProjectWatcher/HumanGatedWorkflow
+        # this has no kanban/gitea dependency, so it starts unconditionally.
+        self._start_context_retention_sweep()
+
+    def _start_context_retention_sweep(self) -> None:
+        """Start the background Context-retention sweep loop, if not already running."""
+        if getattr(self, "_context_retention_sweep_running", False):
+            return
+        self._context_retention_sweep_running = True
+        self._context_retention_task = asyncio.create_task(
+            self._context_retention_sweep_loop(), name="context-retention-sweep"
+        )
+
+    async def _context_retention_sweep_loop(self) -> None:
+        """Background loop pruning old Context data on a fixed interval.
+
+        Sweeps immediately on start (rather than sleeping first) so a
+        short-lived or frequently-restarted server still gets at least one
+        prune per run, then repeats every
+        ``CONTEXT_RETENTION_SWEEP_INTERVAL`` seconds (default 24h) until
+        :meth:`_cleanup_on_shutdown` cancels it. Retention window is
+        ``CONTEXT_RETENTION_DAYS`` (default 30), forwarded to
+        :func:`sweep_context_retention`.
+        """
+        try:
+            interval = float(
+                os.environ.get("CONTEXT_RETENTION_SWEEP_INTERVAL", "86400")
+            )
+        except ValueError:
+            interval = 86400.0
+        try:
+            retention_days = int(os.environ.get("CONTEXT_RETENTION_DAYS", "30"))
+        except ValueError:
+            retention_days = 30
+
+        while self._context_retention_sweep_running:
+            try:
+                swept = await sweep_context_retention(self, days=retention_days)
+                logger.info(
+                    "Context retention sweep pruned %d context(s) "
+                    "(retention=%d days)",
+                    swept,
+                    retention_days,
+                )
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Context retention sweep failed: %s", exc, exc_info=True)
+
+            remaining = interval
+            while remaining > 0 and self._context_retention_sweep_running:
+                await asyncio.sleep(min(remaining, 5.0))
+                remaining -= 5.0
 
     async def _migrate_to_multi_project(self) -> None:
         """

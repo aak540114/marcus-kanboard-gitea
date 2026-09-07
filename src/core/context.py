@@ -13,7 +13,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from src.core.events import Events, EventTypes
 from src.core.models import Priority, Task
@@ -278,6 +278,17 @@ class Context:
             {}
         )  # task_id -> dependent tasks
         self.decisions: List[Decision] = []
+        # task_id -> every Decision with that exact task_id, kept in sync
+        # with self.decisions at every mutation site (log_decision,
+        # _load_persisted_data, clear_old_data). Exists so get_context's
+        # "decisions from a dependency" lookup (an exact task_id match) is
+        # an O(1) dict lookup instead of an O(len(self.decisions)) scan
+        # repeated per dependency. Does NOT help get_context's OTHER scan
+        # (decisions whose free-text `impact` happens to mention this
+        # task's id) — that's a substring search over unstructured text,
+        # not an exact-key lookup, and isn't indexable without changing
+        # what log_decision's callers pass for `impact`.
+        self._decisions_by_task_id: Dict[str, List[Decision]] = {}
         self.patterns: Dict[str, List[Dict[str, Any]]] = {}  # pattern_type -> examples
         self._decision_counter = 0
         self.default_infer_dependencies = (
@@ -308,6 +319,9 @@ class Context:
                 for decision in persisted_decisions:
                     if decision not in self.decisions:
                         self.decisions.append(decision)
+                        self._decisions_by_task_id.setdefault(
+                            decision.task_id, []
+                        ).append(decision)
 
             # Update decision counter
             if self.decisions:
@@ -416,6 +430,7 @@ class Context:
         )
 
         self.decisions.append(decision)
+        self._decisions_by_task_id.setdefault(task_id, []).append(decision)
 
         # Persist decision if persistence is available (with graceful
         # degradation)
@@ -452,6 +467,13 @@ class Context:
         TaskContext
             Complete context for the task.
         """
+        # Without this, the first get_context() call on a freshly created
+        # Context (before any log_decision/log_implementation call has
+        # triggered the lazy load) would silently scan an empty
+        # self.decisions/self._decisions_by_task_id, missing every
+        # decision persisted from a previous run.
+        await self._ensure_persisted_data_loaded()
+
         context = TaskContext(task_id=task_id)
 
         # Get implementations from dependencies
@@ -477,13 +499,21 @@ class Context:
             context.related_patterns.extend(examples[:3])  # Limit to 3 most recent
 
         # Get relevant architectural decisions
-        relevant_decisions = []
-        # Include decisions from dependencies
+        relevant_decisions: List[Dict[str, Any]] = []
+        # Include decisions from dependencies — exact task_id match, so
+        # this is an index lookup (O(1) per dependency) rather than a
+        # linear scan over every decision ever logged in the project.
         for dep_id in task_dependencies:
             relevant_decisions.extend(
-                [d.to_dict() for d in self.decisions if d.task_id == dep_id]
+                d.to_dict() for d in self._decisions_by_task_id.get(dep_id, [])
             )
-        # Include decisions that might affect this task
+        # Include decisions that might affect this task. This is a
+        # substring search over `impact` (free text an agent wrote, not a
+        # structured list of affected task ids) — it can't use the
+        # task_id index above, so it still scans every decision. Bounded
+        # long-term by the periodic sweep_context_retention() job (see
+        # bottom of this module), which ages out old decisions via
+        # clear_old_data(); not bounded per-call.
         for decision in self.decisions:
             if task_id in decision.impact:
                 relevant_decisions.append(decision.to_dict())
@@ -1331,7 +1361,7 @@ class Context:
             List of related decisions
         """
         await self._ensure_persisted_data_loaded()
-        return [d for d in self.decisions if d.task_id == task_id]
+        return list(self._decisions_by_task_id.get(task_id, []))
 
     @with_fallback(
         lambda self, task_id: logger.warning(
@@ -1395,5 +1425,64 @@ class Context:
 
         # Clear old decisions
         self.decisions = [d for d in self.decisions if d.timestamp.timestamp() > cutoff]
+        # Rebuild the task_id index from the pruned list rather than trying
+        # to prune it in place — this method runs infrequently (once per
+        # sweep cycle), so an O(n) rebuild is cheap and avoids any chance
+        # of the index silently drifting out of sync with self.decisions.
+        self._decisions_by_task_id = {}
+        for d in self.decisions:
+            self._decisions_by_task_id.setdefault(d.task_id, []).append(d)
 
         logger.info(f"Cleared context data older than {days} days")
+
+
+async def sweep_context_retention(server: Any, days: int = 30) -> int:
+    """Prune old decisions and implementations from every Context a server holds.
+
+    A ``MarcusServer`` holds more than one :class:`Context` at once: a
+    single global one (``server.context``) plus one per active project
+    (``server.project_manager.contexts[...].context``). Both accumulate
+    ``decisions``/``implementations`` over time via ``log_decision`` and
+    ``log_implementation``, and neither is ever pruned unless something
+    calls :meth:`Context.clear_old_data` — this function is that
+    something, meant to be run periodically (see
+    ``MarcusServer._context_retention_sweep_loop`` in
+    ``src/marcus_mcp/server.py``) rather than relying on a request path to
+    trigger it.
+
+    Parameters
+    ----------
+    server : Any
+        The running ``MarcusServer`` (typed ``Any`` to avoid a circular
+        import with ``src.marcus_mcp.server``). Read via ``getattr`` so a
+        server missing ``context`` or ``project_manager`` (e.g. in tests)
+        is handled gracefully rather than raising.
+    days : int
+        Number of days of history to retain. Forwarded unchanged to each
+        ``Context.clear_old_data`` call.
+
+    Returns
+    -------
+    int
+        The number of distinct ``Context`` objects that were swept.
+    """
+    seen: Set[int] = set()
+    contexts: List[Context] = []
+
+    global_context = getattr(server, "context", None)
+    if global_context is not None and id(global_context) not in seen:
+        seen.add(id(global_context))
+        contexts.append(global_context)
+
+    project_manager = getattr(server, "project_manager", None)
+    if project_manager is not None:
+        for project_context in getattr(project_manager, "contexts", {}).values():
+            ctx = getattr(project_context, "context", None)
+            if ctx is not None and id(ctx) not in seen:
+                seen.add(id(ctx))
+                contexts.append(ctx)
+
+    for ctx in contexts:
+        await ctx.clear_old_data(days=days)
+
+    return len(contexts)
