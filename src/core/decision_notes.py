@@ -23,9 +23,21 @@ get_project_decision_notes
     Scan every ticket in a project and compile all flagged notes.
 """
 
+import asyncio
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+# Kanboard's JSON-RPC API has no "get comments for multiple tasks" call —
+# only getAllComments(task_id), one task at a time (confirmed against
+# Kanboard's own source, app/Api/Procedure/CommentProcedure.php). So this
+# module still makes one RPC round trip per ticket; what it controls is
+# how many of those round trips are in flight at once. Unbounded
+# concurrency (asyncio.gather with no cap) would fire hundreds of
+# simultaneous requests at Kanboard's single-writer SQLite backend on a
+# large project — this caps it instead of trading one bottleneck for
+# another.
+_MAX_CONCURRENT_COMMENT_FETCHES = 10
 
 # Matches "🏗️ Note: <text>", case-insensitive on "Note", capturing
 # everything up to whichever comes first: the "\n\n---" footer separator
@@ -145,15 +157,33 @@ async def get_project_decision_notes(
         int). Sorted newest first by comment date; notes without a date
         sort last. Empty list if the project has no tickets, no
         comments, or no flagged notes.
+
+    Notes
+    -----
+    Fetches every in-scope ticket's comments concurrently (bounded by
+    :data:`_MAX_CONCURRENT_COMMENT_FETCHES`) instead of one at a time —
+    on a project with N tickets this was previously N sequential RPC
+    round trips; it's now N calls in flight at most
+    ``_MAX_CONCURRENT_COMMENT_FETCHES`` at a time, cutting wall-clock
+    time roughly in proportion to that concurrency limit since each call
+    is I/O-bound (waiting on Kanboard's HTTP response), not CPU-bound.
     """
     tasks = await kanban_client.get_all_tasks()
     project_id_str = str(project_id)
+    project_tasks = [t for t in tasks if t.project_id == project_id_str]
+
+    semaphore = asyncio.Semaphore(_MAX_CONCURRENT_COMMENT_FETCHES)
+
+    async def _fetch_comments(task: Any) -> Tuple[Any, List[Dict[str, Any]]]:
+        async with semaphore:
+            return task, await kanban_client.get_comments(task.id)
+
+    results = await asyncio.gather(
+        *(_fetch_comments(task) for task in project_tasks)
+    )
 
     notes: List[Dict[str, Any]] = []
-    for task in tasks:
-        if task.project_id != project_id_str:
-            continue
-        comments = await kanban_client.get_comments(task.id)
+    for task, comments in results:
         for comment in comments:
             for note_text in extract_notes_from_comment(comment.get("content", "")):
                 notes.append(

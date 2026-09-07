@@ -9,6 +9,7 @@ and compiles them into the Decisions Log shown on the /project-description
 page's Decisions tab.
 """
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -311,3 +312,83 @@ class TestNormalizeCommentDate:
         """A provider that already returns an ISO string (or any other
         non-numeric date format) must not be mangled."""
         assert _normalize_comment_date("2026-01-01T00:00:00") == "2026-01-01T00:00:00"
+
+
+# ── concurrency (N+1 fix) ────────────────────────────────────────────────────
+
+class TestConcurrentCommentFetching:
+    """Regression: get_project_decision_notes used to call
+    kanban_client.get_comments(task.id) once per task, strictly
+    sequentially (await inside a for loop) — an N+1 pattern where a
+    project with hundreds of tickets meant hundreds of sequential RPC
+    round trips before the Decisions tab could render. It's now fired
+    concurrently, bounded by _MAX_CONCURRENT_COMMENT_FETCHES.
+
+    These tests prove the *behavior* (calls actually overlap, and the
+    concurrency is capped) rather than just asserting call counts, since
+    call counts alone can't distinguish "fired one at a time" from
+    "fired together" — both call get_comments() the same number of times.
+    """
+
+    @pytest.mark.asyncio
+    async def test_comment_fetches_actually_overlap_in_time(self):
+        """5 tasks, each get_comments() call blocks until all 5 have
+        started. If the implementation were still sequential (await
+        inside a for loop), call #2 would never start — call #1 is
+        blocked waiting for a condition only 5 concurrent callers can
+        satisfy — and this test would hang until asyncio.wait_for's
+        timeout fires it as a clear failure instead of an infinite hang.
+        """
+        n = 5
+        started = 0
+        all_started = asyncio.Event()
+
+        async def get_comments(_task_id):
+            nonlocal started
+            started += 1
+            if started == n:
+                all_started.set()
+            await asyncio.wait_for(all_started.wait(), timeout=2)
+            return []
+
+        kanban = MagicMock()
+        kanban.get_all_tasks = AsyncMock(
+            return_value=[_task(str(i), "7", f"Ticket {i}") for i in range(n)]
+        )
+        kanban.get_comments = AsyncMock(side_effect=get_comments)
+
+        result = await asyncio.wait_for(
+            get_project_decision_notes(kanban, project_id=7), timeout=3
+        )
+        assert result == []
+        assert started == n
+
+    @pytest.mark.asyncio
+    async def test_concurrency_is_bounded(self):
+        """More tasks than _MAX_CONCURRENT_COMMENT_FETCHES must never
+        have more in-flight get_comments() calls at once than that
+        limit — unbounded concurrency would fire every request at once
+        against Kanboard's single-writer SQLite backend."""
+        from src.core.decision_notes import _MAX_CONCURRENT_COMMENT_FETCHES
+
+        n = _MAX_CONCURRENT_COMMENT_FETCHES * 3
+        in_flight = 0
+        peak = 0
+
+        async def get_comments(_task_id):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.01)
+            in_flight -= 1
+            return []
+
+        kanban = MagicMock()
+        kanban.get_all_tasks = AsyncMock(
+            return_value=[_task(str(i), "7", f"Ticket {i}") for i in range(n)]
+        )
+        kanban.get_comments = AsyncMock(side_effect=get_comments)
+
+        await get_project_decision_notes(kanban, project_id=7)
+        assert peak <= _MAX_CONCURRENT_COMMENT_FETCHES
+        assert peak > 1  # sanity: proves some real overlap happened at all
