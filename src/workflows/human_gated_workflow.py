@@ -62,6 +62,7 @@ from src.ai.verification.ai_verifier import AIVerifier, VerificationResult
 from src.core.acceptance_criteria import ACChangeDetector, ACGenerator, ACParser
 from src.core.board_watcher import BoardWatcher
 from src.core.comment_protocol import CommentFormatter, CommentParser
+from src.core.decision_notes import extract_notes_from_comment
 from src.core.dev_environment import DevEnvironmentManager
 from src.core.events import Events
 from src.core.gate_settings import GateMode, GateSettingManager
@@ -1452,6 +1453,13 @@ class HumanGatedWorkflow:
             "id/email>\", \"used\": <number>, \"limit\": <number or null>, "
             "\"unit\": \"<e.g. tokens>\"}` (null/omit `limit` for a self-hosted "
             "or unlimited model) so the human sees it on the ticket.\n"
+            "If you make a choice worth flagging while working this ticket "
+            "— a library or package pick, a design pattern, a tradeoff — "
+            "that isn't already spelled out in the acceptance criteria, "
+            "include a line starting with '🏗️ Note:' followed by what you "
+            "chose and why, anywhere in your `report`. Marcus posts it to "
+            "the ticket verbatim regardless of how the rest of your report "
+            "gets summarized. Skip it for routine implementation details.\n"
             "4. When EVERY acceptance criterion is met: if what you built "
             "added, changed, or contradicted anything about the project's "
             "tech stack (a new dependency, a different dev/install "
@@ -2477,6 +2485,16 @@ class HumanGatedWorkflow:
 
         # 1. A report on the worker's active ticket → summarize + act.
         if report and report.strip() and active:
+            # Post any "🏗️ Note:" the worker flagged BEFORE summarizing —
+            # _summarize_report below rewrites the report into one plain
+            # sentence via an LLM (or truncates it), either of which can
+            # mangle or drop a verbatim note. Posting it as its own
+            # comment here means the Decisions Log tab (which scans for
+            # this exact prefix — see src/core/decision_notes.py) sees it
+            # untouched regardless of what happens to the rest of the
+            # report.
+            for note in extract_notes_from_comment(report):
+                await self._post_comment(active, f"🏗️ Note: {note}")
             summary = await self._summarize_report(report)
             await self._post_comment(active, f"🤖 **Worker progress:** {summary}")
             # A report of any kind means the agent is alive on this ticket —
@@ -4490,6 +4508,15 @@ class HumanGatedWorkflow:
                     if gate_is_ai
                     else ", or signal_waiting_for_human / signal_blocked if stuck"
                 )
+                + "\n\n🏗️ ARCHITECTURAL NOTES: If you make a choice worth "
+                "flagging while working this ticket — a library or package "
+                "pick, a design pattern, a tradeoff — that isn't already "
+                "spelled out in the acceptance criteria, call "
+                "post_ticket_progress on THIS ticket with a message that "
+                "starts with '🏗️ Note:' followed by one or two sentences: "
+                "what you chose and why. Skip it for routine implementation "
+                "details — use it only for choices a reviewer would "
+                "actually want visibility into."
             ),
         }
 

@@ -2497,6 +2497,22 @@ class TestGetWorkContextEnrichedFields:
         assert ctx["recent_comments"] == all_comments[-10:]
         assert len(ctx["recent_comments"]) == 10
 
+    @pytest.mark.asyncio
+    async def test_instructions_tell_the_agent_to_flag_decisions(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Regression: the classic get_work_context flow (an agent pointed
+        at a specific ticket, calling post_ticket_progress directly) never
+        mentioned the '🏗️ Note:' convention the Decisions Log tab scans
+        for (src/core/decision_notes.py) — only the legacy
+        request_next_task path's build_tiered_instructions did, and that
+        path isn't what get_work_context callers use."""
+        lifecycle.get_or_create("66", "kanboard")
+        mock_kanban.get_task_by_id = AsyncMock(return_value=_make_task_mock())
+        ctx = await workflow.get_work_context("66")
+        assert "🏗️ Note:" in ctx["instructions"]
+        assert "post_ticket_progress" in ctx["instructions"]
+
 
 # ---------------------------------------------------------------------------
 # get_work_context: surfaces the CURRENT project Tech Stack, and instructs
@@ -2626,6 +2642,19 @@ class TestWorkerInstructionsTechStackReconciliation:
         text = workflow._worker_instructions()
         assert "human" in text.lower()
         assert "ignores" in text.lower() or "automatic" in text.lower()
+
+    def test_tells_the_worker_to_flag_decisions_with_the_note_prefix(
+        self, workflow
+    ):
+        """Regression: orchestrate mode (marcus_work) is this deployment's
+        primary agent path, but it used to have its own hand-written
+        instructions that never mentioned the '🏗️ Note:' convention the
+        Decisions Log tab scans for (src/core/decision_notes.py) — only
+        the legacy request_next_task path's build_tiered_instructions did.
+        Real agents using marcus_work never learned to flag decisions at
+        all, so the Decisions Log stayed permanently empty."""
+        text = workflow._worker_instructions()
+        assert "🏗️ Note:" in text
 
 
 # ---------------------------------------------------------------------------
@@ -4131,6 +4160,83 @@ class TestOrchestrateWork:
         )
         assert res["status"] == "continue"
         mock_kanban.add_comment.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_flagged_decision_posted_verbatim_alongside_summary(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """A '🏗️ Note:' the worker includes in its report must reach the
+        ticket byte-for-byte, in its own comment — not just folded into
+        the (possibly LLM-paraphrased) 'Worker progress' comment, since
+        the Decisions Log tab scans for this exact prefix
+        (src/core/decision_notes.py)."""
+        lifecycle.get_or_create("11", "kanboard")
+        lifecycle.transition("11", "kanboard", TicketState.READY)
+        lifecycle.claim_ticket("11", "kanboard", "w6")
+        lifecycle.transition("11", "kanboard", TicketState.IN_PROGRESS)
+
+        # An LLM summarizer that rewrites everything into a generic
+        # sentence, proving the note survives independent of it.
+        workflow._llm_generate = AsyncMock(
+            return_value="Made progress on the ticket."
+        )
+
+        await workflow.orchestrate_work(
+            agent_id="w6",
+            ticket_id="11",
+            report=(
+                "wrote the cache layer. 🏗️ Note: chose Redis over "
+                "in-memory caching because we already run it for sessions"
+            ),
+        )
+
+        posted = [c.args[1] for c in mock_kanban.add_comment.call_args_list]
+        assert (
+            "🏗️ Note: chose Redis over in-memory caching because we "
+            "already run it for sessions"
+            in posted
+        )
+        # The summarized progress comment still goes out too.
+        assert any("Made progress on the ticket." in body for body in posted)
+
+    @pytest.mark.asyncio
+    async def test_report_with_multiple_notes_posts_each_separately(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """Two flagged decisions in one report become two separate comments."""
+        lifecycle.get_or_create("12", "kanboard")
+        lifecycle.transition("12", "kanboard", TicketState.READY)
+        lifecycle.claim_ticket("12", "kanboard", "w7")
+        lifecycle.transition("12", "kanboard", TicketState.IN_PROGRESS)
+
+        await workflow.orchestrate_work(
+            agent_id="w7",
+            ticket_id="12",
+            report=(
+                "🏗️ Note: picked argparse over click for zero dependencies\n\n"
+                "🏗️ Note: used a queue instead of polling for lower latency"
+            ),
+        )
+
+        posted = [c.args[1] for c in mock_kanban.add_comment.call_args_list]
+        assert "🏗️ Note: picked argparse over click for zero dependencies" in posted
+        assert "🏗️ Note: used a queue instead of polling for lower latency" in posted
+
+    @pytest.mark.asyncio
+    async def test_report_without_a_note_posts_only_the_progress_comment(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """No '🏗️ Note:' in the report → no extra comment is posted."""
+        lifecycle.get_or_create("13", "kanboard")
+        lifecycle.transition("13", "kanboard", TicketState.READY)
+        lifecycle.claim_ticket("13", "kanboard", "w8")
+        lifecycle.transition("13", "kanboard", TicketState.IN_PROGRESS)
+
+        await workflow.orchestrate_work(
+            agent_id="w8", ticket_id="13", report="wrote a unit test"
+        )
+
+        assert mock_kanban.add_comment.call_count == 1
 
     @pytest.mark.asyncio
     async def test_done_report_completes_ticket(
