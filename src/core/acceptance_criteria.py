@@ -8,16 +8,36 @@ human edits the AC and notify the AI agent to re-read the requirements.
 
 AC format in ticket descriptions
 ---------------------------------
-The AC lives between two sentinel comments that survive round-trips
+The AC lives between two sentinel markers that survive round-trips
 through GitHub/Jira::
 
-    <!-- MARCUS_AC_START -->
+    [MARCUS_AC_START]: # (marker)
     ## Acceptance Criteria
 
     - [ ] First criterion
     - [ ] Second criterion
 
-    <!-- MARCUS_AC_END -->
+    [MARCUS_AC_END]: # (marker)
+
+These are Markdown *link reference definitions* (CommonMark's
+``[label]: destination "title"`` syntax, with a dummy ``#`` destination
+and a ``(marker)`` title) — every Markdown renderer, Kanboard's included,
+consumes them silently as metadata and renders nothing, so the sentinels
+never appear as visible text anywhere a human reads the description
+(the task page, the edit textarea, the activity log, ...).
+
+Earlier versions embedded the block between HTML comments instead
+(``<!-- MARCUS_AC_START -->`` / ``<!-- MARCUS_AC_END -->``). Kanboard
+renders descriptions with HTML escaping turned on, so those comments
+were NOT treated as invisible HTML — they showed up as literal visible
+text, which is what the reference-link markers above fix. ``extract()``
+still recognizes the old HTML-comment markers (read-only) so tickets
+that already have them keep parsing correctly; ``embed()`` only ever
+writes the new format, so a ticket naturally upgrades the next time its
+AC is regenerated or re-embedded. The MarcusDevEnv Kanboard plugin's
+``Template/task/description_cleanup.php`` stays in place to hide the
+old-format markers (client-side only) on tickets that haven't upgraded
+yet.
 
 Any text outside the sentinels is untouched by Marcus.
 
@@ -41,13 +61,23 @@ from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-_AC_START = "<!-- MARCUS_AC_START -->"
-_AC_END = "<!-- MARCUS_AC_END -->"
+_AC_START = "[MARCUS_AC_START]: # (marker)"
+_AC_END = "[MARCUS_AC_END]: # (marker)"
+
+# Read-only: markers used before the switch to reference-link syntax (see
+# module docstring). extract()/remove() still recognize these so tickets
+# that already have them keep working; embed() never writes them again.
+_LEGACY_AC_START = "<!-- MARCUS_AC_START -->"
+_LEGACY_AC_END = "<!-- MARCUS_AC_END -->"
+
 _AC_HEADER = "## Acceptance Criteria"
 
-# Regex to pull out the block between the sentinels (including sentinels).
+# Regex to pull out the block between the sentinels (including sentinels)
+# — either the current reference-link markers or the legacy HTML-comment
+# ones, so a description written under either scheme is recognized.
 _AC_BLOCK_RE = re.compile(
-    r"<!-- MARCUS_AC_START -->.*?<!-- MARCUS_AC_END -->",
+    r"\[MARCUS_AC_START\]: # \(marker\).*?\[MARCUS_AC_END\]: # \(marker\)"
+    r"|<!-- MARCUS_AC_START -->.*?<!-- MARCUS_AC_END -->",
     re.DOTALL,
 )
 
@@ -133,8 +163,15 @@ class ACParser:
             return None
 
         block = match.group(0)
-        # Strip sentinels to get the inner markdown.
-        inner = block.replace(_AC_START, "").replace(_AC_END, "").strip()
+        # Strip sentinels to get the inner markdown — whichever format
+        # (current or legacy) this block actually used.
+        inner = (
+            block.replace(_AC_START, "")
+            .replace(_AC_END, "")
+            .replace(_LEGACY_AC_START, "")
+            .replace(_LEGACY_AC_END, "")
+            .strip()
+        )
 
         items = [
             ACItem(text=m.group(2).strip(), checked=m.group(1).lower() == "x")

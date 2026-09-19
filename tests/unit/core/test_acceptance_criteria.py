@@ -64,9 +64,13 @@ class TestACParser:
         assert all(c in "0123456789abcdef" for c in ac.ac_hash)
 
     def test_embed_inserts_block(self):
-        """embed() appends the AC block to a description without one."""
+        """embed() appends the AC block to a description without one, using
+        the current reference-link sentinel format (invisible when
+        rendered — see module docstring), never the legacy HTML-comment
+        one."""
         result = ACParser.embed(_NO_AC_DESC, "- [ ] Test passes")
-        assert "<!-- MARCUS_AC_START -->" in result
+        assert "[MARCUS_AC_START]: # (marker)" in result
+        assert "<!-- MARCUS_AC_START -->" not in result
         assert "- [ ] Test passes" in result
         assert _NO_AC_DESC in result
 
@@ -75,7 +79,29 @@ class TestACParser:
         result = ACParser.embed(_SAMPLE_DESC, "- [ ] Brand new criterion")
         assert "Deploy the service" not in result
         assert "Brand new criterion" in result
-        assert result.count("<!-- MARCUS_AC_START -->") == 1
+        assert result.count("[MARCUS_AC_START]: # (marker)") == 1
+
+    def test_embed_upgrades_a_legacy_block_to_the_current_format(self):
+        """A description whose AC block still uses the old HTML-comment
+        sentinels (from before the switch to reference-link syntax) gets
+        upgraded to the current format the moment its AC is re-embedded —
+        the old markers must not survive the replace."""
+        result = ACParser.embed(_SAMPLE_DESC, "- [ ] Brand new criterion")
+        assert "<!-- MARCUS_AC_START -->" not in result
+        assert "<!-- MARCUS_AC_END -->" not in result
+
+    def test_extract_still_reads_a_legacy_html_comment_block(self):
+        """Backward compatibility: a ticket whose AC was embedded before
+        the switch to reference-link sentinels must keep parsing
+        correctly — extract() is read-only for the old format, it's only
+        embed() that stops writing it."""
+        legacy_desc = (
+            "<!-- MARCUS_AC_START -->\n## Acceptance Criteria\n\n"
+            "- [ ] Old-format item\n<!-- MARCUS_AC_END -->"
+        )
+        ac = ACParser.extract(legacy_desc)
+        assert ac is not None
+        assert ac.items[0].text == "Old-format item"
 
     def test_remove_strips_block(self):
         """remove() strips the AC block leaving surrounding text."""
@@ -187,11 +213,12 @@ class TestACGenerator:
         assert "LLM criterion one" in result
 
     def test_format_for_description_wraps_in_sentinels(self, gen):
-        """format_for_description wraps text in Marcus sentinels."""
+        """format_for_description wraps text in Marcus's current
+        (reference-link, invisible-when-rendered) sentinels."""
         ac_text = "- [ ] Deploy service"
         result = gen.format_for_description(ac_text)
-        assert "<!-- MARCUS_AC_START -->" in result
-        assert "<!-- MARCUS_AC_END -->" in result
+        assert "[MARCUS_AC_START]: # (marker)" in result
+        assert "[MARCUS_AC_END]: # (marker)" in result
         assert "Deploy service" in result
 
 

@@ -1217,6 +1217,34 @@ class TestHumanGateAIVerify:
         workflow._verifier.verify.assert_not_called()
 
 
+class TestGetAcItems:
+    """_get_ac_items reads the stored raw AC markdown back out as a list
+    of item texts — it wraps record.acceptance_criteria in sentinels the
+    same way ACParser.embed() would, then re-parses, so it always agrees
+    with whatever the canonical sentinel format currently is (see
+    ACParser in src/core/acceptance_criteria.py) instead of duplicating
+    it as a separate literal."""
+
+    def test_returns_item_texts_from_stored_markdown(self, workflow):
+        record = TicketRecord(
+            ticket_id="80",
+            provider="kanboard",
+            state=TicketState.IN_PROGRESS,
+            acceptance_criteria="- [ ] First criterion\n- [x] Second criterion",
+        )
+        items = workflow._get_ac_items(record)
+        assert items == ["First criterion", "Second criterion"]
+
+    def test_empty_when_no_ac_stored(self, workflow):
+        record = TicketRecord(
+            ticket_id="81",
+            provider="kanboard",
+            state=TicketState.IN_PROGRESS,
+            acceptance_criteria="",
+        )
+        assert workflow._get_ac_items(record) == []
+
+
 # ---------------------------------------------------------------------------
 # Manual-testing instructions posted alongside the "ready for review" comment
 # ---------------------------------------------------------------------------

@@ -81,13 +81,16 @@ class Plugin extends Base
             'MarcusDevEnv:task/hidden_fields'
         );
 
-        // Strip the visible "<!-- MARCUS_AC_START -->" / "<!-- MARCUS_AC_END -->"
-        // sentinel text Kanboard's Markdown renderer leaves behind in the
-        // task description (src/core/acceptance_criteria.py needs those
-        // markers to stay in the STORED description — this only cleans up
-        // what's rendered in the browser). Fired immediately after
-        // app/Template/task/description.php renders, before subtasks.
-        // See Template/task/description_cleanup.php for the full rationale.
+        // LEGACY cleanup: strip the visible "<!-- MARCUS_AC_START -->" /
+        // "<!-- MARCUS_AC_END -->" sentinel text Kanboard's Markdown
+        // renderer leaves behind in the task description for tickets
+        // whose AC block predates the switch to invisible-by-construction
+        // Markdown reference-link sentinels (src/core/acceptance_criteria.py
+        // still needs the OLD markers to stay in the STORED description
+        // for those tickets — this only cleans up what's rendered in the
+        // browser). Fired immediately after app/Template/task/description.php
+        // renders, before subtasks. See Template/task/description_cleanup.php
+        // for the full rationale.
         $this->template->hook->attach(
             'template:task:show:before-subtasks',
             'MarcusDevEnv:task/description_cleanup'

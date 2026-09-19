@@ -5262,10 +5262,12 @@ class HumanGatedWorkflow:
         """Return the list of AC item texts from the stored AC markdown."""
         if not record.acceptance_criteria:
             return []
-        ac = ACParser.extract(
-            f"<!-- MARCUS_AC_START -->\n## Acceptance Criteria\n\n"
-            f"{record.acceptance_criteria}\n<!-- MARCUS_AC_END -->"
-        )
+        # record.acceptance_criteria is the raw checklist markdown with no
+        # sentinels (see _generate_and_post_ac) — wrap it the same way
+        # ACParser.embed() would, then immediately extract, so this always
+        # matches whatever the canonical sentinel format currently is
+        # instead of duplicating it here as a separate literal.
+        ac = ACParser.extract(ACParser.embed("", record.acceptance_criteria))
         if ac is None:
             # The stored text might not have sentinels — try parsing directly.
             import re

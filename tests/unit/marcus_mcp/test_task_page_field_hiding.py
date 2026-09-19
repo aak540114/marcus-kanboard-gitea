@@ -2,7 +2,10 @@
 Guard: the MarcusDevEnv plugin hides Swimlane/Priority/Position/Started
 from Kanboard's task-detail page, and strips the visible
 "<!-- MARCUS_AC_START -->" / "<!-- MARCUS_AC_END -->" sentinel text left
-behind by Kanboard's Markdown renderer in the task description.
+behind by Kanboard's Markdown renderer in the task description — a
+LEGACY cleanup for tickets embedded before AC sentinels switched to
+Markdown reference-link syntax (invisible by construction, no cleanup
+needed — see src/core/acceptance_criteria.py's module docstring).
 
 Both are display-only DOM fixups injected via Kanboard's plugin hook
 system (Kanboard gives plugins ADD-only hook points into its own core
