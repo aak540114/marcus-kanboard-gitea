@@ -3110,14 +3110,23 @@ class HumanGatedWorkflow:
     async def signal_ready_for_review(self, ticket_id: str) -> bool:
         """Signal that the AI agent is done.
 
-        **Human gate (default)**: transitions to ``WAITING_FOR_HUMAN``, moves
-        the kanban card to ``waiting for human``, and posts a review comment
-        asking the human to approve and mark the ticket ``done``.
+        **Human gate (default)**: if AI Verify is configured
+        (``verify_count`` > 0), runs one verification round first — same
+        round-tracking as the AI-gate path below, just followed by "wait
+        for human" instead of merging. A round that fails or leaves rounds
+        remaining releases the ticket back to the agent and returns
+        ``False`` without touching the human-review flow; the ticket only
+        reaches a human once every configured round has passed (or
+        immediately, if ``verify_count`` is 0). Once verification clears,
+        transitions to ``WAITING_FOR_HUMAN``, moves the kanban card to
+        ``waiting for human``, and posts a review comment asking the human
+        to approve and mark the ticket ``done``.
 
         **AI gate**: skips the human review step entirely.  The branch is
-        merged to main automatically, the kanban card moves to ``done``, and
-        a completion comment is posted — identical to what happens when a
-        human marks the ticket done in human-gate mode.
+        merged to main automatically (after the same AI-Verify rounds, if
+        configured), the kanban card moves to ``done``, and a completion
+        comment is posted — identical to what happens when a human marks
+        the ticket done in human-gate mode.
 
         Parameters
         ----------
@@ -3178,6 +3187,15 @@ class HumanGatedWorkflow:
 
         if gate == "ai":
             return await self._autocomplete_ticket(ticket_id, record)
+
+        # AI Verify also applies under human gate: the same N-round
+        # verification loop as the AI-gate path must pass before the
+        # ticket is even shown to a human. A round that fails or leaves
+        # rounds remaining has already released the ticket back to the
+        # agent (and moved it to "in progress") inside _run_verify_gate —
+        # the human-review flow below must not run at all in that case.
+        if not await self._run_verify_gate(ticket_id, record):
+            return False
 
         # ── Human gate: wait for human review ──────────────────────────
         # Ordering is deliberate: the review comment — the human's only
@@ -5642,6 +5660,118 @@ class HumanGatedWorkflow:
         """
         return record.assignee in (None, "", "0")
 
+    async def _run_verify_gate(
+        self,
+        ticket_id: str,
+        record: TicketRecord,
+    ) -> bool:
+        """Run the configured AI-Verify rounds for a ticket, gate-agnostic.
+
+        Shared by both :meth:`_autocomplete_ticket` (AI gate: verify then
+        auto-merge) and :meth:`signal_ready_for_review`'s human-gate path
+        (verify then hand off to a human) — verification itself doesn't
+        care what happens once it's satisfied, only whether the configured
+        number of rounds have run and the last one passed. Each call to
+        ``signal_ready_for_review`` completes at most one round; progress
+        is tracked in ``self._ticket_verify_rounds`` /
+        ``self._ticket_verify_last_passed`` so a caller resubmitting after
+        a fix continues from where it left off.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Ticket identifier.
+        record : TicketRecord
+            Current lifecycle record (for branch name / AC).
+
+        Returns
+        -------
+        bool
+            ``True`` once verification is fully satisfied — ``verify_count``
+            is 0 (disabled), or every configured round has run and the last
+            one passed — meaning the caller should proceed with whatever
+            comes after verification. ``False`` if this call consumed a
+            round that either failed or still leaves rounds remaining: the
+            ticket has already been released back to the agent and moved
+            to "in progress", posted with a round-result comment, and the
+            caller must return ``False`` immediately without doing
+            anything further (no merge, no hand-off to a human).
+        """
+        branch_name = record.branch_name
+        verify_count = await self._get_effective_verify_count(ticket_id)
+        if verify_count <= 0:
+            return True
+
+        rounds_done = self._ticket_verify_rounds.get(ticket_id, 0)
+        # Whether the LAST completed round actually passed — checked
+        # alongside rounds_done below so a verify_count DECREASE via
+        # the live gate-setting API (e.g. a human watching round 1
+        # fail and deciding 3 rounds was overkill) can never make the
+        # "already satisfied" fast path proceed when the most recent
+        # verification attempt genuinely FAILED. See
+        # TestVerifyCountLoweredMidFlight.
+        last_passed = self._ticket_verify_last_passed.get(ticket_id, False)
+
+        if rounds_done >= verify_count and last_passed:
+            # All N (now possibly fewer than originally configured)
+            # rounds are done and the last one genuinely passed —
+            # clear the bookkeeping and let the caller proceed.
+            self._ticket_verify_rounds.pop(ticket_id, None)
+            self._ticket_verify_last_passed.pop(ticket_id, None)
+            # Defensive: the "Verify N" card tag should already be gone
+            # (cleared when the final round passed), but a prior crash
+            # between that clear and the caller's next step could leave
+            # it stale.
+            await self._set_verify_round_tag(ticket_id, None)
+            return True
+
+        current_round = rounds_done + 1
+        # Stamp the round on the card BEFORE running it, so "Verify N"
+        # is what a human sees on the board for the whole time this
+        # ticket sits in "in progress" going through round N — not
+        # just a comment they'd have to open the ticket to find.
+        await self._set_verify_round_tag(ticket_id, current_round)
+        result = await self._run_verification_round(ticket_id, record, branch_name)
+        self._ticket_verify_rounds[ticket_id] = current_round
+        self._ticket_verify_last_passed[ticket_id] = result.passed
+
+        # >= rather than == : verify_count may have been lowered
+        # since rounds_done was last recorded (the branch above
+        # only skips straight through when the last attempt already
+        # passed — otherwise a round always runs here, which can make
+        # current_round exceed a since-lowered verify_count). This
+        # round is still the first to confirm a pass against the
+        # CURRENT threshold, so it's final.
+        if result.passed and current_round >= verify_count:
+            # Last round passed → all verification is done. Clear the
+            # card tag before letting the caller proceed.
+            self._ticket_verify_rounds.pop(ticket_id, None)
+            self._ticket_verify_last_passed.pop(ticket_id, None)
+            await self._set_verify_round_tag(ticket_id, None)
+            comment = CommentFormatter.verification_round_result(
+                ticket_id, current_round, verify_count, result
+            )
+            await self._post_comment(ticket_id, comment)
+            return True
+
+        # Issues found (any round) OR passed but more rounds remain.
+        # Post a round-result comment, release the ticket so the agent
+        # can pick it up again to fix issues (or re-signal if clean).
+        comment = CommentFormatter.verification_round_result(
+            ticket_id, current_round, verify_count, result
+        )
+        await self._post_comment(ticket_id, comment)
+        try:
+            self._lifecycle.release_ticket(ticket_id, self._provider)
+        except KeyError:
+            pass
+        try:
+            await self._kanban.move_task_to_column(ticket_id, "in progress")
+        except Exception:  # noqa: BLE001
+            pass
+        await self._pickup_next_ticket()
+        return False
+
     async def _autocomplete_ticket(
         self,
         ticket_id: str,
@@ -5677,81 +5807,12 @@ class HumanGatedWorkflow:
             return False
 
         # ── AI verification (multi-round when enabled) ─────────────────────────
-        # Each call to signal_ready_for_review completes one round.  When the
-        # configured verify_count > 0 we track how many rounds are done in
-        # self._ticket_verify_rounds.  Only when all rounds pass does the
-        # branch merge.
-        verify_count = await self._get_effective_verify_count(ticket_id)
-        if verify_count > 0:
-            rounds_done = self._ticket_verify_rounds.get(ticket_id, 0)
-            # Whether the LAST completed round actually passed — checked
-            # alongside rounds_done below so a verify_count DECREASE via
-            # the live gate-setting API (e.g. a human watching round 1
-            # fail and deciding 3 rounds was overkill) can never make the
-            # "already satisfied" fast path merge code whose most recent
-            # verification attempt genuinely FAILED. See
-            # TestVerifyCountLoweredMidFlight.
-            last_passed = self._ticket_verify_last_passed.get(ticket_id, False)
-
-            if rounds_done >= verify_count and last_passed:
-                # All N (now possibly fewer than originally configured)
-                # rounds are done and the last one genuinely passed —
-                # clear the bookkeeping and fall through to merge.
-                self._ticket_verify_rounds.pop(ticket_id, None)
-                self._ticket_verify_last_passed.pop(ticket_id, None)
-                # Defensive: the "Verify N" card tag should already be gone
-                # (cleared when the final round passed), but a prior crash
-                # between that clear and the merge could leave it stale.
-                await self._set_verify_round_tag(ticket_id, None)
-
-            else:
-                current_round = rounds_done + 1
-                # Stamp the round on the card BEFORE running it, so "Verify N"
-                # is what a human sees on the board for the whole time this
-                # ticket sits in "in progress" going through round N — not
-                # just a comment they'd have to open the ticket to find.
-                await self._set_verify_round_tag(ticket_id, current_round)
-                result = await self._run_verification_round(ticket_id, record, branch_name)
-                self._ticket_verify_rounds[ticket_id] = current_round
-                self._ticket_verify_last_passed[ticket_id] = result.passed
-
-                # >= rather than == : verify_count may have been lowered
-                # since rounds_done was last recorded (the branch above
-                # only skips straight to merge when the last attempt
-                # already passed — otherwise a round always runs here,
-                # which can make current_round exceed a since-lowered
-                # verify_count). This round is still the first to confirm
-                # a pass against the CURRENT threshold, so it's final.
-                if result.passed and current_round >= verify_count:
-                    # Last round passed → all verification is done. Clear the
-                    # card tag before falling through to merge/Done.
-                    self._ticket_verify_rounds.pop(ticket_id, None)
-                    self._ticket_verify_last_passed.pop(ticket_id, None)
-                    await self._set_verify_round_tag(ticket_id, None)
-                    comment = CommentFormatter.verification_round_result(
-                        ticket_id, current_round, verify_count, result
-                    )
-                    await self._post_comment(ticket_id, comment)
-                    # fall through to merge
-
-                else:
-                    # Issues found (any round) OR passed but more rounds remain.
-                    # Post a round-result comment, release the ticket so the agent
-                    # can pick it up again to fix issues (or re-signal if clean).
-                    comment = CommentFormatter.verification_round_result(
-                        ticket_id, current_round, verify_count, result
-                    )
-                    await self._post_comment(ticket_id, comment)
-                    try:
-                        self._lifecycle.release_ticket(ticket_id, self._provider)
-                    except KeyError:
-                        pass
-                    try:
-                        await self._kanban.move_task_to_column(ticket_id, "in progress")
-                    except Exception:  # noqa: BLE001
-                        pass
-                    await self._pickup_next_ticket()
-                    return False
+        # Gate-agnostic: the same rounds/bookkeeping run for the human-gate
+        # path too (see signal_ready_for_review) — only what happens AFTER
+        # verification passes differs (merge here vs. hand off to a human
+        # there). See _run_verify_gate.
+        if not await self._run_verify_gate(ticket_id, record):
+            return False
 
         merge_msg = (
             f"merge: ticket/{self._provider}/{ticket_id} (auto-completed, AI gate)"

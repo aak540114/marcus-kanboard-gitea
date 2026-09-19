@@ -11,9 +11,11 @@
  *              Waiting for Human, plus main-branch line count — see
  *              /project-stats and src/core/project_stats.py)
  * Section 3 — Project-level Human Gate / AI Gate toggle
- * Section 4 — AI Verify counter (only visible when AI Gate is active)
- *             Shows [−] N [+] where N is the number of required LLM review
- *             rounds before a ticket's branch is auto-merged.  0 = disabled.
+ * Section 4 — AI Verify counter (always visible, applies under either
+ *             gate). Shows [−] N [+] where N is the number of required LLM
+ *             review rounds a ticket must pass before it proceeds: under
+ *             AI Gate that means auto-merging the branch; under Human Gate
+ *             it means moving to "waiting for human" for review. 0 = disabled.
  * Section 5 — Max dev environments counter (always visible, global —
  *             not scoped per project).  Shows [−] N [+] where N is the
  *             greatest number of "Open Dev Environment" Docker containers
@@ -199,8 +201,10 @@ $cloneProjectStatusUrl = $marcusUrl . '/api/clone-project-status';
 }
 
 /* ── AI Verify counter ────────────────────────────────────────────────── */
+/* Shown for both gates: AI Gate verifies before auto-merging; Human Gate
+   verifies before handing the ticket to a human for review. */
 #marcus-verify-wrap {
-    display: none; /* hidden by default; shown only when AI gate is active */
+    display: none;
     align-items: center;
     gap: 6px;
 }
@@ -432,8 +436,10 @@ $cloneProjectStatusUrl = $marcusUrl . '/api/clone-project-status';
         &#129517; Decompose: checking&hellip;
     </button>
 
-    <!-- AI Verify counter (only shown when AI Gate is active) -->
-    <div id="marcus-verify-wrap">
+    <!-- AI Verify counter (shown for both gates: AI Gate runs it before
+         auto-merging; Human Gate runs it before handing the ticket to a
+         human for review) -->
+    <div id="marcus-verify-wrap" class="visible">
         <span class="marcus-gate-label">AI Verify:</span>
         <div class="marcus-verify-counter">
             <button class="marcus-verify-btn" id="marcus-verify-dec"
@@ -852,12 +858,9 @@ $cloneProjectStatusUrl = $marcusUrl . '/api/clone-project-status';
         var aiBtn    = document.getElementById('pgBtn-ai');
         humanBtn.className = gate === 'human' ? 'active-human' : '';
         aiBtn.className    = gate === 'ai'    ? 'active-ai'    : '';
-        // Show/hide AI Verify counter depending on gate
-        if (gate === 'ai') {
-            verifyWrap.classList.add('visible');
-        } else {
-            verifyWrap.classList.remove('visible');
-        }
+        // AI Verify runs under both gates (before auto-merge on AI Gate,
+        // before hand-off to a human on Human Gate) — always visible.
+        verifyWrap.classList.add('visible');
     }
 
     function applyProjectVerify(count) {

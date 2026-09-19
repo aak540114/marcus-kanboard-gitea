@@ -42,7 +42,7 @@ This README covers the essentials. Full details live under [`documents/`](docume
 | **Hot-reload dev environments** | One-click per-ticket preview URL, any language/framework, refreshing instantly on every `git push`. See [Hot-reload dev environments](documents/api-reference.md#hot-reload-dev-environments). |
 | **Project Description system** | Per-project markdown doc (tech stack, architecture notes) AI agents read via `get_project_description`; Marcus infers it when missing. |
 | **Human Gate / AI Gate toggle** | Per-project and per-ticket control over whether humans review AI work before it merges. |
-| **AI Verify** | Configurable N-round LLM code review before any AI-gate merge. See [AI Verify](documents/features.md#ai-verify). |
+| **AI Verify** | Configurable N-round LLM code review a ticket must pass before it proceeds — under either gate: auto-merge (AI Gate) or hand-off to a human (Human Gate). See [AI Verify](documents/features.md#ai-verify). |
 | **Clone this project** | A **"📋 Clone this project"** button replicates a project's entire visible state — tickets, settings, description, and full git history — under a new name. See [Cloning a project](documents/features.md#cloning-a-project). |
 | **Project stats** | A **"📊 Project Stats"** page tracking tickets/hour into Done and Waiting for Human, plus the repo's line count on `main`. See [Project stats](documents/features.md#project-stats). |
 | **Claude subscription provider** | Marcus's own planner calls can run through a locally logged-in `claude` CLI instead of a metered API key. See [AI provider](documents/deployment-guide.md#ai-provider). |

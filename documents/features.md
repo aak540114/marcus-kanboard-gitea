@@ -20,7 +20,7 @@ The plugin ships in `kanboard/plugins/MarcusDevEnv/` and is automatically active
 | **Clone this project button** | Prompts for a new project name, then creates a full, isolated copy of this project (tickets, settings, description, git history) under that name. See [Cloning a project](#cloning-a-project). |
 | **Human Gate / AI Gate toggle** | Sets the project-level gate mode. Human Gate (default): AI pauses for human review before done. AI Gate: AI merges and closes autonomously. |
 | **Decompose ON/OFF toggle** | Separate from the Marcus ON/OFF switch above — controls only whether Marcus may auto-split a large ticket into sub-tickets (or honor `@marcus decompose`) in this project. Defaults **ON**. |
-| **AI Verify counter** | Appears when AI Gate is active. `[−] N [+]` sets how many sequential LLM review rounds run before the branch auto-merges. 0 = disabled. |
+| **AI Verify counter** | Always visible, applies under either gate. `[−] N [+]` sets how many sequential LLM review rounds a ticket must pass before it proceeds — auto-merging the branch under AI Gate, or moving to "waiting for human" under Human Gate. 0 = disabled. |
 | **Max dev environments counter** | Global, always visible. `[−] N [+]` caps how many "Open Dev Environment" Docker containers can run at once across every ticket — `∞` (default) means unlimited. Once the limit is reached, starting a new one fails until an existing one is stopped. |
 | **Start/Stop Main Preview** | Project-level (not per-ticket) hot-reload preview of the project's `main` branch — separate from each ticket's own preview button in its sidebar. Starts/stops a container the same way, refreshes automatically on every push to `main`, and counts against the Max dev environments limit above. |
 | **Live refresh** | (Invisible widget.) The page holds one SSE connection to Marcus and reloads the moment Marcus/an agent changes anything — no manual refresh. Deferred while you're typing or a Kanboard dialog is open. |
@@ -31,7 +31,7 @@ The plugin ships in `kanboard/plugins/MarcusDevEnv/` and is automatically active
 | **Marcus Code** | Link to the exact Gitea branch this ticket is worked on, so you can review the code updates on the branch at any time. |
 | **Agent Subscription Usage** | When an AI agent is actively working this ticket and its account reported usage, shows that account's usage / limit (self-reported via `marcus_work`; a self-hosted/unlimited model shows the limit as **∞**). Usage is kept **per account**: two agents on one subscription show the same shared figure, while agents on different accounts stay separate — each ticket shows only its own agent's account. |
 | **Marcus Dev Environment** | Start / Open / Stop a hot-reload preview for this ticket's branch. Any language — stack comes from the project description. |
-| **Marcus Gate Mode** | Per-ticket gate override. Shows the project default; lets you switch this ticket to Human or AI gate independently. Ticket setting overrides project setting. Includes a per-ticket AI Verify override when AI Gate is active. |
+| **Marcus Gate Mode** | Per-ticket gate override. Shows the project default; lets you switch this ticket to Human or AI gate independently. Ticket setting overrides project setting. Includes a per-ticket AI Verify override, always visible regardless of gate. |
 | **Marcus Dependencies** | Dependency graph: *Depends on*, *Blocks*, *Related* — each with a colour-coded column-status badge. |
 | **Live refresh** | (Invisible.) Same SSE stream as the board: a new comment or state change from Marcus/an agent reloads the task view instantly — never while you're mid-comment. |
 
@@ -73,7 +73,7 @@ AI agent works on the branch (its own clone)
   → Classic mode: agent posts progress comments itself, then calls
     signal_ready_for_review when done
 
-  Human Gate (default):
+  Human Gate (default, AI Verify OFF):
     → Ticket moves to "Waiting for Human"
     → Marcus posts a "Ready for Review" comment: AC checklist, preview
       link, and a "How to test this" step-by-step walkthrough tailored
@@ -85,6 +85,19 @@ AI agent works on the branch (its own clone)
       pushed branch and merges it to main
     → Request changes: any other comment → back to "In Progress", agent
       resumes with your feedback
+
+  Human Gate (AI Verify ON, e.g. verify_count=2):
+    → signal_ready_for_review → Round 1 of 2:
+        PASS: comment "Round 1/2: PASSED" → agent calls signal_ready again
+        FAIL: comment "Round 1/2: Issues Found" → ticket stays "In
+          Progress", released back to the agent — does NOT reach a human
+    → signal_ready_for_review → Round 2 of 2:
+        PASS: both rounds cleared → proceeds into the normal Human Gate
+          flow above ("Waiting for Human", Ready-for-Review comment, ...)
+        FAIL: comment "Round 2/2: Issues Found (final)" → agent fixes →
+          signal_ready again → re-verifies with no further round increase
+    (A human only ever sees a branch that already passed every configured
+    AI-Verify round — on top of, not instead of, their own review.)
 
   AI Gate (AI Verify OFF):
     → Branch auto-merges to main immediately
@@ -124,7 +137,12 @@ Triggered via `POST /api/clone-project` (`{"baseline_project_id": int, "new_name
 
 ## AI Verify
 
-AI Verify adds an independent LLM code-review step to the AI Gate auto-merge path. It is disabled by default and can be toggled per-project or per-ticket from the Kanboard UI.
+AI Verify adds an independent LLM code-review step before a ticket proceeds past `signal_ready_for_review` — under **either** gate. It is disabled by default (`verify_count=0`) and can be toggled per-project or per-ticket from the Kanboard UI.
+
+- **Under AI Gate**, verification runs before the branch auto-merges to `main`.
+- **Under Human Gate**, verification runs before the ticket moves to "waiting for human" — so a human reviewer only ever sees a branch that already passed every configured AI-Verify round, on top of (not instead of) their own review.
+
+The round-tracking is identical either way; only what happens once every round passes differs.
 
 ### How it works
 
@@ -132,8 +150,8 @@ AI Verify adds an independent LLM code-review step to the AI Gate auto-merge pat
 2. Marcus fetches the unified diff between the ticket branch and `main`.
 3. A second LLM call is made with a prompt containing the ticket title, acceptance criteria, and the diff. The LLM acts as a senior code reviewer.
 4. The LLM responds with a JSON object `{"passed": bool, "findings": [...]}`.
-5. **If passed:** the branch merges to `main` and the ticket closes as usual.
-6. **If failed:** Marcus posts a "Marcus AI Verifier — Issues Found" comment listing each finding and tells the worker what to fix. The ticket stays "In Progress". The worker reads the comment, fixes the issues, and calls `signal_ready_for_review` again — triggering a fresh verification run. This repeats until the review passes.
+5. **If passed:** once every configured round has passed, the ticket proceeds — the branch merges to `main` and the ticket closes (AI Gate), or the ticket moves to "waiting for human" for review as usual (Human Gate).
+6. **If failed:** Marcus posts a "Marcus AI Verifier — Issues Found" comment listing each finding and tells the worker what to fix. The ticket stays "In Progress" (released back to the agent) — it does NOT reach a human yet under Human Gate. The worker reads the comment, fixes the issues, and calls `signal_ready_for_review` again — triggering a fresh verification round. This repeats until every configured round passes.
 
 ### Failure modes and safety
 
@@ -146,13 +164,14 @@ AI Verify adds an independent LLM code-review step to the AI Gate auto-merge pat
 
 ### Enabling AI Verify
 
+The **AI Verify** round counter is always visible next to the gate toggle — it doesn't require AI Gate to be active.
+
 **Project level (board header):**
-1. Set the project gate to **AI Gate** — the **AI Verify** round counter appears next to it (`[−] 0 [+]`).
-2. Click **`+`** to increase the number of required verification rounds (0 = disabled).
+1. Click **`+`** on the **AI Verify** counter (`[−] 0 [+]`) to increase the number of required verification rounds (0 = disabled). Works the same whether the project is on Human Gate or AI Gate.
 
 **Per-ticket override (task sidebar):**
 1. Open a ticket. The **Marcus Gate Mode** panel shows the current effective verify state.
-2. When the effective gate is AI, an **AI Verify rounds** counter appears. Use `[−]` and `[+]` to set a per-ticket round count. Click **↩** to reset and inherit from the project setting.
+2. The **AI Verify rounds** counter is always shown. Use `[−]` and `[+]` to set a per-ticket round count. Click **↩** to reset and inherit from the project setting.
 
 ---
 

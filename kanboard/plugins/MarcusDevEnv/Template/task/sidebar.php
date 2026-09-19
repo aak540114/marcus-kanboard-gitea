@@ -12,10 +12,11 @@
  *   Per-ticket Human Gate / AI Gate toggle.  Shows the project-level default
  *   and lets the human override it for this ticket only.
  *
- *   AI Verify counter: when the effective gate is AI, shows [−] N [+] to
- *   set how many LLM review rounds run before the branch auto-merges.
- *   The reset button (↩) clears the per-ticket override and inherits
- *   from the project setting.
+ *   AI Verify counter: always shown (applies under either gate), [−] N [+]
+ *   sets how many LLM review rounds must pass before the ticket proceeds —
+ *   auto-merging the branch under AI Gate, or moving to "waiting for
+ *   human" under Human Gate. The reset button (↩) clears the per-ticket
+ *   override and inherits from the project setting.
  *
  * Section 3 — "Dependencies" panel
  *   Shows which tickets this one depends on ("is blocked by") and which
@@ -135,7 +136,7 @@ $agentsUrl = $marcusUrl . '/api/active-agents';
     margin-top: 8px;
     padding-top: 6px;
     border-top: 1px solid rgba(0,0,0,.08);
-    display: none; /* shown only when effective gate is AI */
+    display: none; /* applies under either gate — always shown */
 }
 .m-verify-section.visible { display: block; }
 .m-verify-desc {
@@ -264,11 +265,13 @@ $agentsUrl = $marcusUrl . '/api/active-agents';
             Effective: <strong id="marcus-eff-gate">loading&hellip;</strong>
         </div>
 
-        <!-- AI Verify counter (only shown when effective gate is AI) -->
-        <div class="m-verify-section" id="marcus-verify-section">
+        <!-- AI Verify counter (applies under either gate) -->
+        <div class="m-verify-section visible" id="marcus-verify-section">
             <p class="m-verify-desc">
                 <strong>AI Verify rounds</strong>: how many independent LLM reviews
-                run before this ticket's branch is auto-merged.  0 = no verification.
+                this ticket must pass before it proceeds — auto-merging the
+                branch under AI Gate, or moving to "waiting for human" under
+                Human Gate.  0 = no verification.
             </p>
             <div class="m-verify-row">
                 <div class="m-verify-counter">
@@ -557,12 +560,8 @@ $agentsUrl = $marcusUrl . '/api/active-agents';
         var labels = { human: '👤 Human Gate', ai: '🤖 AI Gate' };
         effEl.textContent = labels[effective] || effective;
         effEl.style.color = effective === 'ai' ? '#7c3aed' : '#1d4ed8';
-        // Show AI Verify section only when effective gate is AI
-        if (effective === 'ai') {
-            verifySection.classList.add('visible');
-        } else {
-            verifySection.classList.remove('visible');
-        }
+        // AI Verify applies under both gates — always visible.
+        verifySection.classList.add('visible');
     }
 
     // ticketVerifyCount: null = inheriting; number = per-ticket override

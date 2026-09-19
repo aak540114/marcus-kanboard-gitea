@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from src.ai.verification.ai_verifier import VerificationResult
 from src.core.events import Events
 from src.core.models import TaskStatus
 from src.core.ticket_lifecycle import (
@@ -1106,6 +1107,114 @@ class TestReviewSignalOrdering:
         assert await workflow.set_waiting_for_human("62", "need input") is True
         rec = lifecycle.get("62", "kanboard")
         assert rec.state == TicketState.WAITING_FOR_HUMAN
+
+
+class TestHumanGateAIVerify:
+    """AI Verify also runs under Human Gate: signal_ready_for_review must
+    pass the configured number of verification rounds before the ticket
+    ever reaches "waiting for human" — same round-tracking loop as the
+    AI-gate path (_run_verify_gate), just followed by a hand-off to a
+    human instead of an auto-merge."""
+
+    def _in_progress_ticket(self, workflow, lifecycle, mock_kanban, mock_branch, tid):
+        lifecycle.get_or_create(tid, "kanboard")
+        lifecycle.transition(tid, "kanboard", TicketState.READY)
+        lifecycle.transition(tid, "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.set_assignee(tid, "kanboard", "alice")
+        lifecycle.claim_ticket(tid, "kanboard", workflow._agent_id)
+        # _run_verification_round needs a real (mocked) diff to reach the
+        # verifier at all — without this it fails open (passed=True)
+        # before ever calling _verifier.verify, defeating these tests.
+        mock_branch.get_branch_diff = AsyncMock(return_value="diff content")
+        mock_kanban.set_verify_round_tag = AsyncMock(return_value=True)
+        return lifecycle.get(tid, "kanboard")
+
+    @pytest.mark.asyncio
+    async def test_failed_round_keeps_ticket_out_of_waiting_for_human(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """A failed AI-Verify round under human gate must NOT let the
+        ticket reach a human — it goes back to the agent instead, exactly
+        like the AI-gate path does on a failed round."""
+        self._in_progress_ticket(workflow, lifecycle, mock_kanban, mock_branch, "70")
+        workflow._get_effective_verify_count = AsyncMock(return_value=1)
+        workflow._verifier = MagicMock()
+        workflow._verifier.verify = AsyncMock(
+            return_value=VerificationResult(passed=False, findings=["Missing test"])
+        )
+
+        result = await workflow.signal_ready_for_review("70")
+
+        assert result is False
+        rec = lifecycle.get("70", "kanboard")
+        assert rec.state == TicketState.IN_PROGRESS
+        mock_kanban.move_task_to_column.assert_called_with("70", "in progress")
+        workflow._verifier.verify.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_passing_round_then_reaches_waiting_for_human(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """Verification passes → the usual human-review hand-off proceeds."""
+        self._in_progress_ticket(workflow, lifecycle, mock_kanban, mock_branch, "71")
+        workflow._get_effective_verify_count = AsyncMock(return_value=1)
+        workflow._verifier = MagicMock()
+        workflow._verifier.verify = AsyncMock(
+            return_value=VerificationResult(passed=True, findings=[])
+        )
+
+        result = await workflow.signal_ready_for_review("71")
+
+        assert result is True
+        rec = lifecycle.get("71", "kanboard")
+        assert rec.state == TicketState.WAITING_FOR_HUMAN
+        mock_kanban.move_task_to_column.assert_called_with(
+            "71", "waiting for human"
+        )
+        workflow._verifier.verify.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_multi_round_all_must_pass_before_waiting_for_human(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """verify_count=2: the ticket must not reach a human until BOTH
+        rounds pass, across two separate signal_ready_for_review calls
+        (mirroring an agent fixing issues and resubmitting)."""
+        tid = "72"
+        self._in_progress_ticket(workflow, lifecycle, mock_kanban, mock_branch, tid)
+        workflow._get_effective_verify_count = AsyncMock(return_value=2)
+        workflow._verifier = MagicMock()
+        workflow._verifier.verify = AsyncMock(
+            return_value=VerificationResult(passed=True, findings=[])
+        )
+
+        # Round 1 of 2 passes but is not final -> still not shown to a human.
+        result1 = await workflow.signal_ready_for_review(tid)
+        assert result1 is False
+        assert lifecycle.get(tid, "kanboard").state == TicketState.IN_PROGRESS
+
+        # Round 2 of 2 passes and is final -> now reaches a human.
+        result2 = await workflow.signal_ready_for_review(tid)
+        assert result2 is True
+        assert lifecycle.get(tid, "kanboard").state == TicketState.WAITING_FOR_HUMAN
+        assert workflow._verifier.verify.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_verify_count_zero_skips_verification_entirely(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """Regression guard: with AI Verify disabled (the pre-existing
+        default), human gate behaves exactly as before — straight to
+        waiting for human, verifier never touched."""
+        self._in_progress_ticket(workflow, lifecycle, mock_kanban, mock_branch, "73")
+        workflow._verifier = MagicMock()
+        workflow._verifier.verify = AsyncMock()
+
+        result = await workflow.signal_ready_for_review("73")
+
+        assert result is True
+        assert lifecycle.get("73", "kanboard").state == TicketState.WAITING_FOR_HUMAN
+        workflow._verifier.verify.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
