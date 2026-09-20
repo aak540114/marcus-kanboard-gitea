@@ -464,7 +464,35 @@ class TestBuildEntrypoint:
         )
         assert "inotifywait" in cmd
         assert "APP_PID" in cmd
-        assert "kill $APP_PID" in cmd
+
+    def test_restart_loop_kills_the_whole_process_tree_not_just_app_pid(
+        self,
+    ) -> None:
+        """Regression: `served` backgrounds a SUBSHELL (`( start_cmd;
+        fallback )`), so `$!` is the subshell's PID, not start_cmd's own
+        process. A bare `kill $APP_PID` only signals that subshell —
+        without job control (the normal case for a detached `docker run
+        -d ... sh -c "..."` container), the real server process is left
+        running, orphaned, still bound to :3000. The next restart (or
+        every later one) then fails to bind — "port already in use",
+        eventually even for the static fallback. Verified end-to-end
+        against a real POSIX shell (dash) that `kill $APP_PID` alone
+        leaves the child process alive while `kill_tree $APP_PID` (walks
+        `pgrep -P` recursively before killing) correctly reaps it.
+
+        This asserts the restart loop calls `kill_tree`, a helper
+        defined earlier in the same script, instead of a bare `kill`."""
+        cmd = self._mgr()._build_entrypoint(
+            "ticket/k/3",
+            install_cmd="",
+            start_cmd="python -m http.server 3000",
+            use_hm_reload=False,
+        )
+        assert "kill $APP_PID" not in cmd
+        assert "kill_tree $APP_PID" in cmd
+        assert "kill_tree() {" in cmd
+        # The helper must be defined before the restart loop uses it.
+        assert cmd.index("kill_tree() {") < cmd.index("kill_tree $APP_PID")
 
     def test_php_uses_inotifywait_wrapper(self) -> None:
         """PHP stack wraps built-in server with inotifywait."""

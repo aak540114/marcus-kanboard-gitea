@@ -1402,6 +1402,36 @@ class DevEnvironmentManager:
         # starting.  The served command is backgrounded and its PID tracked
         # so a file change can restart it.
         #
+        # `served` is `( start_cmd; static_fallback )` — a SUBSHELL, so
+        # `$!` after backgrounding it is the subshell's own PID, not
+        # start_cmd's. Plain `kill $APP_PID` only signals that subshell:
+        # in the common case (no job control / no controlling TTY, which
+        # is exactly what a detached `docker run -d ... sh -c "..."`
+        # container has) the subshell does NOT get a new process group,
+        # so there is no safe "kill the whole group" shortcut either —
+        # `kill -- -$APP_PID` would hit the wrong group entirely (verified
+        # empirically: without job control the backgrounded subshell
+        # shares its PARENT's process group, not its own). The real
+        # server process is left running, orphaned, still bound to
+        # :3000 — the next restart (or the very next `served &`) then
+        # fails with "port already in use", and if that keeps happening
+        # the process count climbs until even the static fallback can't
+        # bind the port either.
+        #
+        # kill_tree walks and kills the whole process tree rooted at a
+        # PID (via `pgrep -P`, present in Alpine's stock busybox — same
+        # tool family already relied on elsewhere in this module), not
+        # just that one PID, so it reaches start_cmd's real process
+        # (and any of ITS children, e.g. a `mvn`/`bundle` launcher
+        # forking the actual server as a grandchild) regardless of how
+        # many shell/process layers sit between it and the subshell.
+        # Verified end-to-end against a real POSIX shell: after
+        # `kill_tree $APP_PID`, the previously-orphaned server process is
+        # actually gone, and — because the subshell itself is killed in
+        # the same call, before it can move on to its own next
+        # statement — the static fallback does NOT spuriously start
+        # serving in between restarts either.
+        #
         # The trailing `wait $APP_PID` is essential: it keeps the container's
         # PID 1 alive (and the port served) even when `inotifywait` is
         # missing or errors.  In that case the `while` condition fails on the
@@ -1409,14 +1439,21 @@ class DevEnvironmentManager:
         # wait the shell would fall off the end, PID 1 would exit, and the
         # `--rm` container would vanish from `docker ps` mid-serve — the very
         # failure this whole rework exists to eliminate.
+        kill_tree_fn = (
+            "kill_tree() { "
+            'for pid in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$pid"; done; '
+            'kill "$1" 2>/dev/null; '
+            "}"
+        )
         setup_part = "; ".join(steps)
         return (
+            f"{kill_tree_fn}; "
             f"{setup_part}; "
             f"{served} & APP_PID=$!; "
             f"while inotifywait -e modify,create,delete,move -r /app "
             f"--exclude '\\.git' --quiet 2>/dev/null; do "
             f"echo '[marcus] File changed — restarting...'; "
-            f"kill $APP_PID 2>/dev/null; wait $APP_PID 2>/dev/null; "
+            f"kill_tree $APP_PID; wait $APP_PID 2>/dev/null; "
             f"{served} & APP_PID=$!; "
             f"done; "
             f"wait $APP_PID"
