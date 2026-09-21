@@ -127,6 +127,21 @@ _APP_PORT = 3000
 #: fallback when a project's real dev command can't start.
 _STATIC_FALLBACK = f"httpd -f -p {_APP_PORT} -h /app"
 
+#: ``inotifywait --exclude`` pattern (POSIX extended regex, matched against
+#: each event's full path) for the restart loop in :meth:`_build_entrypoint`.
+#: Anything matching this is NOT a source-code change and must never trigger
+#: a restart — only ``.git`` was excluded before, so a running app's own
+#: routine writes into ``/app`` looked exactly like an edited file:
+#: a SQLite database's own ``-journal``/``-wal`` companion (written on every
+#: transaction — Django's own migrations are a textbook case, each
+#: statement writing to ``db.sqlite3-journal``), Python's ``__pycache__``
+#: bytecode cache (written on every import), and log files. Confirmed live:
+#: without this, a migration (or any startup step with more than one write)
+#: gets killed and restarted by its OWN previous write before it can ever
+#: finish — "[marcus] File changed — restarting..." on a tight loop, and the
+#: preview never comes up, no matter how long it's left running.
+_INOTIFY_EXCLUDE = r"\.git|\.sqlite3|__pycache__|\.pyc$|\.log$"
+
 # ---------------------------------------------------------------------------
 # Fallback stack table — used when no ProjectStack is supplied and
 # auto_detect=True sniffs well-known project files from the repo root.
@@ -1451,7 +1466,7 @@ class DevEnvironmentManager:
             f"{setup_part}; "
             f"{served} & APP_PID=$!; "
             f"while inotifywait -e modify,create,delete,move -r /app "
-            f"--exclude '\\.git' --quiet 2>/dev/null; do "
+            f"--exclude '{_INOTIFY_EXCLUDE}' --quiet 2>/dev/null; do "
             f"echo '[marcus] File changed — restarting...'; "
             f"kill_tree $APP_PID; wait $APP_PID 2>/dev/null; "
             f"{served} & APP_PID=$!; "

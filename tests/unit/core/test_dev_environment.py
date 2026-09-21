@@ -3,6 +3,7 @@ Unit tests for src/core/dev_environment.py
 """
 
 import asyncio
+import re
 import socket
 import subprocess
 from pathlib import Path
@@ -493,6 +494,57 @@ class TestBuildEntrypoint:
         assert "kill_tree() {" in cmd
         # The helper must be defined before the restart loop uses it.
         assert cmd.index("kill_tree() {") < cmd.index("kill_tree $APP_PID")
+
+    def test_restart_loop_excludes_runtime_writes_not_just_git(self) -> None:
+        """Regression: `inotifywait -r /app` used to exclude only `.git`,
+        so any file the RUNNING app itself writes into /app — a SQLite
+        database's own `-journal`/`-wal` companion (written on every
+        transaction; Django's migrations are a textbook case, each
+        statement writing to db.sqlite3-journal), Python's __pycache__
+        bytecode cache, log files — looked exactly like an edited source
+        file. For a startup step with more than one write (a
+        multi-statement migration), this becomes a self-sustaining
+        restart loop: the app's own previous write kills and restarts it
+        before the NEXT write can happen, forever — confirmed live
+        against a real inotifywait: with only `.git` excluded, a
+        migration writing to its own journal file six times in six
+        seconds was restarted 66 times and never once completed; with
+        this exclude pattern, the same migration completed cleanly with
+        zero restarts, while an edit to an actual source file still
+        triggered a restart as expected (hot reload unaffected)."""
+        cmd = self._mgr()._build_entrypoint(
+            "ticket/k/3",
+            install_cmd="",
+            start_cmd="python -m http.server 3000",
+            use_hm_reload=False,
+        )
+        assert "--exclude '\\.git'" not in cmd
+        exclude_match = re.search(r"--exclude '([^']+)'", cmd)
+        assert exclude_match is not None
+        exclude_pattern = exclude_match.group(1)
+        excluded_paths = [
+            "/app/db.sqlite3-journal",
+            "/app/db.sqlite3-wal",
+            "/app/.git/HEAD",
+            "/app/posts/__pycache__/models.cpython-311.pyc",
+            "/app/app.log",
+        ]
+        for path in excluded_paths:
+            assert re.search(exclude_pattern, path), (
+                f"{path!r} should be excluded (a runtime write, not a "
+                f"source change) by {exclude_pattern!r}"
+            )
+        source_paths = [
+            "/app/posts/models.py",
+            "/app/templates/index.html",
+            "/app/posts/migrations/0002_add_field.py",
+            "/app/requirements.txt",
+        ]
+        for path in source_paths:
+            assert not re.search(exclude_pattern, path), (
+                f"{path!r} is a real source file and must still trigger a "
+                f"restart — {exclude_pattern!r} wrongly excludes it"
+            )
 
     def test_php_uses_inotifywait_wrapper(self) -> None:
         """PHP stack wraps built-in server with inotifywait."""
