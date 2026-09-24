@@ -318,6 +318,39 @@ class TestVerificationRoundResultDrift:
         assert CommentParser.is_marcus_comment(body) is True
 
 
+class TestVerificationRoundResultBugsFoundHeading:
+    """A failed round's comment must clearly flag itself as AI-Verify's
+    own bug report — both for a human skimming the ticket and for the
+    next worker agent, which is told (see _worker_instructions and
+    get_work_context's instructions in human_gated_workflow.py) to scan
+    recent_comments for this exact phrase and treat its findings as
+    required fixes."""
+
+    def test_failed_round_heading_says_bugs_found_by_ai_verify(self):
+        result = SimpleNamespace(passed=False, findings=["Missing null check"])
+        body = CommentFormatter.verification_round_result("T-30", 1, 2, result)
+        assert "Bugs Found by AI Verify" in body
+        assert "Round 1 of 2" in body
+
+    def test_bugs_found_heading_still_starts_with_marcus_ai(self):
+        """Regression guard: comments are recognised as Marcus's own
+        ONLY by a strict visible-heading regex requiring the line to
+        start with '### Marcus Agent' or '### Marcus AI' (see
+        _TITLE_RE, src/core/comment_protocol.py) — there is no hidden
+        metadata fallback (_header() is a documented no-op). A heading
+        that leads with the "Bugs Found" phrasing instead of "Marcus
+        AI"/"Marcus Agent" would make Marcus fail to recognise its own
+        AI-Verify comment, with the same failure mode described on
+        test_every_formatter_output_is_recognised_as_marcus_own: Marcus
+        treats its own comment as human input and drags the card back
+        out of the column it just moved it to."""
+        from src.core.comment_protocol import CommentParser
+
+        result = SimpleNamespace(passed=False, findings=["Missing null check"])
+        body = CommentFormatter.verification_round_result("T-31", 1, 2, result)
+        assert CommentParser.is_marcus_comment(body) is True
+
+
 class TestCommentParser:
     """Tests for CommentParser class methods."""
 

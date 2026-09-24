@@ -2650,6 +2650,24 @@ class TestGetWorkContextEnrichedFields:
         assert "🏗️ Note:" in ctx["instructions"]
         assert "post_ticket_progress" in ctx["instructions"]
 
+    @pytest.mark.asyncio
+    async def test_instructions_tell_the_agent_to_check_ai_verify_findings(
+        self, workflow, lifecycle, mock_kanban
+    ):
+        """A worker re-picking up a ticket after a failed AI-Verify round
+        already sees the failure comment via recent_comments (get_work_context
+        returns the last 10) — but nothing told the agent to actually look
+        there and treat those findings as required fixes, so an LLM agent
+        given only the generic instructions could easily miss them and
+        just re-implement blind. The instructions must point the agent at
+        the exact heading (CommentFormatter.verification_round_result,
+        src/core/comment_protocol.py) AI Verify uses."""
+        lifecycle.get_or_create("67", "kanboard")
+        mock_kanban.get_task_by_id = AsyncMock(return_value=_make_task_mock())
+        ctx = await workflow.get_work_context("67")
+        assert "recent_comments" in ctx["instructions"]
+        assert "Bugs Found by AI Verify" in ctx["instructions"]
+
 
 # ---------------------------------------------------------------------------
 # get_work_context: surfaces the CURRENT project Tech Stack, and instructs
@@ -2792,6 +2810,18 @@ class TestWorkerInstructionsTechStackReconciliation:
         all, so the Decisions Log stayed permanently empty."""
         text = workflow._worker_instructions()
         assert "🏗️ Note:" in text
+
+    def test_tells_the_worker_to_check_ai_verify_findings(self, workflow):
+        """orchestrate mode's per-turn instructions must point the agent
+        at recent_comments for a prior '🐛 Bugs Found by AI Verify'
+        comment (CommentFormatter.verification_round_result,
+        src/core/comment_protocol.py) — the data is already returned in
+        context.recent_comments, but nothing told the agent to look
+        there or that those findings are required fixes rather than
+        optional feedback."""
+        text = workflow._worker_instructions()
+        assert "recent_comments" in text
+        assert "Bugs Found by AI Verify" in text
 
 
 # ---------------------------------------------------------------------------

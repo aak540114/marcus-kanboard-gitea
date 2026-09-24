@@ -786,7 +786,7 @@ class CommentFormatter:
                 )
             body = (
                 f"{cls._header(comment_type, ticket_id)}\n"
-                f"### Marcus AI Verifier — {round_label}: Issues Found\n\n"
+                f"### Marcus AI — 🐛 Bugs Found by AI Verify ({round_label})\n\n"
                 f"The AI code reviewer checked the branch and found problems:\n\n"
                 f"{items}"
                 f"{drift_section}"

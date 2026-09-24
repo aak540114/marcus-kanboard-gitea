@@ -292,7 +292,7 @@ class TestVerifyCountThree:
         assert workflow._ticket_verify_rounds["42"] == 1
 
         comment_body = workflow._kanban.add_comment.call_args[0][1]
-        assert "Round 1 of 3: Issues Found" in comment_body
+        assert "Bugs Found by AI Verify (Round 1 of 3)" in comment_body
         assert "round 2 of 3" in comment_body.lower()
 
         workflow._kanban.add_comment.reset_mock()
@@ -338,7 +338,7 @@ class TestVerifyCountThree:
         assert workflow._ticket_verify_rounds["42"] == 2
 
         comment_body = workflow._kanban.add_comment.call_args[0][1]
-        assert "Round 2 of 2: Issues Found" in comment_body
+        assert "Bugs Found by AI Verify (Round 2 of 2)" in comment_body
         assert "final verification round" in comment_body.lower()
 
         workflow._kanban.add_comment.reset_mock()
