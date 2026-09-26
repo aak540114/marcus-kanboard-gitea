@@ -2407,6 +2407,32 @@ class HumanGatedWorkflow:
         labels = getattr(task, "labels", None) or []
         return _AUDIT_TAG in labels
 
+    async def has_open_audit_ticket(self, project_id: int) -> bool:
+        """True if *project_id* has a codebase-audit ticket still in flight.
+
+        Backs the board header's "Audit" button: only one audit may run
+        per project at a time (decision: disable the button while one is
+        open, re-enable once it reaches ``DONE``). A parent audit ticket
+        with findings stays parked ``BLOCKED`` — not ``DONE`` — until its
+        spun-off child tickets all finish (the same parent-auto-complete
+        machinery ``decompose_ticket`` already uses), so ``BLOCKED``
+        counts as still in flight here.
+        """
+        try:
+            tasks = await self._kanban.get_all_tasks()
+        except Exception:  # noqa: BLE001
+            return False
+        pid = str(project_id)
+        for task in tasks:
+            if str(getattr(task, "project_id", None)) != pid:
+                continue
+            labels = getattr(task, "labels", None) or []
+            if _AUDIT_TAG not in labels:
+                continue
+            if task.status != TaskStatus.DONE:
+                return True
+        return False
+
     async def _complete_audit_ticket(
         self, ticket_id: str, record: TicketRecord
     ) -> bool:

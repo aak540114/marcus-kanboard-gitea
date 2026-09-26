@@ -7876,6 +7876,142 @@ setInterval(refresh, 30000);
                 )
             )
 
+        async def audit_project_api(request: Request) -> JSONResponse:
+            """POST /api/audit-project — create a codebase-audit ticket.
+
+            Body (JSON): ``{"project_id": int, "requested_by": str|int|None}``
+            ``requested_by`` is the Kanboard user id of whoever clicked the
+            board header's "Audit" button — the created ticket is
+            auto-assigned to them (the MarcusDevEnv template embeds this
+            via ``$this->user->getId()``). See
+            :meth:`~src.workflows.human_gated_workflow.HumanGatedWorkflow.
+            create_audit_ticket` for what the created ticket contains and
+            how it's special-cased through the normal ticket workflow.
+
+            Returns ``{"ticket_id": str}`` on success. ``409`` if a
+            codebase-audit ticket for this project is already open (the
+            button should already be disabled client-side via
+            ``/api/audit-status`` — this is a defensive re-check against a
+            stale button state, e.g. two browser tabs). ``503`` if the
+            human-gated workflow isn't wired up.
+            """
+            def _cors(r: JSONResponse) -> JSONResponse:
+                r.headers["Access-Control-Allow-Origin"] = "*"
+                r.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+                return r
+
+            if request.method == "OPTIONS":
+                return _cors(JSONResponse({}))
+
+            try:
+                body = await request.json()
+            except Exception:
+                return _cors(
+                    JSONResponse({"error": "invalid JSON"}, status_code=400)
+                )
+            if not isinstance(body, dict):
+                return _cors(
+                    JSONResponse({"error": "JSON object required"}, status_code=400)
+                )
+
+            pid_raw = body.get("project_id")
+            if not isinstance(pid_raw, int) or isinstance(pid_raw, bool):
+                return _cors(
+                    JSONResponse(
+                        {"error": "project_id (int) is required"}, status_code=400
+                    )
+                )
+            requested_by_raw = body.get("requested_by")
+            requested_by = (
+                str(requested_by_raw) if requested_by_raw not in (None, "") else None
+            )
+
+            wf = getattr(server, "_human_gated_workflow", None)
+            if wf is None:
+                return _cors(
+                    JSONResponse(
+                        {
+                            "error": "Codebase-audit feature is not available "
+                            "(the human-gated workflow is not configured)"
+                        },
+                        status_code=503,
+                    )
+                )
+
+            try:
+                if await wf.has_open_audit_ticket(pid_raw):
+                    return _cors(
+                        JSONResponse(
+                            {
+                                "error": "A codebase-audit ticket for this "
+                                "project is already open"
+                            },
+                            status_code=409,
+                        )
+                    )
+                ticket_id = await wf.create_audit_ticket(
+                    pid_raw, requested_by=requested_by
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "create_audit_ticket(project_id=%d) failed: %s", pid_raw, exc
+                )
+                return _cors(
+                    JSONResponse({"error": str(exc)}, status_code=500)
+                )
+            if ticket_id is None:
+                return _cors(
+                    JSONResponse(
+                        {"error": "Could not create the audit ticket"},
+                        status_code=500,
+                    )
+                )
+            return _cors(JSONResponse({"ticket_id": ticket_id}))
+
+        async def audit_status_api(request: Request) -> JSONResponse:
+            """GET /api/audit-status?project_id=<id> — is an audit open?
+
+            Returns ``{"project_id": int, "has_open_audit": bool}``. The
+            board header polls this to disable the "Audit" button while a
+            codebase-audit ticket for the project is still in flight, and
+            re-enable it once that ticket reaches ``DONE`` (see
+            :meth:`~src.workflows.human_gated_workflow.HumanGatedWorkflow.
+            has_open_audit_ticket`).
+            """
+            def _cors(r: JSONResponse) -> JSONResponse:
+                r.headers["Access-Control-Allow-Origin"] = "*"
+                r.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+                return r
+
+            pid_str = request.query_params.get("project_id", "").strip()
+            if not pid_str:
+                return _cors(
+                    JSONResponse(
+                        {"error": "project_id query parameter is required"},
+                        status_code=400,
+                    )
+                )
+            try:
+                pid = int(pid_str)
+            except ValueError:
+                return _cors(
+                    JSONResponse(
+                        {"error": "project_id must be a numeric Kanboard id"},
+                        status_code=400,
+                    )
+                )
+
+            wf = getattr(server, "_human_gated_workflow", None)
+            has_open_audit = False
+            if wf is not None:
+                try:
+                    has_open_audit = await wf.has_open_audit_ticket(pid)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("audit_status lookup failed: %s", exc)
+            return _cors(
+                JSONResponse({"project_id": pid, "has_open_audit": has_open_audit})
+            )
+
         async def events_stream(request: Request) -> StreamingResponse:
             """Server-Sent Events stream that pushes a "refresh" the instant
             Marcus changes anything (a comment posted, a card moved, a state
@@ -8058,6 +8194,16 @@ setInterval(refresh, 30000);
                 Route(
                     "/api/clone-project-status",
                     clone_project_status_api,
+                    methods=["GET"],
+                ),
+                Route(
+                    "/api/audit-project",
+                    audit_project_api,
+                    methods=["POST", "OPTIONS"],
+                ),
+                Route(
+                    "/api/audit-status",
+                    audit_status_api,
                     methods=["GET"],
                 ),
                 Route("/api/events/stream", events_stream, methods=["GET"]),

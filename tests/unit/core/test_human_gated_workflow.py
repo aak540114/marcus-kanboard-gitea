@@ -1359,6 +1359,80 @@ class TestIsAuditTicket:
         assert await workflow._is_audit_ticket("1") is False
 
 
+def _make_audit_task(project_id=9, status=TaskStatus.IN_PROGRESS, labels=None):
+    """Build a minimal Task-like mock for has_open_audit_ticket's scan
+    over get_all_tasks() — project_id and status are the two fields it
+    filters on, labels carries (or omits) the marcus-audit tag."""
+    task = MagicMock()
+    task.project_id = project_id
+    task.status = status
+    task.labels = labels if labels is not None else ["marcus-audit"]
+    return task
+
+
+class TestHasOpenAuditTicket:
+    """Backs the board header's Audit-button enable/disable polling: only
+    one audit ticket may be open per project at a time."""
+
+    @pytest.mark.asyncio
+    async def test_true_when_an_audit_ticket_is_in_progress(
+        self, workflow, mock_kanban
+    ):
+        mock_kanban.get_all_tasks = AsyncMock(
+            return_value=[_make_audit_task(project_id=9, status=TaskStatus.IN_PROGRESS)]
+        )
+        assert await workflow.has_open_audit_ticket(9) is True
+
+    @pytest.mark.asyncio
+    async def test_true_when_an_audit_ticket_is_blocked(self, workflow, mock_kanban):
+        """A parent audit ticket with findings parks BLOCKED (not DONE)
+        while its spun-off child tickets are worked on — still counts as
+        open."""
+        mock_kanban.get_all_tasks = AsyncMock(
+            return_value=[_make_audit_task(project_id=9, status=TaskStatus.BLOCKED)]
+        )
+        assert await workflow.has_open_audit_ticket(9) is True
+
+    @pytest.mark.asyncio
+    async def test_false_when_the_audit_ticket_is_done(self, workflow, mock_kanban):
+        mock_kanban.get_all_tasks = AsyncMock(
+            return_value=[_make_audit_task(project_id=9, status=TaskStatus.DONE)]
+        )
+        assert await workflow.has_open_audit_ticket(9) is False
+
+    @pytest.mark.asyncio
+    async def test_false_when_no_tasks_are_tagged_as_audit(self, workflow, mock_kanban):
+        mock_kanban.get_all_tasks = AsyncMock(
+            return_value=[
+                _make_audit_task(
+                    project_id=9, status=TaskStatus.IN_PROGRESS, labels=["bug"]
+                )
+            ]
+        )
+        assert await workflow.has_open_audit_ticket(9) is False
+
+    @pytest.mark.asyncio
+    async def test_false_when_the_open_audit_ticket_is_in_a_different_project(
+        self, workflow, mock_kanban
+    ):
+        mock_kanban.get_all_tasks = AsyncMock(
+            return_value=[
+                _make_audit_task(project_id=42, status=TaskStatus.IN_PROGRESS)
+            ]
+        )
+        assert await workflow.has_open_audit_ticket(9) is False
+
+    @pytest.mark.asyncio
+    async def test_false_on_no_tasks(self, workflow, mock_kanban):
+        mock_kanban.get_all_tasks = AsyncMock(return_value=[])
+        assert await workflow.has_open_audit_ticket(9) is False
+
+    @pytest.mark.asyncio
+    async def test_false_on_kanban_error(self, workflow, mock_kanban):
+        mock_kanban.get_all_tasks = AsyncMock(side_effect=RuntimeError("down"))
+        assert await workflow.has_open_audit_ticket(9) is False
+
+
 class TestCompleteAuditTicket:
     """signal_ready_for_review's audit-completion path: findings become
     child tickets, and the completion comment reports what merged into

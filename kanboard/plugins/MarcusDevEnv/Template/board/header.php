@@ -31,6 +31,12 @@
  *             every push to its own branch. Counts against the same Max
  *             dev environments limit above (Section 5) — no separate
  *             reservation.
+ * Section 7 — "Audit" button. Creates a codebase-audit ticket (see
+ *             HumanGatedWorkflow.create_audit_ticket) that goes through the
+ *             normal Ready -> pickup -> AI Verify workflow, auto-assigned to
+ *             whoever clicked the button. Disabled while a project already
+ *             has one open (polls /api/audit-status), re-enabled once it
+ *             reaches Done.
  *
  * The gate and verify_count settings persist via Marcus /api/gate-setting/project.
  * Default gate is "human"; default verify_count is 0.
@@ -81,6 +87,8 @@ $devEnvMainLogsUrl = $marcusUrl . '/dev-env/logs'
                   . ($marcusToken !== '' ? '&token=' . urlencode($marcusToken) : '');
 $cloneProjectUrl       = $marcusUrl . '/api/clone-project';
 $cloneProjectStatusUrl = $marcusUrl . '/api/clone-project-status';
+$auditProjectUrl       = $marcusUrl . '/api/audit-project';
+$auditStatusUrl        = $marcusUrl . '/api/audit-status?project_id=' . urlencode((string) $projectId);
 ?>
 <style>
 /* ── Active agents badge ──────────────────────────────────────────────── */
@@ -480,6 +488,16 @@ $cloneProjectStatusUrl = $marcusUrl . '/api/clone-project-status';
         <span id="marcus-clone-status" style="font-size:11px;color:#6b7280;"></span>
     </span>
 
+    <!-- Codebase audit -->
+    <span style="display:inline-flex;align-items:center;gap:6px;">
+        <button id="marcus-audit-btn" class="marcus-main-preview-btn start"
+                onclick="startCodebaseAudit()"
+                title="Create a ticket that systematically reviews main for bugs, verifies each finding, and logs it for review — only one may be open per project at a time">
+            &#128269; Audit
+        </button>
+        <span id="marcus-audit-status" style="font-size:11px;color:#6b7280;"></span>
+    </span>
+
 </div>
 
 <script>
@@ -498,7 +516,10 @@ $cloneProjectStatusUrl = $marcusUrl . '/api/clone-project-status';
     var DEV_ENV_MAIN_LOGS_URL   = <?= json_encode($devEnvMainLogsUrl) ?>;
     var CLONE_PROJECT_URL        = <?= json_encode($cloneProjectUrl) ?>;
     var CLONE_PROJECT_STATUS_URL = <?= json_encode($cloneProjectStatusUrl) ?>;
+    var AUDIT_PROJECT_URL = <?= json_encode($auditProjectUrl) ?>;
+    var AUDIT_STATUS_URL  = <?= json_encode($auditStatusUrl) ?>;
     var PROJECT_ID       = <?= json_encode((int) $projectId) ?>;
+    var CURRENT_USER_ID  = <?= json_encode((int) $this->user->getId()) ?>;
     var MARCUS_TOKEN     = <?= json_encode($marcusToken) ?>;
     var INTERVAL         = 15000;
 
@@ -1150,6 +1171,64 @@ $cloneProjectStatusUrl = $marcusUrl . '/api/clone-project-status';
                 })
                 .catch(function () {
                     statusEl.textContent = 'Could not reach Marcus to start the clone.';
+                });
+        };
+    })();
+
+    /* ── Codebase audit ────────────────────────────────────────────────
+       Creates a ticket that systematically reviews `main` for bugs, with
+       each finding independently re-verified before it's reported (see
+       HumanGatedWorkflow.create_audit_ticket). Only one audit ticket may
+       be open per project at a time, so the button polls
+       /api/audit-status and disables itself while one is in flight —
+       re-enabling once that ticket reaches Done. */
+    (function () {
+        var btn = document.getElementById('marcus-audit-btn');
+        var statusEl = document.getElementById('marcus-audit-status');
+        if (!PROJECT_ID || !btn || !statusEl) { return; }
+
+        function refreshAuditButtonState() {
+            fetch(AUDIT_STATUS_URL, { cache: 'no-store', headers: marcusHeaders() })
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    if (data.has_open_audit) {
+                        btn.disabled = true;
+                        statusEl.textContent = 'Audit already in progress…';
+                    } else {
+                        btn.disabled = false;
+                        statusEl.textContent = '';
+                    }
+                })
+                .catch(function () { /* leave the button as-is on a transient error */ });
+        }
+
+        refreshAuditButtonState();
+        setInterval(refreshAuditButtonState, INTERVAL);
+
+        window.startCodebaseAudit = function () {
+            btn.disabled = true;
+            statusEl.textContent = 'Creating audit ticket…';
+            fetch(AUDIT_PROJECT_URL, {
+                method: 'POST',
+                headers: marcusHeaders({ 'Content-Type': 'application/json' }),
+                body: JSON.stringify({
+                    project_id: PROJECT_ID,
+                    requested_by: CURRENT_USER_ID || null,
+                }),
+            })
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    if (!data.ticket_id) {
+                        statusEl.textContent = 'Could not start audit: ' + mEsc(data.error || 'unknown error');
+                        refreshAuditButtonState();
+                        return;
+                    }
+                    statusEl.textContent = 'Audit ticket #' + mEsc(data.ticket_id) + ' created.';
+                    refreshAuditButtonState();
+                })
+                .catch(function () {
+                    statusEl.textContent = 'Could not reach Marcus to start the audit.';
+                    refreshAuditButtonState();
                 });
         };
     })();
