@@ -60,6 +60,7 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 
 from src.ai.verification.ai_verifier import AIVerifier, VerificationResult
 from src.core.acceptance_criteria import ACChangeDetector, ACGenerator, ACParser
+from src.core.audit_findings import AuditFinding, extract_findings_from_comment
 from src.core.board_watcher import BoardWatcher
 from src.core.comment_protocol import CommentFormatter, CommentParser
 from src.core.decision_notes import extract_notes_from_comment
@@ -153,6 +154,102 @@ _MAX_TESTING_INSTRUCTIONS_CHARS = 3_000
 #: one-off blip without adding meaningful latency to a completion signal.
 _COLUMN_MOVE_MAX_ATTEMPTS = 3
 _COLUMN_MOVE_RETRY_DELAY_SECONDS = 1.0
+
+#: Kanboard tag marking a Marcus-created codebase-audit ticket. Read back
+#: via task.labels wherever "is this ticket an audit?" needs checking
+#: (signal_ready_for_review's completion hook, the board-header's "is one
+#: already open" poll). A tag rather than a description-embedded marker
+#: (like sub-tickets' "Sub-ticket of #N") because it needs to be visible
+#: and queryable independent of the ticket's actual AC/description
+#: content, and shows as a colored board badge for free.
+_AUDIT_TAG = "marcus-audit"
+
+#: Fixed acceptance criteria embedded into a new audit ticket's description
+#: at creation time (see create_audit_ticket) — deliberately NOT run
+#: through ACGenerator, which is tuned for "build this feature", not
+#: "audit for bugs, and it's fine to find none". Embedding a real,
+#: ACParser-parseable AC block up front also makes _on_ticket_new's own
+#: AC-generation skip automatically (it only generates when
+#: ACParser.extract(description) finds nothing).
+_AUDIT_AC_MARKDOWN = (
+    "- [ ] Every reported finding includes a verified reproduction (a "
+    "failing test, or exact step-by-step manual repro instructions)\n"
+    "- [ ] No finding is reported without being independently confirmed "
+    "as real first — a suspicion is not a finding\n"
+    "- [ ] Finding zero issues is an acceptable, correctly-reported "
+    "outcome\n"
+    "- [ ] Any silent implementation decisions made while investigating "
+    "are logged via the existing 🏗️ Note convention"
+)
+
+#: Fixed acceptance criteria given to each per-finding child ticket
+#: created by _complete_audit_ticket — generic on purpose (the finding's
+#: own description already states the specific bug/repro/fix), so every
+#: spun-off fix ticket is held to the same bar regardless of what kind of
+#: bug it is.
+_AUDIT_FIX_AC_MARKDOWN = (
+    "- [ ] The proposed fix described above is implemented\n"
+    "- [ ] The reproduction steps described above no longer reproduce "
+    "the bug\n"
+    "- [ ] A regression test is added covering this case"
+)
+
+
+def _audit_time_budget_hours() -> float:
+    """Hours a new audit ticket's instructions ask the agent to budget.
+
+    Advisory only — Marcus has no way to force an LLM agent to literally
+    spend N wall-clock hours; this is a instruction in the ticket, not a
+    mechanically enforced cutoff. Configurable via
+    ``AUDIT_TIME_BUDGET_HOURS`` (default 2), matching the
+    try/except-ValueError-falls-back-to-default pattern used for every
+    other env-configurable interval in this codebase (e.g.
+    ``PROJECT_POLL_INTERVAL``).
+    """
+    try:
+        return float(os.environ.get("AUDIT_TIME_BUDGET_HOURS", "2"))
+    except ValueError:
+        return 2.0
+
+
+def _audit_instructions(time_budget_hours: float) -> str:
+    """Fixed instructions embedded into a new audit ticket's description."""
+    return (
+        "This is a Marcus-initiated **codebase audit** — not a "
+        "human-authored feature request. Systematically review the "
+        "current state of `main` for real bugs, design issues, and gaps. "
+        "Do not invent problems that aren't there.\n\n"
+        "## Scope and approach\n"
+        "- Review systematically (e.g. module by module, or "
+        "prioritizing recently-changed/high-risk areas) rather than "
+        "randomly sampling files.\n"
+        f"- Budget: keep reviewing for up to {time_budget_hours:g} hours "
+        "of active work. Stop earlier if you are genuinely confident "
+        "there is nothing more to find — do not pad the audit with "
+        "low-value findings just to fill the time.\n"
+        "- Finding zero issues is a completely acceptable outcome. Say "
+        "so plainly if that's the case rather than fabricating a "
+        "finding to avoid reporting \"nothing found.\"\n\n"
+        "## Rules for every finding\n"
+        "- Do NOT report a suspicion as a finding. Before logging "
+        "anything as a confirmed bug, independently VERIFY it is real: "
+        "write a FAILING test that reproduces it (preferred), or give a "
+        "concrete, step-by-step manual reproduction a human can "
+        "literally follow to see it happen.\n"
+        "- For every verified finding, call post_ticket_progress with a "
+        "comment starting with '### 🔍 Audit Finding: <short title>', "
+        "then in plain language a human can review without deep "
+        "codebase context: **Bug:** what's wrong and why; **How to "
+        "reproduce:** the exact steps (or the failing test) from above; "
+        "**Proposed fix:** what you'd change and why that fixes it.\n"
+        "- Any silent implementation decisions you make while "
+        "investigating still get flagged the normal way: a "
+        "post_ticket_progress report line starting with '🏗️ Note:'.\n"
+        "- Do NOT patch the code yourself on this ticket's branch. "
+        "Marcus creates one focused, separate ticket per verified "
+        "finding once you call signal_ready_for_review — each fix gets "
+        "its own independent review, not one giant bundled diff.\n"
+    )
 
 
 def _safe_usage_scalar(value: Any, max_len: int = _USAGE_SCALAR_MAX) -> Any:
@@ -1860,24 +1957,65 @@ class HumanGatedWorkflow:
             )
             return []
 
-        # Sub-tickets ALWAYS start in Ready, whatever column the parent sat
-        # in. A column reflects who is working a card, not where it belongs
-        # in the plan: a freshly created child has not been claimed by any
-        # agent, so putting it in In Progress just because its parent was
-        # there would advertise work nobody is doing. Ready is exactly the
-        # "assigned and available to claim" state, which is what these are.
-        child_column = "ready"
-
         subs = await self._llm_decompose(
             title, description, record.acceptance_criteria
         )
         if not subs:
             return []
 
-        # Re-verify once more, right before any write happens. The pre-call
-        # gate above only catches a call that was already pointless — it
-        # cannot see a disable that happens WHILE the LLM call is in
-        # flight. Without this, a project disabled during that call would
+        return await self._create_child_tickets(
+            ticket_id, record, parent_project_id, parent_color, subs
+        )
+
+    async def _create_child_tickets(
+        self,
+        ticket_id: str,
+        record: TicketRecord,
+        parent_project_id: Optional[int],
+        parent_color: Optional[str],
+        subs: List[Dict[str, Any]],
+    ) -> List[str]:
+        """Create linked child tickets from an explicit list of specs.
+
+        The actual "create + link + inherit status/owner + park the parent
+        in Blocked" mechanics extracted out of :meth:`decompose_ticket`, so
+        a caller that already has its own list of child-ticket specs (not
+        derived from an LLM splitting the parent's acceptance criteria) can
+        reuse the exact same, already-hardened write path. Each ``subs``
+        entry is a dict shaped like ``_llm_decompose``'s own output:
+        ``{"title": str, "description": str, "acceptance_criteria":
+        Optional[str]}``.
+
+        Parameters
+        ----------
+        ticket_id : str
+            Parent ticket identifier.
+        record : TicketRecord
+            Parent's current lifecycle record (for its owner).
+        parent_project_id : Optional[int]
+            Kanboard project id the children must land on (``None`` skips
+            the project-scoped gate re-checks below, matching
+            :meth:`decompose_ticket`'s own behavior when it couldn't
+            resolve the parent's project).
+        parent_color : Optional[str]
+            Card color to inherit, if known.
+        subs : List[Dict[str, Any]]
+            Child-ticket specs to create.
+
+        Returns
+        -------
+        List[str]
+            The created child ticket ids (empty if none were created).
+        """
+        create = getattr(self._kanban, "create_task", None)
+        if create is None:
+            return []
+
+        # Re-verify once more, right before any write happens. A caller's
+        # own pre-call gate check (e.g. decompose_ticket's, before its LLM
+        # call) only catches a call that was already pointless — it
+        # cannot see a disable that happened WHILE that call was in
+        # flight. Without this, a project disabled in the meantime would
         # still get child tickets created, assigned, linked, and its
         # parent parked as BLOCKED, regardless of whether those children
         # ever reach an agent (orchestrate_work re-filters them before
@@ -1887,8 +2025,8 @@ class HumanGatedWorkflow:
             parent_project_id
         ):
             logger.debug(
-                "Refusing to write sub-tickets for %s: Kanboard project %d "
-                "was disabled during decomposition",
+                "Refusing to write child tickets for %s: Kanboard project "
+                "%d was disabled before the write",
                 ticket_id,
                 parent_project_id,
             )
@@ -1898,12 +2036,20 @@ class HumanGatedWorkflow:
             and not self._gate.get_effective_decompose_enabled(parent_project_id)
         ):
             logger.debug(
-                "Refusing to write sub-tickets for %s: decomposition was "
-                "disabled for Kanboard project %d during decomposition",
+                "Refusing to write child tickets for %s: decomposition was "
+                "disabled for Kanboard project %d before the write",
                 ticket_id,
                 parent_project_id,
             )
             return []
+
+        # Children ALWAYS start in Ready, whatever column the parent sat
+        # in. A column reflects who is working a card, not where it belongs
+        # in the plan: a freshly created child has not been claimed by any
+        # agent, so putting it in In Progress just because its parent was
+        # there would advertise work nobody is doing. Ready is exactly the
+        # "assigned and available to claim" state, which is what these are.
+        child_column = "ready"
 
         link = getattr(self._kanban, "create_task_link", None)
         create_subtask = getattr(self._kanban, "create_subtask", None)
@@ -2114,6 +2260,314 @@ class HumanGatedWorkflow:
                     ticket_id,
                 )
         return child_ids
+
+    async def create_audit_ticket(
+        self, project_id: int, requested_by: Optional[str] = None
+    ) -> Optional[str]:
+        """Create a Marcus-initiated codebase-audit ticket.
+
+        Instructs a worker agent to systematically review ``main`` for
+        bugs, independently verify each finding before reporting it
+        (never fabricate one), and log silent decisions via the existing
+        🏗️ Note convention. Goes through the normal Ready → pickup →
+        ``signal_ready_for_review`` flow like any other ticket — the only
+        special-casing is: AC generation is skipped (this ticket embeds
+        its own fixed AC up front, which makes ``_on_ticket_new``'s own
+        generation check a no-op), AI Verify is forced on (>= 1 round) so
+        a claimed finding isn't just the same agent's own say-so, and
+        ``signal_ready_for_review`` spins each verified finding off into
+        its own child ticket instead of merging one bundled fix branch
+        (see :meth:`_complete_audit_ticket`).
+
+        Parameters
+        ----------
+        project_id : int
+            Kanboard project to create the ticket in.
+        requested_by : Optional[str]
+            Kanboard user id (or username) of whoever clicked the Audit
+            button — the created ticket is auto-assigned to them.
+            ``None`` leaves it unassigned.
+
+        Returns
+        -------
+        Optional[str]
+            The created ticket's id, or ``None`` if Kanboard rejected the
+            create (no ``create_task`` support, or an RPC failure).
+        """
+        create = getattr(self._kanban, "create_task", None)
+        if create is None:
+            return None
+
+        description = ACParser.embed(
+            _audit_instructions(_audit_time_budget_hours()), _AUDIT_AC_MARKDOWN
+        )
+        try:
+            task = await create(
+                {
+                    "name": "🔍 Codebase Audit",
+                    "description": description,
+                    "project_id": project_id,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not create audit ticket: %s", exc)
+            return None
+        ticket_id = str(getattr(task, "id", "") or "")
+        if not ticket_id:
+            return None
+
+        set_tags = getattr(self._kanban, "set_task_tags", None)
+        if set_tags is not None:
+            try:
+                await set_tags(ticket_id, project_id=project_id, tags=[_AUDIT_TAG])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Could not tag audit ticket %s as an audit: %s", ticket_id, exc
+                )
+
+        record = self._lifecycle.get_or_create(
+            ticket_id, self._provider, acceptance_criteria=_AUDIT_AC_MARKDOWN
+        )
+        # Same race as decompose_ticket's children (see its own comment):
+        # create() above already made this ticket visible on the board via
+        # at least one RPC round trip before this line runs, so a
+        # concurrent BoardWatcher poll can see it and fire ticket.new
+        # first — _on_ticket_new's own get_or_create (no AC) would then
+        # win the race, silently dropping the fixed AC this whole feature
+        # depends on (both for skipping ACGenerator and for _is_audit_ticket
+        # having something real to check later). Patch it in if that
+        # happened.
+        if not (record.acceptance_criteria or "").strip():
+            self._lifecycle.update_acceptance_criteria(
+                ticket_id,
+                self._provider,
+                _AUDIT_AC_MARKDOWN,
+                ACChangeDetector.hash_ac(_AUDIT_AC_MARKDOWN),
+            )
+
+        if requested_by:
+            try:
+                self._lifecycle.set_assignee(ticket_id, self._provider, requested_by)
+            except KeyError:
+                pass
+            assign = getattr(self._kanban, "assign_task", None)
+            if assign is not None:
+                try:
+                    if not await assign(ticket_id, requested_by):
+                        logger.warning(
+                            "Could not assign audit ticket %s to %r on the board",
+                            ticket_id,
+                            requested_by,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Could not assign audit ticket %s to %r: %s",
+                        ticket_id,
+                        requested_by,
+                        exc,
+                    )
+
+        try:
+            await self._kanban.move_task_to_column(ticket_id, "ready")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not move audit ticket %s to ready: %s", ticket_id, exc
+            )
+        try:
+            self._lifecycle.human_transition(
+                ticket_id,
+                self._provider,
+                TicketState.READY,
+                reason="Codebase audit ticket created",
+            )
+        except (InvalidTransitionError, KeyError):
+            pass
+
+        # Force AI Verify on (>= 1 round) regardless of the project's own
+        # setting — a claimed bug is only as trustworthy as an
+        # INDEPENDENT check of it, and self-graded verification is
+        # exactly the failure mode the Multi-Agency Proclamation's v2
+        # rewrite already exists to prevent (issue #636: an
+        # agent-authored verifier gamed its own retries). max(), not a
+        # flat override, so a project already configured for MORE rounds
+        # keeps them.
+        project_default = self._gate.get_project_verify_count(project_id)
+        self._gate.set_ticket_verify_count(ticket_id, max(1, project_default or 0))
+
+        return ticket_id
+
+    async def _is_audit_ticket(self, ticket_id: str) -> bool:
+        """True if *ticket_id* is a Marcus-created codebase-audit ticket."""
+        try:
+            task = await self._kanban.get_task_by_id(ticket_id)
+        except Exception:  # noqa: BLE001
+            return False
+        if task is None:
+            return False
+        labels = getattr(task, "labels", None) or []
+        return _AUDIT_TAG in labels
+
+    async def _complete_audit_ticket(
+        self, ticket_id: str, record: TicketRecord
+    ) -> bool:
+        """Finish a codebase-audit ticket in place of the normal gate flow.
+
+        Called from :meth:`signal_ready_for_review` instead of the usual
+        human-gate/AI-gate branches when the submitted ticket is
+        audit-tagged. Scans the ticket's own comments for "🔍 Audit
+        Finding:" entries (each one already independently verified by AI
+        Verify — this only runs once ``signal_ready_for_review``'s normal
+        verify-gate has already passed, since the audit ticket forces
+        ``verify_count`` >= 1 at creation), spins each into its own child
+        ticket via the same write path ``decompose_ticket`` uses, and
+        reports which OTHER tickets merged into ``main`` during the audit
+        (so the human knows that code was never covered by it).
+
+        Parameters
+        ----------
+        ticket_id : str
+            The audit ticket's id.
+        record : TicketRecord
+            Its current lifecycle record.
+
+        Returns
+        -------
+        bool
+            ``True`` on success.
+        """
+        findings: List[AuditFinding] = []
+        comments: List[Dict[str, Any]] = []
+        get_comments = getattr(self._kanban, "get_comments", None)
+        if get_comments is not None:
+            try:
+                comments = await get_comments(ticket_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Could not fetch comments to complete audit ticket %s: %s",
+                    ticket_id,
+                    exc,
+                )
+        for comment in comments:
+            findings.extend(
+                extract_findings_from_comment(comment.get("content", ""))
+            )
+
+        task = None
+        try:
+            task = await self._kanban.get_task_by_id(ticket_id)
+        except Exception:  # noqa: BLE001
+            pass
+        parent_project_id: Optional[int] = None
+        parent_color: Optional[str] = None
+        if task is not None:
+            raw = (task.source_context or {}).get("kanboard_task", {})
+            pid_raw = raw.get("project_id")
+            if pid_raw:
+                parent_project_id = int(pid_raw)
+            get_color = getattr(self._kanban, "get_task_color", None)
+            if get_color is not None:
+                try:
+                    parent_color = await get_color(ticket_id)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        child_ids: List[str] = []
+        if findings:
+            subs = [
+                {
+                    "title": f.title,
+                    "description": f.body,
+                    "acceptance_criteria": _AUDIT_FIX_AC_MARKDOWN,
+                }
+                for f in findings
+            ]
+            child_ids = await self._create_child_tickets(
+                ticket_id, record, parent_project_id, parent_color, subs
+            )
+
+        merged_since: List[str] = []
+        try:
+            branch_mgr = await self._branch_for_ticket(ticket_id)
+            snapshot = await branch_mgr.merge_base_with_main(record.branch_name)
+            if snapshot:
+                all_merged = await branch_mgr.ticket_ids_merged_since(snapshot)
+                merged_since = [t for t in all_merged if t != ticket_id]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not compute merged-since list for audit %s: %s",
+                ticket_id,
+                exc,
+            )
+
+        if child_ids:
+            summary = (
+                f"🔍 **Audit complete** — {len(child_ids)} verified "
+                f"finding{'s' if len(child_ids) != 1 else ''}, split into "
+                f"{'its own ticket' if len(child_ids) == 1 else 'their own tickets'} "
+                f"for independent review: "
+                f"{', '.join('#' + c for c in child_ids)}."
+            )
+        else:
+            summary = "🔍 **Audit complete** — no verified issues found."
+        if merged_since:
+            summary += (
+                "\n\n**Merged into `main` during this audit (not covered "
+                f"by it):** {', '.join('#' + t for t in merged_since)}. "
+                "Run another audit to cover this code."
+            )
+        await self._post_comment(ticket_id, summary)
+
+        try:
+            self._lifecycle.release_ticket(ticket_id, self._provider)
+        except KeyError:
+            pass
+        if child_ids:
+            # Same as decompose_ticket: park BLOCKED, it auto-completes
+            # once every spun-off finding-ticket is Done (existing
+            # _maybe_complete_parent / periodic reconcile machinery
+            # applies unchanged — a finding-ticket is just another child).
+            try:
+                self._lifecycle.human_transition(
+                    ticket_id,
+                    self._provider,
+                    TicketState.BLOCKED,
+                    reason="Audit findings split into their own tickets",
+                )
+            except (InvalidTransitionError, KeyError):
+                pass
+            try:
+                await self._kanban.move_task_to_column(ticket_id, "blocked")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Could not move audit ticket %s to blocked: %s", ticket_id, exc
+                )
+        else:
+            # Nothing to wait on — the audit itself is the whole
+            # deliverable, so it completes immediately without a human
+            # review step (there is no code diff to review; the summary
+            # comment above is the record of what was checked).
+            try:
+                self._lifecycle.human_transition(
+                    ticket_id,
+                    self._provider,
+                    TicketState.DONE,
+                    reason="Audit complete, no issues found",
+                )
+            except (InvalidTransitionError, KeyError):
+                pass
+            try:
+                await self._kanban.move_task_to_column(ticket_id, "done")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Could not move audit ticket %s to done: %s", ticket_id, exc
+                )
+            try:
+                self._lifecycle.set_merged(ticket_id, self._provider)
+            except KeyError:
+                pass
+            await self._pickup_next_ticket()
+
+        return True
 
     async def _rescan_boards(self) -> None:
         """Refresh lifecycle state from every enabled board (best-effort).
@@ -3185,6 +3639,18 @@ class HumanGatedWorkflow:
                 ticket_id,
                 exc,
             )
+
+        # A codebase-audit ticket never goes through the normal human/AI
+        # gate branches below: instead of a code diff to merge or hand
+        # off, it has a set of "🔍 Audit Finding:" comments to turn into
+        # their own independently-reviewable child tickets. It still
+        # goes through the same AI-Verify round-gate below first, so a
+        # finding only reaches this point once it's been independently
+        # checked, not just claimed by the same agent that found it.
+        if await self._is_audit_ticket(ticket_id):
+            if not await self._run_verify_gate(ticket_id, record):
+                return False
+            return await self._complete_audit_ticket(ticket_id, record)
 
         gate = await self._get_effective_gate(ticket_id)
 

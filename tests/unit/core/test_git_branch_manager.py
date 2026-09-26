@@ -856,3 +856,117 @@ class TestSharedCloneLock:
                 outstanding += 1
             else:
                 outstanding -= 1
+
+
+class TestMergeBaseWithMain:
+    """merge_base_with_main is the audit feature's "snapshot" of the
+    codebase at the moment a ticket's branch was created — git already
+    records this as the branches' common ancestor, so no separate
+    bookkeeping is needed to capture it."""
+
+    @pytest.mark.asyncio
+    async def test_returns_the_merge_base_commit(self):
+        mgr = _mgr()
+
+        async def fake_git(*args):
+            if args[0] == "fetch":
+                return (0, "", "")
+            if args[0] == "merge-base":
+                return (0, "abc123\n", "")
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+
+        sha = await mgr.merge_base_with_main("ticket/kanboard/9")
+
+        assert sha == "abc123"
+        calls = _calls(mgr._git)
+        assert any(c[0] == "fetch" and "ticket/kanboard/9" in c for c in calls)
+        assert any(
+            c[0] == "merge-base" and "FETCH_HEAD" in c for c in calls
+        )
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_local_branch_when_fetch_fails(self):
+        mgr = _mgr()
+
+        async def fake_git(*args):
+            if args[0] == "fetch":
+                return (1, "", "couldn't find remote ref")
+            if args[0] == "merge-base":
+                return (0, "def456\n", "")
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+
+        sha = await mgr.merge_base_with_main("ticket/kanboard/9")
+
+        assert sha == "def456"
+        assert any(
+            c[0] == "merge-base" and "ticket/kanboard/9" in c
+            for c in _calls(mgr._git)
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_git_error(self):
+        mgr = _mgr()
+        mgr._git = AsyncMock(return_value=(1, "", "fatal: not a valid object"))
+
+        sha = await mgr.merge_base_with_main("ticket/kanboard/9")
+
+        assert sha is None
+
+
+class TestTicketIdsMergedSince:
+    """ticket_ids_merged_since parses Marcus's own merge-commit message
+    convention out of git history, so the audit feature can report which
+    tickets merged (and so were never covered) during an audit."""
+
+    @pytest.mark.asyncio
+    async def test_extracts_ticket_ids_from_merge_commit_subjects(self):
+        mgr = _mgr()
+        log_output = (
+            "merge: ticket/kanboard/42 (auto-completed, AI gate)\n"
+            "merge: ticket/kanboard/7\n"
+        )
+        mgr._git = AsyncMock(return_value=(0, log_output, ""))
+
+        ids = await mgr.ticket_ids_merged_since("abc123")
+
+        assert ids == ["42", "7"]
+        calls = _calls(mgr._git)
+        assert any(
+            c[0] == "log" and "--merges" in c and "abc123..main" in c
+            for c in calls
+        )
+
+    @pytest.mark.asyncio
+    async def test_ignores_non_marcus_merge_commits(self):
+        """A merge commit not made by Marcus's own merge_to_main (e.g. a
+        human merging manually outside the tool) must not be
+        misidentified as a ticket id."""
+        mgr = _mgr()
+        log_output = "Merge branch 'some-other-branch'\n"
+        mgr._git = AsyncMock(return_value=(0, log_output, ""))
+
+        ids = await mgr.ticket_ids_merged_since("abc123")
+
+        assert ids == []
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_list_on_git_error(self):
+        mgr = _mgr()
+        mgr._git = AsyncMock(return_value=(1, "", "fatal: bad revision"))
+
+        ids = await mgr.ticket_ids_merged_since("abc123")
+
+        assert ids == []
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_list_when_nothing_merged(self):
+        mgr = _mgr()
+        mgr._git = AsyncMock(return_value=(0, "", ""))
+
+        ids = await mgr.ticket_ids_merged_since("abc123")
+
+        assert ids == []

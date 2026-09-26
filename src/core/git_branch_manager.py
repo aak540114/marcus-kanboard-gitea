@@ -49,6 +49,14 @@ logger = logging.getLogger(__name__)
 #: Marcus, not just git operations.
 _GIT_CMD_TIMEOUT = 60
 
+#: Matches Marcus's own merge-commit message convention, e.g.
+#: "merge: ticket/kanboard/42 (auto-completed, AI gate)" — see
+#: merge_to_main's callers in src/workflows/human_gated_workflow.py, both
+#: the human-gate and AI-gate paths use this exact "merge: ticket/<provider>/
+#: <id>" prefix. Used by ticket_ids_merged_since() to recover which
+#: tickets a range of merge commits corresponds to.
+_MERGE_SUBJECT_RE = re.compile(r"^merge: ticket/\S+/(\S+)", re.IGNORECASE)
+
 
 @dataclass
 class BranchManagerConfig:
@@ -773,6 +781,81 @@ class BranchManager:
         _, stdout, _ = await self._git("log", "--oneline", f"{base}..{branch_ref}")
         lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
         return lines
+
+    async def merge_base_with_main(
+        self, branch_name: str, *, base_branch: Optional[str] = None
+    ) -> Optional[str]:
+        """Return the commit *branch_name* forked from *base_branch*.
+
+        This is the audit feature's "snapshot" of the codebase at the
+        moment a ticket's branch was created — no separate bookkeeping is
+        needed to capture it, since git already records it as the
+        branches' common ancestor.
+
+        Parameters
+        ----------
+        branch_name : str
+            Ticket branch.
+        base_branch : Optional[str]
+            Comparison base; defaults to ``config.main_branch``.
+
+        Returns
+        -------
+        Optional[str]
+            The merge-base commit hash, or ``None`` if it couldn't be
+            determined (branch not found, git error).
+        """
+        base = base_branch or self.config.main_branch
+        branch_ref = branch_name
+        rc, _, _ = await self._git("fetch", self.config.remote, branch_name)
+        if rc == 0:
+            branch_ref = "FETCH_HEAD"
+        rc, stdout, _ = await self._git("merge-base", base, branch_ref)
+        if rc != 0:
+            return None
+        sha = stdout.strip()
+        return sha or None
+
+    async def ticket_ids_merged_since(
+        self, since_commit: str, *, base_branch: Optional[str] = None
+    ) -> List[str]:
+        """Return ticket ids whose branch merged into main after *since_commit*.
+
+        Parses Marcus's own merge-commit message convention —
+        ``f"merge: ticket/{provider}/{ticket_id}"`` (see
+        :meth:`merge_to_main` and its AI-gate/human-gate callers in
+        ``src/workflows/human_gated_workflow.py``) — out of every merge
+        commit between *since_commit* and *base_branch*. Used by the
+        audit feature to report which tickets merged during an audit
+        (and so were never covered by it) once the audit itself
+        completes.
+
+        Parameters
+        ----------
+        since_commit : str
+            Commit hash to start from (exclusive) — typically a prior
+            :meth:`merge_base_with_main` result.
+        base_branch : Optional[str]
+            Branch to walk up to; defaults to ``config.main_branch``.
+
+        Returns
+        -------
+        List[str]
+            Ticket ids, oldest merge first. Empty on any git error or
+            when nothing merged in that range.
+        """
+        base = base_branch or self.config.main_branch
+        rc, stdout, _ = await self._git(
+            "log", "--merges", "--format=%s", f"{since_commit}..{base}"
+        )
+        if rc != 0:
+            return []
+        ticket_ids = []
+        for line in stdout.splitlines():
+            match = _MERGE_SUBJECT_RE.search(line)
+            if match:
+                ticket_ids.append(match.group(1))
+        return ticket_ids
 
     # ------------------------------------------------------------------
     # Internal helpers

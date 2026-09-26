@@ -20,6 +20,7 @@ are mocked; no file I/O or network calls occur.
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1215,6 +1216,306 @@ class TestHumanGateAIVerify:
         assert result is True
         assert lifecycle.get("73", "kanboard").state == TicketState.WAITING_FOR_HUMAN
         workflow._verifier.verify.assert_not_called()
+
+
+class TestCreateAuditTicket:
+    """create_audit_ticket: a Marcus-initiated codebase-audit ticket."""
+
+    @pytest.mark.asyncio
+    async def test_creates_ticket_with_fixed_ac_embedded(
+        self, workflow, lifecycle, mock_kanban, tmp_path
+    ):
+        """The fixed AC must actually be embedded in the description AND
+        stored in the lifecycle record — embedding it is what makes
+        _on_ticket_new's own AC-generation skip automatically (it only
+        generates when ACParser.extract(description) finds nothing)."""
+        from src.core.gate_settings import GateSettingManager
+
+        workflow._gate = GateSettingManager(data_dir=tmp_path)
+        created = MagicMock(id="500")
+        mock_kanban.create_task = AsyncMock(return_value=created)
+        mock_kanban.set_task_tags = AsyncMock(return_value=True)
+
+        ticket_id = await workflow.create_audit_ticket(project_id=9)
+
+        assert ticket_id == "500"
+        call_kwargs = mock_kanban.create_task.call_args.args[0]
+        assert "## Acceptance Criteria" in call_kwargs["description"]
+        assert "Finding zero issues is an acceptable" in call_kwargs["description"]
+        record = lifecycle.get("500", "kanboard")
+        assert record is not None
+        assert record.acceptance_criteria is not None
+        assert "Finding zero issues" in record.acceptance_criteria
+
+    @pytest.mark.asyncio
+    async def test_tags_the_ticket_as_an_audit(
+        self, workflow, lifecycle, mock_kanban, tmp_path
+    ):
+        from src.core.gate_settings import GateSettingManager
+
+        workflow._gate = GateSettingManager(data_dir=tmp_path)
+        mock_kanban.create_task = AsyncMock(return_value=MagicMock(id="501"))
+        mock_kanban.set_task_tags = AsyncMock(return_value=True)
+
+        await workflow.create_audit_ticket(project_id=9)
+
+        mock_kanban.set_task_tags.assert_awaited_once_with(
+            "501", project_id=9, tags=["marcus-audit"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_assigns_to_requested_by(
+        self, workflow, lifecycle, mock_kanban, tmp_path
+    ):
+        from src.core.gate_settings import GateSettingManager
+
+        workflow._gate = GateSettingManager(data_dir=tmp_path)
+        mock_kanban.create_task = AsyncMock(return_value=MagicMock(id="502"))
+        mock_kanban.assign_task = AsyncMock(return_value=True)
+
+        await workflow.create_audit_ticket(project_id=9, requested_by="alice")
+
+        mock_kanban.assign_task.assert_awaited_once_with("502", "alice")
+        assert lifecycle.get("502", "kanboard").assignee == "alice"
+
+    @pytest.mark.asyncio
+    async def test_moves_ticket_to_ready(
+        self, workflow, lifecycle, mock_kanban, tmp_path
+    ):
+        from src.core.gate_settings import GateSettingManager
+
+        workflow._gate = GateSettingManager(data_dir=tmp_path)
+        mock_kanban.create_task = AsyncMock(return_value=MagicMock(id="503"))
+
+        await workflow.create_audit_ticket(project_id=9)
+
+        mock_kanban.move_task_to_column.assert_awaited_once_with("503", "ready")
+        assert lifecycle.get("503", "kanboard").state == TicketState.READY
+
+    @pytest.mark.asyncio
+    async def test_forces_verify_count_to_at_least_one(
+        self, workflow, lifecycle, mock_kanban, tmp_path
+    ):
+        """Regression guard for a self-graded-verification hole: without
+        this, an audit ticket on a project with AI Verify OFF (the
+        default) would never get an independent check on its own
+        findings — the same failure mode the Multi-Agency Proclamation's
+        v2 rewrite already exists to prevent (issue #636)."""
+        from src.core.gate_settings import GateSettingManager
+
+        workflow._gate = GateSettingManager(data_dir=tmp_path)
+        # Project's own verify_count defaults to 0 (AI Verify off).
+        mock_kanban.create_task = AsyncMock(return_value=MagicMock(id="504"))
+
+        ticket_id = await workflow.create_audit_ticket(project_id=9)
+
+        assert workflow._gate.get_effective_verify_count(ticket_id, 9) >= 1
+
+    @pytest.mark.asyncio
+    async def test_does_not_lower_an_already_higher_project_verify_count(
+        self, workflow, lifecycle, mock_kanban, tmp_path
+    ):
+        from src.core.gate_settings import GateSettingManager
+
+        workflow._gate = GateSettingManager(data_dir=tmp_path)
+        workflow._gate.set_project_verify_count(9, 3)
+        mock_kanban.create_task = AsyncMock(return_value=MagicMock(id="505"))
+
+        ticket_id = await workflow.create_audit_ticket(project_id=9)
+
+        assert workflow._gate.get_effective_verify_count(ticket_id, 9) == 3
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_kanban_lacks_create_task(
+        self, workflow, lifecycle
+    ):
+        workflow._kanban = MagicMock(spec=[])  # no create_task attribute
+        assert await workflow.create_audit_ticket(project_id=9) is None
+
+
+class TestIsAuditTicket:
+    @pytest.mark.asyncio
+    async def test_true_when_tagged(self, workflow, mock_kanban):
+        mock_kanban.get_task_by_id = AsyncMock(
+            return_value=_make_task_mock(labels=["marcus-audit"])
+        )
+        assert await workflow._is_audit_ticket("1") is True
+
+    @pytest.mark.asyncio
+    async def test_false_when_not_tagged(self, workflow, mock_kanban):
+        mock_kanban.get_task_by_id = AsyncMock(
+            return_value=_make_task_mock(labels=["bug"])
+        )
+        assert await workflow._is_audit_ticket("1") is False
+
+    @pytest.mark.asyncio
+    async def test_false_when_task_not_found(self, workflow, mock_kanban):
+        mock_kanban.get_task_by_id = AsyncMock(return_value=None)
+        assert await workflow._is_audit_ticket("1") is False
+
+    @pytest.mark.asyncio
+    async def test_false_on_kanban_error(self, workflow, mock_kanban):
+        mock_kanban.get_task_by_id = AsyncMock(side_effect=RuntimeError("down"))
+        assert await workflow._is_audit_ticket("1") is False
+
+
+class TestCompleteAuditTicket:
+    """signal_ready_for_review's audit-completion path: findings become
+    child tickets, and the completion comment reports what merged into
+    main during the audit."""
+
+    def _audit_ticket(self, workflow, lifecycle, mock_kanban, mock_branch, tid="90"):
+        lifecycle.get_or_create(tid, "kanboard")
+        lifecycle.transition(tid, "kanboard", TicketState.READY)
+        lifecycle.transition(tid, "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.set_assignee(tid, "kanboard", "alice")
+        lifecycle.claim_ticket(tid, "kanboard", workflow._agent_id)
+        mock_kanban.get_task_by_id = AsyncMock(
+            return_value=_make_task_mock(labels=["marcus-audit"])
+        )
+        mock_kanban.create_task = AsyncMock(
+            side_effect=[MagicMock(id=str(200 + i)) for i in range(10)]
+        )
+        mock_branch.merge_base_with_main = AsyncMock(return_value="abc123")
+        mock_branch.ticket_ids_merged_since = AsyncMock(return_value=[])
+        # Unrelated to the audit flow itself: a failed AI-Verify round
+        # releases the ticket and calls _pickup_next_ticket(), which (with
+        # no OTHER ticket in this minimal test's lifecycle store) re-selects
+        # this SAME just-released ticket and tries to (re)start it —
+        # hitting _check_project_stack's pre-existing "does the project
+        # description have tech-stack info" pause, unrelated to anything
+        # this test class is actually exercising. Short-circuit it so the
+        # verify-gate failure test observes ONLY what it's testing for.
+        workflow._check_project_stack = AsyncMock(return_value=True)
+        return lifecycle.get(tid, "kanboard")
+
+    @pytest.mark.asyncio
+    async def test_zero_findings_completes_directly_to_done(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        self._audit_ticket(workflow, lifecycle, mock_kanban, mock_branch, "90")
+        mock_kanban.get_comments = AsyncMock(return_value=[])
+
+        result = await workflow.signal_ready_for_review("90")
+
+        assert result is True
+        assert lifecycle.get("90", "kanboard").state == TicketState.DONE
+        mock_kanban.create_task.assert_not_called()
+        posted = [c.args[1] for c in mock_kanban.add_comment.call_args_list]
+        assert any("no verified issues found" in body for body in posted)
+
+    @pytest.mark.asyncio
+    async def test_one_finding_spins_off_a_child_ticket_and_blocks(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        self._audit_ticket(workflow, lifecycle, mock_kanban, mock_branch, "91")
+        mock_kanban.get_comments = AsyncMock(
+            return_value=[
+                {
+                    "content": (
+                        "### 🔍 Audit Finding: Off-by-one in pagination\n"
+                        "**Bug:** last page dropped.\n"
+                        "**How to reproduce:** create 11 items, page 2 is empty.\n"
+                        "**Proposed fix:** use ceil().\n"
+                    )
+                }
+            ]
+        )
+
+        result = await workflow.signal_ready_for_review("91")
+
+        assert result is True
+        assert lifecycle.get("91", "kanboard").state == TicketState.BLOCKED
+        mock_kanban.create_task.assert_awaited_once()
+        child_payload = mock_kanban.create_task.call_args.args[0]
+        assert child_payload["name"] == "Off-by-one in pagination"
+        assert "last page dropped" in child_payload["description"]
+        posted = [c.args[1] for c in mock_kanban.add_comment.call_args_list]
+        assert any("1 verified finding" in body and "#200" in body for body in posted)
+
+    @pytest.mark.asyncio
+    async def test_two_findings_spin_off_two_child_tickets(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        self._audit_ticket(workflow, lifecycle, mock_kanban, mock_branch, "92")
+        mock_kanban.get_comments = AsyncMock(
+            return_value=[
+                {
+                    "content": (
+                        "### 🔍 Audit Finding: First bug\nBody one.\n\n"
+                        "### 🔍 Audit Finding: Second bug\nBody two.\n"
+                    )
+                }
+            ]
+        )
+
+        result = await workflow.signal_ready_for_review("92")
+
+        assert result is True
+        assert mock_kanban.create_task.await_count == 2
+        posted = [c.args[1] for c in mock_kanban.add_comment.call_args_list]
+        assert any("2 verified findings" in body for body in posted)
+
+    @pytest.mark.asyncio
+    async def test_reports_tickets_merged_during_the_audit(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        self._audit_ticket(workflow, lifecycle, mock_kanban, mock_branch, "93")
+        mock_kanban.get_comments = AsyncMock(return_value=[])
+        mock_branch.ticket_ids_merged_since = AsyncMock(return_value=["55", "56"])
+
+        await workflow.signal_ready_for_review("93")
+
+        posted = [c.args[1] for c in mock_kanban.add_comment.call_args_list]
+        assert any(
+            "#55" in body and "#56" in body and "not covered" in body
+            for body in posted
+        )
+
+    @pytest.mark.asyncio
+    async def test_never_reports_itself_as_merged_since(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """The audit ticket's OWN merge (once it completes) must never
+        appear in its own "not yet covered" list."""
+        self._audit_ticket(workflow, lifecycle, mock_kanban, mock_branch, "94")
+        mock_kanban.get_comments = AsyncMock(return_value=[])
+        mock_branch.ticket_ids_merged_since = AsyncMock(return_value=["94", "55"])
+
+        await workflow.signal_ready_for_review("94")
+
+        posted = [c.args[1] for c in mock_kanban.add_comment.call_args_list]
+        merged_comment = next(b for b in posted if "not covered" in b)
+        assert "#55" in merged_comment
+        assert "#94" not in merged_comment
+
+    @pytest.mark.asyncio
+    async def test_findings_only_processed_after_verification_passes(
+        self, workflow, lifecycle, mock_kanban, mock_branch, tmp_path
+    ):
+        """A finding is only trustworthy once AI Verify has independently
+        checked it (verify_count forced >= 1 at creation) — a failed
+        verification round must release the ticket back to the agent
+        instead of processing whatever findings it already posted."""
+        from src.core.gate_settings import GateSettingManager
+
+        self._audit_ticket(workflow, lifecycle, mock_kanban, mock_branch, "95")
+        mock_kanban.get_comments = AsyncMock(
+            return_value=[{"content": "### 🔍 Audit Finding: X\nY"}]
+        )
+        workflow._gate = GateSettingManager(data_dir=tmp_path)
+        workflow._gate.set_ticket_verify_count("95", 1)
+        workflow._verifier = MagicMock()
+        workflow._verifier.verify = AsyncMock(
+            return_value=SimpleNamespace(passed=False, findings=["still broken"])
+        )
+        mock_branch.get_branch_diff = AsyncMock(return_value="diff")
+
+        result = await workflow.signal_ready_for_review("95")
+
+        assert result is False
+        assert lifecycle.get("95", "kanboard").state == TicketState.IN_PROGRESS
+        mock_kanban.create_task.assert_not_called()
 
 
 class TestGetAcItems:
