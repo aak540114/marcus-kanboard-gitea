@@ -5090,8 +5090,9 @@ def _dev_env_logs_page(ticket_id: str, provider: str, *, token: str = "") -> str
 </head>
 <body>
 <header>
-  <h1>Preview logs — ticket {display_html}</h1>
+  <h1 id="pageTitle">Preview logs — ticket {display_html}</h1>
   <span class="pill" id="status">checking&hellip;</span>
+  <button id="copy">Copy all</button>
   <button id="refresh">Refresh now</button>
 </header>
 <div id="command" style="display:none">Last dev-server command: <code id="cmd"></code></div>
@@ -5161,6 +5162,52 @@ def _dev_env_logs_page(ticket_id: str, provider: str, *, token: str = "") -> str
 
   document.getElementById("refresh").addEventListener("click", refresh);
   refresh();
+
+  // "Copy all" — everything currently visible on the page (title, last
+  // dev-server command if shown, status, and the full log text) as one
+  // plain-text blob, so a human can paste the whole picture into a bug
+  // report or a ticket comment without manually re-assembling it from
+  // several DOM pieces.
+  function buildCopyText() {{
+    var lines = [document.getElementById("pageTitle").textContent];
+    if (cmdWrap.style.display !== "none" && cmdEl.textContent) {{
+      lines.push("Last dev-server command: " + cmdEl.textContent);
+    }}
+    if (statusEl.textContent) {{ lines.push("Status: " + statusEl.textContent); }}
+    lines.push("");
+    lines.push(logEl.textContent || "");
+    return lines.join("\\n");
+  }}
+
+  function copyToClipboard(text) {{
+    if (navigator.clipboard && navigator.clipboard.writeText) {{
+      return navigator.clipboard.writeText(text);
+    }}
+    // Fallback for a non-secure context (plain HTTP on a non-localhost
+    // host — see the README's Network access section — where the
+    // Clipboard API is unavailable): a hidden textarea + the legacy
+    // execCommand("copy") still works in every modern browser.
+    var ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    var ok = false;
+    try {{ ok = document.execCommand("copy"); }} catch (e) {{ ok = false; }}
+    document.body.removeChild(ta);
+    return ok ? Promise.resolve() : Promise.reject(new Error("copy failed"));
+  }}
+
+  document.getElementById("copy").addEventListener("click", function () {{
+    var btn = document.getElementById("copy");
+    var original = btn.textContent;
+    copyToClipboard(buildCopyText())
+      .then(function () {{ btn.textContent = "Copied!"; }})
+      .catch(function () {{ btn.textContent = "Copy failed"; }})
+      .then(function () {{ setTimeout(function () {{ btn.textContent = original; }}, 1500); }});
+  }});
 </script>
 </body>
 </html>"""

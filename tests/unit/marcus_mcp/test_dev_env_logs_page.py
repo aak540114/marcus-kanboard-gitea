@@ -78,3 +78,32 @@ class TestDevEnvLogsPage:
         # driven by data.running — not a single unconditional interval
         # set up once at page load.
         assert "if (data.running) { startPolling(); } else { stopPolling(); }" in page
+
+    def test_has_a_copy_all_button(self) -> None:
+        page = _dev_env_logs_page("7", "kanboard")
+        assert 'id="copy"' in page
+        assert "getElementById(\"copy\")" in page
+
+    def test_copy_text_includes_title_command_status_and_log(self) -> None:
+        """Copy must assemble everything visible on the page into one
+        blob — the human-facing title, the last dev-server command (when
+        shown), the running/stopped status, and the full log text — not
+        just the raw log content alone."""
+        page = _dev_env_logs_page("7", "kanboard")
+        assert 'document.getElementById("pageTitle")' in page
+        assert "Last dev-server command: " in page
+        assert "Status: " in page
+        assert "logEl.textContent" in page
+
+    def test_copy_falls_back_to_execcommand_when_clipboard_api_unavailable(
+        self,
+    ) -> None:
+        """Marcus can run over plain HTTP on a non-localhost host (see
+        the README's Network access section) — browsers restrict
+        navigator.clipboard to secure contexts, so it can be entirely
+        absent there. Copy must still work via the legacy
+        document.execCommand("copy") in that case, not silently do
+        nothing."""
+        page = _dev_env_logs_page("7", "kanboard")
+        assert "navigator.clipboard" in page
+        assert 'execCommand("copy")' in page
