@@ -45,6 +45,7 @@ from src.marcus_mcp.server import (
     _maybe_ai_infer_stack,
     _maybe_update_dev_preview_readme,
     _persist_detected_stack,
+    _relearn_stack_after_ticket_done,
     _repo_fingerprint,
 )
 
@@ -322,6 +323,214 @@ class TestMaybeAiInferStack:
         assert result is existing
 
 
+class TestRelearnStackAfterTicketDone:
+    """After a ticket's branch merges to main, re-read the repo's own
+    files with the AI provider and, if the code an agent just merged
+    changed what the project actually needs, update the Tech Stack
+    description and log a note on the ticket that introduced it — the
+    "learn about new tech as tickets get done" half of AI-based stack
+    inference (see _maybe_ai_infer_stack for the reactive,
+    preview-start-time half)."""
+
+    def _server_with_desc_mgr(self, tmp_path, mgr, **kwargs):
+        server = _server(tmp_path, **kwargs)
+        server._project_desc_mgr = mgr
+        return server
+
+    @pytest.mark.asyncio
+    async def test_no_op_when_no_ai_engine(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        mgr = _mgr(tmp_path)
+        server = self._server_with_desc_mgr(tmp_path, mgr, ai_engine=None)
+
+        with patch(
+            "src.core.repo_stack_inference.infer_stack_with_ai",
+            new=AsyncMock(return_value=_django_stack()),
+        ) as fake_infer:
+            await _relearn_stack_after_ticket_done(server, 7, str(repo), "42")
+
+        fake_infer.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_op_and_no_llm_call_when_description_locked_by_human(
+        self, tmp_path
+    ):
+        """A human-edited description must never be silently overwritten
+        — and the (costly) LLM call shouldn't even happen if the result
+        couldn't be persisted anyway."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        mgr = _mgr(tmp_path)
+        mgr.update_description(7, "# Project\n## Tech Stack\n- **Language**: Nodejs\n")
+        ai_engine = SimpleNamespace(generate_text=AsyncMock(return_value="{}"))
+        server = self._server_with_desc_mgr(tmp_path, mgr, ai_engine=ai_engine)
+
+        with patch(
+            "src.core.repo_stack_inference.infer_stack_with_ai",
+            new=AsyncMock(return_value=_django_stack()),
+        ) as fake_infer:
+            await _relearn_stack_after_ticket_done(server, 7, str(repo), "42")
+
+        fake_infer.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_op_when_ai_is_not_confident(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        mgr = _mgr(tmp_path)
+        _persist_detected_stack(
+            mgr, 7,
+            ProjectStack(language="nodejs", framework="Express",
+                         install_cmd="npm install", dev_cmd="npm start"),
+        )
+        ai_engine = SimpleNamespace(generate_text=AsyncMock(return_value="{}"))
+        server = self._server_with_desc_mgr(
+            tmp_path, mgr, ai_engine=ai_engine,
+            kanban_client=MagicMock(add_comment=AsyncMock()),
+            events=MagicMock(publish=AsyncMock()),
+        )
+
+        with patch(
+            "src.core.repo_stack_inference.infer_stack_with_ai",
+            new=AsyncMock(return_value=None),
+        ):
+            await _relearn_stack_after_ticket_done(server, 7, str(repo), "42")
+
+        server.kanban_client.add_comment.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_op_when_ai_confirms_the_same_stack(self, tmp_path):
+        """A confident AI answer that just re-confirms what's already
+        declared must not spam a note or rewrite an unchanged
+        description on every single merge."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        mgr = _mgr(tmp_path)
+        stack = ProjectStack(language="nodejs", framework="Express",
+                              install_cmd="npm install", dev_cmd="npm start")
+        _persist_detected_stack(mgr, 7, stack)
+        ai_engine = SimpleNamespace(generate_text=AsyncMock(return_value="{}"))
+        server = self._server_with_desc_mgr(
+            tmp_path, mgr, ai_engine=ai_engine,
+            kanban_client=MagicMock(add_comment=AsyncMock()),
+            events=MagicMock(publish=AsyncMock()),
+        )
+
+        with patch(
+            "src.core.repo_stack_inference.infer_stack_with_ai",
+            new=AsyncMock(return_value=ProjectStack(
+                language="nodejs", framework="Express",
+                install_cmd="npm install", dev_cmd="npm start",
+            )),
+        ):
+            await _relearn_stack_after_ticket_done(server, 7, str(repo), "42")
+
+        server.kanban_client.add_comment.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_updates_description_and_posts_note_on_real_change(
+        self, tmp_path
+    ):
+        """Regression: this is the concrete reported scenario — a
+        Node.js project's dev script grew a Django backend dependency
+        partway through a ticket. The next ticket to merge must correct
+        the project's Tech Stack AND leave a visible note on the ticket
+        that introduced the change, matching the existing 🏗️ Note
+        decision-logging convention."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        mgr = _mgr(tmp_path)
+        _persist_detected_stack(
+            mgr, 7,
+            ProjectStack(language="nodejs", framework="Express",
+                         install_cmd="npm install", dev_cmd="npm run dev"),
+        )
+        ai_engine = SimpleNamespace(generate_text=AsyncMock(return_value="{}"))
+        server = self._server_with_desc_mgr(
+            tmp_path, mgr, ai_engine=ai_engine,
+            kanban_client=MagicMock(add_comment=AsyncMock(return_value=True)),
+            events=MagicMock(publish=AsyncMock()),
+            provider="kanboard",
+        )
+        polyglot = ProjectStack(
+            language="nodejs", framework="Express + Django",
+            install_cmd="npm install && pip install -r requirements.txt",
+            dev_cmd="npm run dev",
+            extra_apt=["nodejs", "npm", "python3", "py3-pip"],
+        )
+
+        with patch(
+            "src.core.repo_stack_inference.infer_stack_with_ai",
+            new=AsyncMock(return_value=polyglot),
+        ):
+            await _relearn_stack_after_ticket_done(server, 7, str(repo), "129")
+
+        updated = mgr.get_stack(7)
+        assert updated is not None
+        # get_stack() re-derives language/framework via a free-text
+        # keyword scan (parse_stack_from_text) rather than reading back
+        # a literal field — "django" is what it recognizes out of the
+        # persisted "Express + Django" text (install/dev commands DO
+        # round-trip literally, which is the operationally important
+        # part: what actually gets installed and run).
+        assert updated.framework == "django"
+        assert "pip install" in updated.install_cmd
+        server.kanban_client.add_comment.assert_awaited_once()
+        ticket_id, note = server.kanban_client.add_comment.call_args.args
+        assert ticket_id == "129"
+        assert "🏗️ Note" in note
+        assert "Express + Django" in note
+        server.events.publish.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_caches_the_fresh_ai_stack_even_when_unchanged(self, tmp_path):
+        """The cache benefits the NEXT preview-start regardless of
+        whether this particular merge changed anything worth notifying
+        a human about."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True)
+        (repo / "f.txt").write_text("x")
+        subprocess.run(["git", "add", "f.txt"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "x"], cwd=repo, check=True, capture_output=True)
+        mgr = _mgr(tmp_path)
+        stack = ProjectStack(language="nodejs", framework="Express",
+                              install_cmd="npm install", dev_cmd="npm start")
+        _persist_detected_stack(mgr, 7, stack)
+        ai_engine = SimpleNamespace(generate_text=AsyncMock(return_value="{}"))
+        server = self._server_with_desc_mgr(tmp_path, mgr, ai_engine=ai_engine)
+
+        with patch(
+            "src.core.repo_stack_inference.infer_stack_with_ai",
+            new=AsyncMock(return_value=ProjectStack(
+                language="nodejs", framework="Express",
+                install_cmd="npm install", dev_cmd="npm start",
+            )),
+        ):
+            await _relearn_stack_after_ticket_done(server, 7, str(repo), "42")
+
+        assert _get_repo_stack_cache_mgr(server).get_ai_stack(7) is not None
+
+    @pytest.mark.asyncio
+    async def test_no_repo_path_is_a_no_op(self, tmp_path):
+        mgr = _mgr(tmp_path)
+        ai_engine = SimpleNamespace(generate_text=AsyncMock(return_value="{}"))
+        server = self._server_with_desc_mgr(tmp_path, mgr, ai_engine=ai_engine)
+
+        with patch(
+            "src.core.repo_stack_inference.infer_stack_with_ai",
+            new=AsyncMock(return_value=_django_stack()),
+        ) as fake_infer:
+            await _relearn_stack_after_ticket_done(
+                server, 7, str(tmp_path / "does-not-exist"), "42"
+            )
+
+        fake_infer.assert_not_awaited()
+
+
 class TestMaybeUpdateDevPreviewReadme:
     @pytest.mark.asyncio
     async def test_writes_when_hash_not_cached(self, tmp_path):
@@ -482,6 +691,49 @@ class TestDetermineDevPreviewStack:
 
         assert result is not None
         assert result.language == "nodejs"
+
+    @pytest.mark.asyncio
+    async def test_ai_is_consulted_even_when_a_stack_was_already_detected(
+        self, tmp_path
+    ):
+        """Regression: detect_project_type() is single-manifest — it
+        commits to "nodejs" the instant package.json exists and never
+        even checks for requirements.txt/manage.py. A genuinely polyglot
+        repo (a Node.js frontend whose dev script also needs to migrate a
+        Django backend) used to stay wrongly declared "nodejs" forever,
+        because the AI path only ever ran when file-sniffing found
+        NOTHING recognizable at all. Confirmed live: `npm run dev` failed
+        with `ModuleNotFoundError: No module named 'django'`. The AI must
+        now be consulted (and allowed to override) even when file-
+        sniffing DID recognize something."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "package.json").write_text("{}")
+        (repo / "manage.py").write_text("# django")
+        ai_engine = SimpleNamespace(generate_text=AsyncMock(return_value="{}"))
+        server = _server(tmp_path, ai_engine=ai_engine)
+        mgr = _mgr(tmp_path)
+        polyglot_stack = ProjectStack(
+            language="nodejs", framework="Express + Django",
+            install_cmd="npm install && pip install -r requirements.txt",
+            dev_cmd="npm run dev",
+            extra_apt=["nodejs", "npm", "python3", "py3-pip"],
+        )
+
+        with (
+            patch(
+                "src.core.repo_stack_inference.infer_stack_with_ai",
+                new=AsyncMock(return_value=polyglot_stack),
+            ) as fake_infer,
+            patch(
+                "src.core.repo_readme_writer.update_dev_preview_readme_section",
+                new=AsyncMock(return_value=True),
+            ),
+        ):
+            result = await _determine_dev_preview_stack(server, mgr, 7, None, str(repo))
+
+        fake_infer.assert_awaited_once()
+        assert result is polyglot_stack
 
     @pytest.mark.asyncio
     async def test_falls_back_to_ai_when_repo_unrecognized(self, tmp_path):

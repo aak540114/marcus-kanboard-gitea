@@ -4499,9 +4499,11 @@ async def _maybe_ai_infer_stack(
     resolved: Optional[Any],
     repo_path: Optional[str],
 ) -> Optional[Any]:
-    """AI-based last resort: read the repo's own files to infer a stack
-    when file-sniffing alone (``detect_project_type``) found nothing
-    recognizable at all.
+    """Read the repo's own files with Marcus's AI provider to infer (or
+    correct) its stack — called whenever a provider is configured, not
+    only when file-sniffing (``detect_project_type``) found nothing
+    recognizable at all, since a single-manifest heuristic can't
+    represent a genuinely polyglot repo.
 
     Cached against the repo's current commit SHA (see
     :func:`_repo_fingerprint`) so this LLM call only ever runs once per
@@ -4573,6 +4575,158 @@ async def _maybe_ai_infer_stack(
             "AI-based stack inference failed for project %d: %s", project_id, exc
         )
         return resolved
+
+
+async def _relearn_stack_after_ticket_done(
+    server: "MarcusServer",
+    project_id: int,
+    repo_path: str,
+    ticket_id: str,
+) -> None:
+    """After a ticket's branch merges to main, re-read the repo's own
+    files with Marcus's AI provider and, if the code an agent just
+    merged introduced a real change in how the project must be run
+    (a new backend framework, a newly-needed system package, ...),
+    update the project's Tech Stack description and log a visible note
+    on the ticket that introduced it.
+
+    This is the "learn about new tech as tickets get done" half of the
+    same AI-based stack inference :func:`_maybe_ai_infer_stack` already
+    uses at preview-start time — that path is reactive (it only notices
+    a change the next time someone happens to open a preview); this one
+    is proactive, firing the instant a merge lands, so the very next
+    preview start (or the next agent reading the project description)
+    already sees the corrected stack instead of failing first.
+
+    Best-effort and fire-and-forget throughout: called from a
+    ``ticket.status_changed`` event handler as a detached background
+    task (see :func:`_wire_human_gated_workflow`), so nothing here can
+    ever block or fail ticket processing. Costs exactly one LLM call per
+    ticket that reaches ``done`` (the commit SHA always changes on a
+    merge, so the SHA-keyed cache :func:`_maybe_ai_infer_stack` relies on
+    can never skip this one) — a deliberate, known tradeoff for genuinely
+    catching whatever an agent introduced, not a bug to be tuned away.
+
+    Parameters
+    ----------
+    server : MarcusServer
+        The running server instance (for ``server.ai_engine`` and the
+        shared ``RepoStackCache``).
+    project_id : int
+        Kanboard project ID whose repo just changed.
+    repo_path : str
+        Local path to the project's cloned repo.
+    ticket_id : str
+        The ticket whose merge triggered this — the note (if any) is
+        posted there, so it reads as "this ticket is what introduced
+        this" rather than an unattributed project-wide change.
+    """
+    if not os.path.isdir(repo_path):
+        return
+    ai_engine = getattr(server, "ai_engine", None)
+    generate_text = getattr(ai_engine, "generate_text", None)
+    if generate_text is None:
+        return
+
+    desc_mgr = _get_project_desc_mgr(server)
+    if not desc_mgr.can_auto_update(project_id):
+        # A human has locked this description — never silently overwrite
+        # their own correction, and skip the LLM call entirely since the
+        # result couldn't be persisted anyway.
+        return
+    before = desc_mgr.get_stack(project_id)
+    before_text = desc_mgr.get_description(project_id)
+
+    from src.core.repo_stack_inference import infer_stack_with_ai
+
+    try:
+        new_stack = await infer_stack_with_ai(repo_path, generate_text)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Post-merge stack re-check failed for project %d (ticket %s): %s",
+            project_id,
+            ticket_id,
+            exc,
+        )
+        return
+    if new_stack is None:
+        return  # AI couldn't confidently determine anything — leave as-is
+
+    fingerprint = await _repo_fingerprint(repo_path)
+    if fingerprint:
+        _get_repo_stack_cache_mgr(server).store_ai_stack(
+            project_id,
+            fingerprint,
+            {
+                "language": new_stack.language,
+                "framework": new_stack.framework,
+                "install_cmd": new_stack.install_cmd,
+                "dev_cmd": new_stack.dev_cmd,
+                "use_hm_reload": new_stack.use_hm_reload,
+                "extra_apt": list(new_stack.extra_apt),
+            },
+        )
+
+    # Compare the persisted MARKDOWN TEXT before vs. after — not the two
+    # ProjectStack objects' fields directly. `before` came back through
+    # get_stack()'s free-text keyword parser (parse_stack_from_text),
+    # which normalizes/lowercases language+framework and can collapse a
+    # multi-framework answer to whichever single keyword it matches
+    # first; `new_stack` is the AI's raw, un-normalized answer. Diffing
+    # those two representations directly would report a "change" on
+    # every single call purely from formatting, even when nothing
+    # meaningful actually changed. _persist_detected_stack already knows
+    # how to tell a real edit from a no-op the same way the rest of this
+    # module does (see _persist_corrected_stack's own text-equality
+    # check) — reusing that comparison keeps this consistent instead of
+    # re-deriving a second, less reliable one.
+    _persist_detected_stack(desc_mgr, project_id, new_stack)
+    after_text = desc_mgr.get_description(project_id)
+    if after_text == before_text:
+        return
+    logger.info(
+        "Project %d's Tech Stack updated after ticket %s merged: "
+        "%r/%r -> %r/%r",
+        project_id,
+        ticket_id,
+        before.language if before else None,
+        before.framework if before else None,
+        new_stack.language,
+        new_stack.framework,
+    )
+
+    if server.kanban_client is None:
+        return
+    old_desc = (
+        f"{before.language}/{before.framework or 'none'}"
+        if before is not None
+        else "nothing declared yet"
+    )
+    note = (
+        "🏗️ Note: Re-checked this project's actual files after this "
+        f"ticket merged to main. Detected a change from **{old_desc}** to "
+        f"**{new_stack.language}/{new_stack.framework or 'none'}** — "
+        "updated the project's Tech Stack section so the dev-environment "
+        "preview (and the next agent reading the project description) "
+        "installs what the code actually needs now."
+    )
+    try:
+        await server.kanban_client.add_comment(ticket_id, note)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Could not post stack-change note on ticket %s: %s", ticket_id, exc
+        )
+        return
+    events_bus = getattr(server, "events", None)
+    if events_bus is not None:
+        try:
+            await events_bus.publish(
+                "ui.refresh",
+                source="_relearn_stack_after_ticket_done",
+                data={"ticket_id": ticket_id, "provider": getattr(server, "provider", None)},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Could not emit ui.refresh for %s: %s", ticket_id, exc)
 
 
 async def _maybe_update_dev_preview_readme(
@@ -4772,12 +4926,15 @@ async def _determine_dev_preview_stack(
     2. No declared stack at all: the same file-sniffing, used to build a
        stack from scratch instead of only correcting one
        (:func:`_detect_stack_from_repo_only`).
-    3. Still nothing recognized (``detect_project_type`` returns
-       ``"static"``, regardless of whether step 1 or 2 ran): ask
-       Marcus's own AI provider to read the repo's actual files —
+    3. Whenever an AI provider is configured (not just when nothing was
+       recognized at all): ask it to read the repo's actual files —
        README, manifests, common entrypoints — and infer how to run it
        (:func:`_maybe_ai_infer_stack`), cached per repo commit so this
-       only ever costs one LLM call per repo state.
+       only ever costs one LLM call per repo state. This is what catches
+       a genuinely polyglot repo file-sniffing can't represent (it picks
+       exactly one language key and stops at the first manifest it
+       sees) — the AI reads the whole repo and can describe a compound
+       install/start command spanning multiple runtimes.
 
     Whatever stack is ultimately chosen, this also (best-effort, only
     when it actually changed) mirrors it into the repo's own README.md
@@ -4817,19 +4974,24 @@ async def _determine_dev_preview_stack(
     elif repo_path and os.path.isdir(repo_path):
         resolved = _detect_stack_from_repo_only(desc_mgr, project_id, repo_path)
 
-    detected_key = "static"
-    if repo_path and os.path.isdir(repo_path):
-        from src.core.dev_environment import detect_project_type
-
-        try:
-            detected_key = detect_project_type(repo_path)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Could not sniff repo %s: %s", repo_path, exc)
-
-    if detected_key == "static":
-        resolved = await _maybe_ai_infer_stack(
-            server, desc_mgr, project_id, resolved, repo_path
-        )
+    # Always let the AI read the repo's own files when a provider is
+    # configured — not just when detect_project_type() found NOTHING
+    # (the original, narrower trigger). File-sniffing is single-stack by
+    # construction: the instant it sees a package.json it commits to
+    # "nodejs" and never even checks for requirements.txt/manage.py, so a
+    # genuinely polyglot repo (e.g. a Node.js frontend with a Django
+    # backend the dev script also needs to migrate/serve) was declared
+    # "nodejs" and stayed wrong forever — confirmed live: a project's own
+    # `npm run dev` failed with `ModuleNotFoundError: No module named
+    # 'django'` because nothing ever installed it. _maybe_ai_infer_stack
+    # only OVERRIDES `resolved` when the AI returns a confident answer
+    # (see infer_stack_with_ai's prompt: an uncertain read yields `None`
+    # and this falls through unchanged) and is cached per commit SHA, so
+    # this costs at most one extra LLM call per repo state, not per
+    # preview start.
+    resolved = await _maybe_ai_infer_stack(
+        server, desc_mgr, project_id, resolved, repo_path
+    )
 
     if resolved is not None:
         healed_pip = _ensure_pip_break_system_packages(resolved)
@@ -5312,6 +5474,56 @@ async def _wire_human_gated_workflow(server: "MarcusServer") -> None:
                 asyncio.create_task(_refresh_loc())
 
     server.events.subscribe("ticket.status_changed", _track_project_stats)
+
+    async def _relearn_stack_on_done(event: Any) -> None:
+        """Fire _relearn_stack_after_ticket_done whenever a ticket
+        reaches ``done`` (a merge to main) — see that function's
+        docstring for what it does and why. Independent of
+        _track_project_stats above (a separate concern, deliberately
+        not folded into it) but reuses the exact same event-shape
+        parsing and fire-and-forget backgrounding, for the same reason:
+        this handler runs inside BoardWatcher's poll_lock, and an LLM
+        call has real latency that must never stall task assignment for
+        every other agent in the system.
+        """
+        data = event.data
+        ticket_id = str(data.get("ticket_id", ""))
+        new_status = data.get("new_status")
+        task_data = data.get("task") or {}
+        pid_raw = task_data.get("project_id")
+        if not ticket_id or new_status != "done" or pid_raw is None:
+            return
+        try:
+            project_id = int(pid_raw)
+        except (TypeError, ValueError):
+            return
+        project_sync = getattr(server, "_project_sync", None)
+        mapping = (
+            project_sync.get_repo_for_project(project_id)
+            if project_sync is not None
+            else None
+        )
+        repo_path = mapping.get("local_repo_path") if mapping else None
+        if not repo_path:
+            return
+
+        async def _relearn(
+            pid: int = project_id, path: str = str(repo_path), tid: str = ticket_id
+        ) -> None:
+            try:
+                await _relearn_stack_after_ticket_done(server, pid, path, tid)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Post-merge stack re-check errored for project %d "
+                    "(ticket %s): %s",
+                    pid,
+                    tid,
+                    exc,
+                )
+
+        asyncio.create_task(_relearn())
+
+    server.events.subscribe("ticket.status_changed", _relearn_stack_on_done)
 
     from src.core.dev_environment import DevEnvironmentManager
     from src.integrations.gitea_manager import GiteaManager
