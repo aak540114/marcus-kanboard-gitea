@@ -126,3 +126,40 @@ class TestArchitecturalNotesGuidanceContent:
             predictions=None,
         )
         assert "'🏗️ Note:'" in result or '"🏗️ Note:"' in result
+
+    def test_requests_the_structured_sections(self):
+        """A one-line note gives a reviewer nothing to expand into on the
+        Decisions tab's expandable card — the agent must be asked for
+        the labeled sections a human needs to actually evaluate the
+        decision (where it can bite them, what it doesn't cover)."""
+        result = build_tiered_instructions(
+            base_instructions="Build it.",
+            task=_task(),
+            context_data=None,
+            dependency_awareness=None,
+            predictions=None,
+        )
+        for label in (
+            "**Background:**",
+            "**Implementation:**",
+            "**Reasoning:**",
+            "**Affects:**",
+            "**Limitations:**",
+            "**Concerns:**",
+        ):
+            assert label in result
+
+    def test_summary_line_comes_before_the_sections(self):
+        """The Decisions tab shows only the note's first line collapsed —
+        the one-line summary must be written FIRST, not buried after the
+        detailed sections."""
+        result = build_tiered_instructions(
+            base_instructions="Build it.",
+            task=_task(),
+            context_data=None,
+            dependency_awareness=None,
+            predictions=None,
+        )
+        prefix_idx = result.index("🏗️ Note:")
+        background_idx = result.index("**Background:**")
+        assert prefix_idx < background_idx

@@ -6382,6 +6382,13 @@ if __name__ == "__main__":
   .decision-meta {{ font-size: 12px; color: #64748b; }}
   .decision-meta a {{ color: #2563eb; text-decoration: none; }}
   .decision-meta a:hover {{ text-decoration: underline; }}
+  .decision-expand {{ font-size: 12px; color: #2563eb; cursor: pointer; margin-top: 6px;
+                       display: inline-block; user-select: none; }}
+  .decision-expand:hover {{ text-decoration: underline; }}
+  .decision-details {{ display: none; white-space: pre-wrap; font-size: 13px; color: #334155;
+                        margin-top: 8px; padding-top: 8px; border-top: 1px solid #e2e8f0;
+                        line-height: 1.5; }}
+  .decision-details strong {{ color: #1e293b; }}
 </style>
 </head>
 <body>
@@ -6435,6 +6442,25 @@ function escapeHtml(s) {{
   return d.innerHTML;
 }}
 
+// Bold the "**Label:**" markers agents are asked to write (Background,
+// Implementation, Reasoning, Affects, Limitations, Concerns — see
+// build_tiered_instructions Layer 1.25 in src/marcus_mcp/tools/task.py)
+// into <strong> tags. Applied AFTER escapeHtml, on already-escaped text
+// — it only wraps literal text already stripped of markup in a tag, so
+// it can't reintroduce unescaped agent-controlled content.
+function boldLabels(escaped) {{
+  return escaped.replace(/\*\*([^*<>\\n]+):\*\*/g, '<strong>$1:</strong>');
+}}
+
+function toggleDecisionDetails(idx) {{
+  var el = document.getElementById('decision-details-' + idx);
+  var arrow = document.getElementById('decision-arrow-' + idx);
+  if (!el) {{ return; }}
+  var showing = el.style.display === 'block';
+  el.style.display = showing ? 'none' : 'block';
+  if (arrow) {{ arrow.textContent = showing ? '&#9656;' : '&#9662;'; }}
+}}
+
 function loadDecisions() {{
   fetch(decisionsUrl).then(function(r) {{ return r.json(); }}).then(function(data) {{
     decisionsLoaded = true;
@@ -6450,9 +6476,24 @@ function loadDecisions() {{
       var d = decisions[i];
       var when = d.date ? escapeHtml(d.date) : 'unknown time';
       var who = d.author ? escapeHtml(d.author) : 'an agent';
+      // The agent's note is one summary line, a blank line, then the
+      // labeled sections — show only the summary collapsed; everything
+      // after the first line (background/implementation/reasoning/
+      // affects/limitations/concerns) is hidden until the human
+      // explicitly expands it.
+      var note = d.note || '';
+      var newlineAt = note.indexOf('\\n');
+      var summary = newlineAt === -1 ? note : note.substring(0, newlineAt);
+      var details = newlineAt === -1 ? '' : note.substring(newlineAt + 1).trim();
       html += '<div class="decision-card">' +
-        '<p class="decision-note">' + escapeHtml(d.note) + '</p>' +
-        '<p class="decision-meta">Ticket #' + escapeHtml(d.ticket_id) + ' — ' +
+        '<p class="decision-note">' + escapeHtml(summary) + '</p>';
+      if (details) {{
+        html += '<span class="decision-expand" onclick="toggleDecisionDetails(' + i + ')">' +
+          '<span id="decision-arrow-' + i + '">&#9656;</span> Background, reasoning &amp; impact</span>' +
+          '<div class="decision-details" id="decision-details-' + i + '">' +
+          boldLabels(escapeHtml(details)) + '</div>';
+      }}
+      html += '<p class="decision-meta">Ticket #' + escapeHtml(d.ticket_id) + ' — ' +
         escapeHtml(d.ticket_title) + ' &middot; ' + who + ' &middot; ' + when + '</p>' +
         '</div>';
     }}
