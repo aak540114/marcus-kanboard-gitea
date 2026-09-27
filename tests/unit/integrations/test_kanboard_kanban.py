@@ -2681,6 +2681,35 @@ class TestCreateTaskColor:
         first_call = kanban._client.post.await_args_list[0]
         assert first_call.kwargs["json"]["params"]["color_id"] == "yellow"
 
+
+class TestSetTaskColor:
+    """Test set_task_color() — lets the MarcusDevEnv sidebar offer a
+    one-click swatch picker instead of requiring the full "Edit task"
+    form for something this small."""
+
+    @pytest.mark.asyncio
+    async def test_sends_the_new_color(self, kanban):
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(return_value=_rpc_response(True))
+        result = await kanban.set_task_color("10", "deep_orange")
+        assert result is True
+        call = kanban._client.post.await_args_list[0]
+        params = call.kwargs["json"]["params"]
+        assert params["id"] == 10
+        assert params["color_id"] == "deep_orange"
+
+    @pytest.mark.asyncio
+    async def test_returns_false_on_falsy_result(self, kanban):
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(return_value=_rpc_response(False))
+        result = await kanban.set_task_color("10", "blue")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_raises_if_not_connected(self, kanban):
+        with pytest.raises(RuntimeError, match="connect()"):
+            await kanban.set_task_color("10", "blue")
+
     @pytest.mark.asyncio
     async def test_omits_color_id_when_not_given(self, kanban):
         """No color_id in task_data -> the param is left out entirely

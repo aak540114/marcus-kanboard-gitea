@@ -6774,6 +6774,89 @@ setInterval(refresh, 30000);
 </html>"""
             return HTMLResponse(page)
 
+        # Kanboard's fixed card-color palette (ColorModel::$default_colors
+        # in Kanboard core) — used to validate task_color_api's input, and
+        # mirrored in the MarcusDevEnv sidebar's swatch picker so both
+        # sides agree on exactly what's selectable.
+        _TASK_COLOR_IDS = (
+            "yellow", "blue", "green", "purple", "red", "orange", "grey",
+            "brown", "deep_orange", "dark_grey", "pink", "teal", "cyan",
+            "lime", "light_green", "amber",
+        )
+
+        async def task_color_api(request: Request) -> JSONResponse:
+            """PUT /api/task-color — change a ticket's Kanboard card color.
+
+            Body (JSON): ``{"ticket_id": str, "color_id": str}`` —
+            ``color_id`` must be one of Kanboard's fixed palette ids (see
+            :data:`_TASK_COLOR_IDS`). Backs the MarcusDevEnv sidebar's
+            one-click color swatch picker — Kanboard only otherwise
+            offers this via the full "Edit task" form.
+            """
+            def _cors(r: JSONResponse) -> JSONResponse:
+                r.headers["Access-Control-Allow-Origin"] = "*"
+                r.headers["Access-Control-Allow-Methods"] = "PUT, OPTIONS"
+                return r
+
+            if request.method == "OPTIONS":
+                return _cors(JSONResponse({}))
+
+            try:
+                body = await request.json()
+            except Exception:
+                return _cors(JSONResponse({"error": "invalid JSON"}, status_code=400))
+            if not isinstance(body, dict):
+                return _cors(
+                    JSONResponse({"error": "JSON object required"}, status_code=400)
+                )
+
+            ticket_id = body.get("ticket_id")
+            color_id = body.get("color_id")
+            if (
+                not isinstance(ticket_id, str)
+                or not ticket_id
+                or color_id not in _TASK_COLOR_IDS
+            ):
+                return _cors(
+                    JSONResponse(
+                        {
+                            "error": "ticket_id (non-empty str) and color_id "
+                            f"(one of {', '.join(_TASK_COLOR_IDS)}) are required"
+                        },
+                        status_code=400,
+                    )
+                )
+
+            if server.kanban_client is None:
+                return _cors(
+                    JSONResponse(
+                        {"error": "No kanban provider configured"}, status_code=503
+                    )
+                )
+            set_color = getattr(server.kanban_client, "set_task_color", None)
+            if set_color is None:
+                return _cors(
+                    JSONResponse(
+                        {"error": "This kanban provider does not support "
+                                  "changing a task's color"},
+                        status_code=503,
+                    )
+                )
+
+            try:
+                saved = await set_color(ticket_id, color_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Could not set color for ticket %s: %s", ticket_id, exc
+                )
+                return _cors(JSONResponse({"error": str(exc)}, status_code=500))
+
+            return _cors(
+                JSONResponse(
+                    {"saved": bool(saved), "ticket_id": ticket_id, "color_id": color_id}
+                )
+            )
+
         async def gate_setting_api(request: Request) -> JSONResponse:
             """GET/PUT gate-mode settings for a project or ticket.
 
@@ -8427,6 +8510,7 @@ setInterval(refresh, 30000);
                 Route("/api/gate-setting", gate_setting_api, methods=["GET"]),
                 Route("/api/gate-setting/project", gate_setting_api, methods=["PUT"]),
                 Route("/api/gate-setting/ticket", gate_setting_api, methods=["PUT"]),
+                Route("/api/task-color", task_color_api, methods=["PUT", "OPTIONS"]),
                 Route(
                     "/api/decompose-setting",
                     decompose_setting_api,

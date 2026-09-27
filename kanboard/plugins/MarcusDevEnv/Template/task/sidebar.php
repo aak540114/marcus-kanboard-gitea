@@ -69,6 +69,12 @@ $eventsStreamUrl = $marcusUrl . '/api/events/stream'
 
 $gateApiBase = $marcusUrl . '/api/gate-setting';
 
+$taskColorUrl = $marcusUrl . '/api/task-color';
+// Kanboard always populates color_id on a task row; 'yellow' matches
+// ColorModel::getDefaultColor()'s own fallback for the rare case it's
+// somehow empty.
+$currentColorId = $task['color_id'] ?? 'yellow';
+
 // Active-agents feed — used to show the working agent's subscription usage
 // on this ticket. fetch() sends the bearer token via marcusHeaders(); no
 // ?token= needed here (this is a fetch, not a navigation).
@@ -291,6 +297,22 @@ $agentsUrl = $marcusUrl . '/api/active-agents';
     </div>
 </div>
 
+<!-- ── Section 2b: Card color ───────────────────────────────────────── -->
+<style>
+.m-color-swatches { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 4px; }
+.m-color-swatch {
+    width: 22px; height: 22px; border-radius: 50%; padding: 0; cursor: pointer;
+    border: 2px solid transparent;
+}
+.m-color-swatch.selected { border-color: #111827; }
+.m-color-saving { font-size: 10px; color: #9ca3af; margin-top: 4px; display: none; }
+</style>
+<div class="sidebar-collapse">
+    <h2 class="sidebar-title"><?= t('Card Color') ?></h2>
+    <div class="m-color-swatches" id="marcus-color-swatches"></div>
+    <span class="m-color-saving" id="marcus-color-saving">saving&hellip;</span>
+</div>
+
 <!-- ── Section 3: Dependencies ────────────────────────────────────── -->
 <style>
 .marcus-deps { margin: 0; padding: 0; list-style: none; }
@@ -356,6 +378,8 @@ $agentsUrl = $marcusUrl . '/api/active-agents';
     var AGENTS_URL   = <?= json_encode($agentsUrl) ?>;
     var EVENTS_STREAM_URL = <?= json_encode($eventsStreamUrl) ?>;
     var GATE_URL     = <?= json_encode($gateApiBase) ?>;
+    var TASK_COLOR_URL = <?= json_encode($taskColorUrl) ?>;
+    var CURRENT_COLOR_ID = <?= json_encode($currentColorId) ?>;
     var TICKET_ID    = <?= json_encode((string) $ticketId) ?>;
     var PROJECT_ID   = <?= json_encode((int) $projectId) ?>;
     var MARCUS_TOKEN = <?= json_encode($marcusToken) ?>;
@@ -367,6 +391,61 @@ $agentsUrl = $marcusUrl . '/api/active-agents';
         if (MARCUS_TOKEN) { h['Authorization'] = 'Bearer ' + MARCUS_TOKEN; }
         return h;
     }
+
+    /* ── Card color swatch picker ──────────────────────────────────────
+       Kanboard's fixed palette (ColorModel::$default_colors) — mirrored
+       here so the swatches render with the SAME colors Kanboard itself
+       uses to tint the card, without an extra round trip just to fetch
+       them. Clicking a swatch PUTs to /api/task-color (task_color_api in
+       server.py), which is the only new capability this needs — Kanboard
+       otherwise only offers this via the full "Edit task" form. */
+    (function () {
+        var COLORS = {
+            yellow:      '#f5f7c4', blue:        '#dbebff',
+            green:       '#bdf4cb', purple:      '#dfb0ff',
+            red:         '#ffbbbb', orange:      '#ffd7b3',
+            grey:        '#eeeeee', brown:       '#d7ccc8',
+            deep_orange: '#ffab91', dark_grey:   '#cfd8dc',
+            pink:        '#f48fb1', teal:        '#80cbc4',
+            cyan:        '#b2ebf2', lime:        '#e6ee9c',
+            light_green: '#dcedc8', amber:       '#ffe082'
+        };
+        var wrap = document.getElementById('marcus-color-swatches');
+        var savingEl = document.getElementById('marcus-color-saving');
+        if (!wrap || !TICKET_ID) { return; }
+
+        function render(selected) {
+            wrap.innerHTML = '';
+            Object.keys(COLORS).forEach(function (colorId) {
+                var btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'm-color-swatch' + (colorId === selected ? ' selected' : '');
+                btn.style.background = COLORS[colorId];
+                btn.title = colorId.replace(/_/g, ' ');
+                btn.onclick = function () { setTaskColor(colorId); };
+                wrap.appendChild(btn);
+            });
+        }
+
+        window.setTaskColor = function (colorId) {
+            savingEl.style.display = 'inline';
+            fetch(TASK_COLOR_URL, {
+                method: 'PUT',
+                headers: marcusHeaders({ 'Content-Type': 'application/json' }),
+                body: JSON.stringify({ ticket_id: TICKET_ID, color_id: colorId }),
+            })
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    savingEl.style.display = 'none';
+                    render(data.saved ? colorId : CURRENT_COLOR_ID);
+                })
+                .catch(function () {
+                    savingEl.style.display = 'none';
+                });
+        };
+
+        render(CURRENT_COLOR_ID);
+    })();
 
     /* ── Agent subscription usage for THIS ticket ─────────────────────── */
     // Poll active-agents; if an agent is working this ticket and its account

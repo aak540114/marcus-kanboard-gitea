@@ -1029,6 +1029,35 @@ class KanboardKanban(KanbanInterface):
         )
         return bool(result)
 
+    async def set_task_color(self, task_id: str, color_id: str) -> bool:
+        """Change a task's card color.
+
+        Kanboard normally only offers this via the full "Edit task" form
+        (native, but easy to miss for something this small); this lets
+        the MarcusDevEnv sidebar offer a one-click swatch picker instead.
+        The counterpart read is :meth:`get_task_color`.
+
+        Parameters
+        ----------
+        task_id : str
+            Kanboard task ID.
+        color_id : str
+            One of Kanboard's fixed palette ids (``"yellow"``, ``"blue"``,
+            ``"deep_orange"``, ...) — see ``ColorModel::$default_colors``
+            in Kanboard core. An unrecognized id is accepted by the RPC
+            without error; Kanboard just falls back to its configured
+            default color rather than rejecting the update.
+
+        Returns
+        -------
+        bool
+            ``True`` on success.
+        """
+        if self._client is None:
+            raise RuntimeError("Call connect() before set_task_color()")
+        result = await self._rpc("updateTask", id=int(task_id), color_id=color_id)
+        return bool(result)
+
     def _columns_for(self, project_id: int) -> Dict[str, int]:
         """Return the cached column-name→id map for a given project.
 
