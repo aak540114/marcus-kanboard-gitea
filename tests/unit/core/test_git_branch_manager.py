@@ -916,6 +916,33 @@ class TestMergeBaseWithMain:
 
         assert sha is None
 
+    @pytest.mark.asyncio
+    async def test_fetches_base_fresh_and_diffs_against_remote_tracking_ref(self):
+        """Regression: this shared clone's local `main` only advances when
+        ITS OWN merge_to_main() runs — a direct push or a Gitea-UI merge
+        never touches it, so it can be stale. Must fetch `base` and
+        compute the merge-base against `{remote}/{base}`, not the bare
+        local branch name, the same way get_branch_diff/get_branch_commits
+        already do."""
+        mgr = _mgr()
+
+        async def fake_git(*args):
+            if args[0] == "fetch":
+                return (0, "", "")
+            if args[0] == "merge-base":
+                return (0, "abc123\n", "")
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+
+        await mgr.merge_base_with_main("ticket/kanboard/9")
+
+        calls = _calls(mgr._git)
+        assert any(c[0] == "fetch" and "main" in c for c in calls)
+        assert any(
+            c[0] == "merge-base" and "origin/main" in c for c in calls
+        )
+
 
 class TestTicketIdsMergedSince:
     """ticket_ids_merged_since parses Marcus's own merge-commit message
@@ -936,7 +963,7 @@ class TestTicketIdsMergedSince:
         assert ids == ["42", "7"]
         calls = _calls(mgr._git)
         assert any(
-            c[0] == "log" and "--merges" in c and "abc123..main" in c
+            c[0] == "log" and "--merges" in c and "abc123..origin/main" in c
             for c in calls
         )
 
@@ -970,3 +997,16 @@ class TestTicketIdsMergedSince:
         ids = await mgr.ticket_ids_merged_since("abc123")
 
         assert ids == []
+
+    @pytest.mark.asyncio
+    async def test_fetches_base_fresh_before_walking_it(self):
+        """Regression: same staleness risk as merge_base_with_main — this
+        shared clone's local `main` doesn't advance on its own, so the
+        walk must be against a freshly-fetched `{remote}/{base}`."""
+        mgr = _mgr()
+        mgr._git = AsyncMock(return_value=(0, "", ""))
+
+        await mgr.ticket_ids_merged_since("abc123")
+
+        calls = _calls(mgr._git)
+        assert any(c[0] == "fetch" and "main" in c for c in calls)

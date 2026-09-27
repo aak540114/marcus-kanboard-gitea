@@ -1974,6 +1974,9 @@ class HumanGatedWorkflow:
         parent_project_id: Optional[int],
         parent_color: Optional[str],
         subs: List[Dict[str, Any]],
+        *,
+        check_decompose_enabled: bool = True,
+        announce: bool = True,
     ) -> List[str]:
         """Create linked child tickets from an explicit list of specs.
 
@@ -2001,6 +2004,30 @@ class HumanGatedWorkflow:
             Card color to inherit, if known.
         subs : List[Dict[str, Any]]
             Child-ticket specs to create.
+        check_decompose_enabled : bool
+            Re-check the project's "no ticket splitting" toggle
+            (``get_effective_decompose_enabled``) before writing.
+            ``True`` (default) for :meth:`decompose_ticket`, whose whole
+            purpose IS that LLM-driven splitting feature. ``False`` for
+            :meth:`_complete_audit_ticket`: turning off LLM ticket-
+            splitting for a project has nothing to do with the audit
+            feature's own, separately-decided "spin verified findings
+            into their own tickets" behavior — gating it on the same
+            toggle used to silently discard real, independently-verified
+            bugs (reported as "no verified issues found") the instant a
+            human disabled decomposition for any other reason. The
+            project-enabled check just below always still applies to
+            both callers.
+        announce : bool
+            Post the "🧩 Decomposed into sub-tickets" comment and park
+            the parent ``BLOCKED`` when children were created. ``True``
+            (default) for :meth:`decompose_ticket`. ``False`` for
+            :meth:`_complete_audit_ticket`, which posts its own, more
+            accurate "🔍 Audit complete" summary (that wording — nothing
+            was "decomposed", no LLM split anything — and does its own
+            release/BLOCKED transition/column-move itself); without this,
+            an audit that found bugs used to get BOTH comments, one of
+            them actively misleading.
 
         Returns
         -------
@@ -2032,7 +2059,8 @@ class HumanGatedWorkflow:
             )
             return []
         if (
-            parent_project_id is not None
+            check_decompose_enabled
+            and parent_project_id is not None
             and not self._gate.get_effective_decompose_enabled(parent_project_id)
         ):
             logger.debug(
@@ -2212,7 +2240,7 @@ class HumanGatedWorkflow:
                     logger.debug("Could not create subtask entry: %s", exc)
             child_ids.append(child_id)
 
-        if child_ids:
+        if child_ids and announce:
             await self._post_comment(
                 ticket_id,
                 "🧩 **Decomposed into sub-tickets** so agents can work them in "
@@ -2292,8 +2320,23 @@ class HumanGatedWorkflow:
         -------
         Optional[str]
             The created ticket's id, or ``None`` if Kanboard rejected the
-            create (no ``create_task`` support, or an RPC failure).
+            create (no ``create_task`` support, an RPC failure, or the
+            project isn't enabled for Marcus).
         """
+        # Same "don't touch a disabled project" gate every other
+        # Marcus-initiated write in this file re-checks (decompose_ticket,
+        # _create_child_tickets) — without it, clicking the board header's
+        # Audit button (or hitting the HTTP endpoint directly) for a
+        # project a human explicitly turned Marcus off for would still
+        # create a real ticket, tag it, assign it, and move it to Ready.
+        if not self._project_access.is_enabled(project_id):
+            logger.debug(
+                "Refusing to create audit ticket: Kanboard project %d is "
+                "not enabled for Marcus",
+                project_id,
+            )
+            return None
+
         create = getattr(self._kanban, "create_task", None)
         if create is None:
             return None
@@ -2508,7 +2551,21 @@ class HumanGatedWorkflow:
                 for f in findings
             ]
             child_ids = await self._create_child_tickets(
-                ticket_id, record, parent_project_id, parent_color, subs
+                ticket_id,
+                record,
+                parent_project_id,
+                parent_color,
+                subs,
+                # Spinning verified findings into their own tickets is
+                # the audit feature's own, separately-approved behavior —
+                # not the unrelated "disable LLM ticket-splitting" toggle
+                # (see _create_child_tickets' docstring). And this method
+                # posts its own accurate "🔍 Audit complete" summary and
+                # does its own release/BLOCKED transition/column-move
+                # below, so _create_child_tickets must not also post its
+                # decompose-specific comment for this caller.
+                check_decompose_enabled=False,
+                announce=False,
             )
 
         merged_since: List[str] = []

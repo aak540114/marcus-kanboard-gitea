@@ -1332,6 +1332,27 @@ class TestCreateAuditTicket:
         workflow._kanban = MagicMock(spec=[])  # no create_task attribute
         assert await workflow.create_audit_ticket(project_id=9) is None
 
+    @pytest.mark.asyncio
+    async def test_returns_none_when_project_not_enabled_for_marcus(
+        self, workflow, lifecycle, mock_kanban, mock_project_access, tmp_path
+    ):
+        """Regression: every other Marcus-initiated write in this file
+        (decompose_ticket, _create_child_tickets) re-checks the
+        project-enabled gate before writing — create_audit_ticket must
+        too, or clicking the board header's Audit button (or hitting the
+        HTTP endpoint directly) for a project a human explicitly disabled
+        would still create a real ticket on its board."""
+        from src.core.gate_settings import GateSettingManager
+
+        workflow._gate = GateSettingManager(data_dir=tmp_path)
+        mock_project_access.is_enabled = MagicMock(return_value=False)
+        mock_kanban.create_task = AsyncMock(return_value=MagicMock(id="506"))
+
+        ticket_id = await workflow.create_audit_ticket(project_id=9)
+
+        assert ticket_id is None
+        mock_kanban.create_task.assert_not_awaited()
+
 
 class TestIsAuditTicket:
     @pytest.mark.asyncio
@@ -1562,6 +1583,53 @@ class TestCompleteAuditTicket:
         merged_comment = next(b for b in posted if "not covered" in b)
         assert "#55" in merged_comment
         assert "#94" not in merged_comment
+
+    @pytest.mark.asyncio
+    async def test_findings_still_split_when_decompose_disabled_for_project(
+        self, workflow, lifecycle, mock_kanban, mock_branch, tmp_path
+    ):
+        """Regression: turning off LLM ticket-splitting for a project (the
+        unrelated "no ticket splitting" toggle) must NOT silently discard
+        real, independently-verified audit findings — they'd otherwise be
+        reported as "no verified issues found" with zero error signal to
+        the human, hiding actual confirmed bugs."""
+        from src.core.gate_settings import GateSettingManager
+
+        self._audit_ticket(workflow, lifecycle, mock_kanban, mock_branch, "96")
+        mock_kanban.get_comments = AsyncMock(
+            return_value=[{"content": "### 🔍 Audit Finding: X\nY"}]
+        )
+        workflow._gate = GateSettingManager(data_dir=tmp_path)
+        workflow._gate.set_project_decompose_enabled(9, False)
+
+        result = await workflow.signal_ready_for_review("96")
+
+        assert result is True
+        mock_kanban.create_task.assert_awaited_once()
+        posted = [c.args[1] for c in mock_kanban.add_comment.call_args_list]
+        assert any("1 verified finding" in body for body in posted)
+        assert not any("no verified issues found" in body for body in posted)
+
+    @pytest.mark.asyncio
+    async def test_does_not_post_the_decompose_specific_comment(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """Regression: _create_child_tickets (shared with decompose_ticket)
+        used to unconditionally post its own "🧩 Decomposed into
+        sub-tickets ... work them in parallel" comment on TOP of this
+        method's accurate "🔍 Audit complete" summary — wrong terminology
+        (nothing was decomposed, no LLM split anything) left on the ticket
+        alongside the correct one."""
+        self._audit_ticket(workflow, lifecycle, mock_kanban, mock_branch, "97")
+        mock_kanban.get_comments = AsyncMock(
+            return_value=[{"content": "### 🔍 Audit Finding: X\nY"}]
+        )
+
+        await workflow.signal_ready_for_review("97")
+
+        posted = [c.args[1] for c in mock_kanban.add_comment.call_args_list]
+        assert not any("Decomposed into sub-tickets" in body for body in posted)
+        assert any("Audit complete" in body for body in posted)
 
     @pytest.mark.asyncio
     async def test_findings_only_processed_after_verification_passes(

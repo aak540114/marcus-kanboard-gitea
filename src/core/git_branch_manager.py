@@ -806,11 +806,21 @@ class BranchManager:
             determined (branch not found, git error).
         """
         base = base_branch or self.config.main_branch
+        # Fetch base fresh and diff against the REMOTE-tracking ref, not
+        # this shared clone's local branch — same reasoning as
+        # get_branch_diff/get_branch_commits above. This clone's local
+        # `main` only advances when ITS OWN merge_to_main() runs; a
+        # direct push or a merge done through Gitea's own UI never
+        # touches it, so the local ref can be stale by the time an audit
+        # ticket (created independently of any merge) asks for its
+        # branch's fork point.
+        await self._git("fetch", self.config.remote, base)
+        remote_base = f"{self.config.remote}/{base}"
         branch_ref = branch_name
         rc, _, _ = await self._git("fetch", self.config.remote, branch_name)
         if rc == 0:
             branch_ref = "FETCH_HEAD"
-        rc, stdout, _ = await self._git("merge-base", base, branch_ref)
+        rc, stdout, _ = await self._git("merge-base", remote_base, branch_ref)
         if rc != 0:
             return None
         sha = stdout.strip()
@@ -845,8 +855,16 @@ class BranchManager:
             when nothing merged in that range.
         """
         base = base_branch or self.config.main_branch
+        # Fetch fresh and walk the REMOTE-tracking ref, not this shared
+        # clone's local branch — see merge_base_with_main's identical
+        # reasoning. Using the same remote ref both methods' callers
+        # chain together (audit's snapshot, then its merged-since query)
+        # keeps them consistent with each other, not just individually
+        # correct.
+        await self._git("fetch", self.config.remote, base)
+        remote_base = f"{self.config.remote}/{base}"
         rc, stdout, _ = await self._git(
-            "log", "--merges", "--format=%s", f"{since_commit}..{base}"
+            "log", "--merges", "--format=%s", f"{since_commit}..{remote_base}"
         )
         if rc != 0:
             return []
