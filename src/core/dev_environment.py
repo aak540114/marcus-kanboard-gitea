@@ -45,6 +45,7 @@ import json
 import logging
 import os
 import random
+import re
 import shlex
 import socket
 import subprocess
@@ -174,7 +175,17 @@ _FALLBACK_STACKS: Dict[str, Dict[str, Any]] = {
     "nodejs":         {"install": "npm install",
                        "start":   "npm run dev -- --port 3000",
                        "hm":      True,
-                       "apk":     ["nodejs", "npm"]},
+                       # python3/py3-pip: many npm packages (native addons
+                       # built via node-gyp — canvas, sharp, sqlite3,
+                       # bcrypt — and some projects' own dev-server
+                       # scripts) shell out to a "python" on PATH even
+                       # though the project is pure Node.js. Missing it
+                       # doesn't fail npm install (native builds are often
+                       # skipped/cached), it fails LATER at `npm run dev`
+                       # with a message pointing straight at this gap
+                       # (confirmed live: "no Python interpreter found on
+                       # PATH ... apk add --no-cache python3 py3-pip").
+                       "apk":     ["nodejs", "npm", "python3", "py3-pip"]},
     "python-fastapi": {"install": "pip install --break-system-packages --no-cache-dir -r requirements.txt",
                        "start":   "uvicorn main:app --host 0.0.0.0 --port 3000",
                        "hm":      False,
@@ -286,6 +297,28 @@ def detect_project_type(repo_path: str) -> str:
 _NODEJS_SCRIPT_PRIORITY = ("dev", "start", "serve", "develop")
 
 
+def _read_nodejs_scripts(repo_path: str) -> Dict[str, Any]:
+    """Return package.json's ``"scripts"`` object, or ``{}`` if the file
+    is missing, unreadable, not valid JSON, or has no such object."""
+    package_json = Path(repo_path) / "package.json"
+    try:
+        data = json.loads(package_json.read_text())
+    except (OSError, ValueError):
+        return {}
+    scripts = data.get("scripts")
+    return scripts if isinstance(scripts, dict) else {}
+
+
+def _find_nodejs_script(repo_path: str) -> Optional[str]:
+    """Return the first :data:`_NODEJS_SCRIPT_PRIORITY` name defined in
+    *repo_path*'s package.json, or ``None`` if none of them are."""
+    scripts = _read_nodejs_scripts(repo_path)
+    for name in _NODEJS_SCRIPT_PRIORITY:
+        if name in scripts:
+            return name
+    return None
+
+
 def _resolve_nodejs_dev_command(repo_path: str) -> str:
     """Pick the npm script to run as a Node.js project's dev server.
 
@@ -315,21 +348,66 @@ def _resolve_nodejs_dev_command(repo_path: str) -> str:
         The ``npm run <script> -- --port {port}`` command to use as this
         stack's ``start`` command.
     """
-    default: str = _FALLBACK_STACKS["nodejs"]["start"]
-    package_json = Path(repo_path) / "package.json"
-    try:
-        data = json.loads(package_json.read_text())
-    except (OSError, ValueError):
+    name = _find_nodejs_script(repo_path)
+    if name is None:
+        default: str = _FALLBACK_STACKS["nodejs"]["start"]
         return default
+    return f"npm run {name} -- --port {_APP_PORT}"
 
-    scripts = data.get("scripts")
-    if not isinstance(scripts, dict):
-        return default
 
-    for name in _NODEJS_SCRIPT_PRIORITY:
-        if name in scripts:
-            return f"npm run {name} -- --port {_APP_PORT}"
-    return default
+#: Node.js dev-server invocations known to implement their own file
+#: watching / hot-module-reload, matched against the actual command TEXT
+#: inside package.json's "scripts" entry (not just the script's NAME) —
+#: e.g. ``"dev": "vite"`` matches, but ``"dev": "sh bin/dev.sh"`` does
+#: not, even though both are reached via the exact same "npm run dev".
+_NODEJS_HM_TOOL_RE = re.compile(
+    r"\b(vite|webpack(?:-dev-server|\s+serve)|next\s+dev|nodemon|"
+    r"ts-node-dev|parcel)\b",
+    re.IGNORECASE,
+)
+
+
+def _nodejs_script_has_own_hot_reload(repo_path: str) -> bool:
+    """True if the Node.js dev script Marcus resolved for *repo_path*
+    runs a known hot-reload-capable tool (Vite, webpack-dev-server,
+    Next.js dev, nodemon, ts-node-dev, Parcel).
+
+    Every ``nodejs``-stack dev environment used to assume this
+    unconditionally (``_FALLBACK_STACKS["nodejs"]["hm"] = True`` /
+    ``ProjectStack.use_hm_reload = (language == "nodejs")``), which skips
+    wrapping the dev command in the inotify restart-loop that ``refresh()``
+    relies on to make a ``git reset --hard`` (e.g. from a Gitea push
+    webhook after a ticket merges to main) actually show up in the
+    running preview. That's fine for Vite/webpack/Next — they watch
+    ``/app`` themselves — but a project whose "dev" script shells out to
+    its OWN custom launcher (confirmed live: a project's `npm run dev`
+    ran `sh bin/dev.sh`) has no such watcher: the container's files
+    change on disk but the already-running process never notices, so the
+    preview silently keeps serving the pre-merge code forever.
+
+    Defaults to ``False`` (fall back to the restart loop) whenever this
+    can't be positively confirmed — package.json missing/unreadable, or
+    the resolved script not matching a known tool. A false negative here
+    only costs a slower full-process restart on file change instead of
+    instant in-process HMR; a false positive would silently serve stale
+    code forever, which is the actual failure mode this exists to close.
+
+    Parameters
+    ----------
+    repo_path : str
+        Root of the git repository to inspect.
+
+    Returns
+    -------
+    bool
+        ``True`` only when the resolved script's command text matches a
+        known HMR-capable tool.
+    """
+    name = _find_nodejs_script(repo_path) or "dev"
+    script_value = _read_nodejs_scripts(repo_path).get(name)
+    if not isinstance(script_value, str):
+        return False
+    return bool(_NODEJS_HM_TOOL_RE.search(script_value))
 
 
 def _resolve_host_repo_path(repo_path: str) -> str:
@@ -1559,6 +1637,12 @@ class DevEnvironmentManager:
         # when it matches leaves a real override untouched.
         if start_cmd == _FALLBACK_STACKS["nodejs"]["start"]:
             start_cmd = _resolve_nodejs_dev_command(repo_path)
+            # Refine the blanket "Node.js always self-reloads" assumption
+            # against what this project's OWN script actually runs — see
+            # _nodejs_script_has_own_hot_reload's docstring for the live
+            # failure this closes (a custom launcher script with no
+            # watcher of its own, silently never picking up a merge).
+            use_hm_reload = _nodejs_script_has_own_hot_reload(repo_path)
 
         # Remember the resolved dev-server command so the "Preview could not
         # start" page can show exactly what Marcus inferred from the Tech

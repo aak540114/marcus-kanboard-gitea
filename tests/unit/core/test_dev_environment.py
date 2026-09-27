@@ -3,6 +3,7 @@ Unit tests for src/core/dev_environment.py
 """
 
 import asyncio
+import json
 import re
 import socket
 import subprocess
@@ -17,6 +18,7 @@ from src.core.dev_environment import (
     DevEnvironmentManager,
     PortAllocator,
     STACK_CONFIGS,
+    _nodejs_script_has_own_hot_reload,
     _resolve_nodejs_dev_command,
     detect_project_type,
 )
@@ -191,6 +193,25 @@ class TestDevEnvironmentManager:
 # ---------------------------------------------------------------------------
 # detect_project_type
 # ---------------------------------------------------------------------------
+
+
+class TestFallbackStackApkPackages:
+    """STACK_CONFIGS["nodejs"]["apk"] — the packages `apk add`ed into the
+    bare-Alpine dev-env container when auto-detection (no project
+    description) picks the Node.js fallback stack."""
+
+    def test_nodejs_includes_python3(self):
+        """Regression: node-gyp (native npm addons) and some projects' own
+        dev-server scripts shell out to a "python" on PATH even for a
+        pure Node.js project — confirmed live via a project whose
+        `npm run dev` failed with "no Python interpreter found on PATH"
+        on a container that only had nodejs+npm installed."""
+        assert "python3" in STACK_CONFIGS["nodejs"]["apk"]
+        assert "py3-pip" in STACK_CONFIGS["nodejs"]["apk"]
+
+    def test_nodejs_still_includes_node_and_npm(self):
+        assert "nodejs" in STACK_CONFIGS["nodejs"]["apk"]
+        assert "npm" in STACK_CONFIGS["nodejs"]["apk"]
 
 
 class TestDetectProjectType:
@@ -390,6 +411,65 @@ class TestResolveNodejsDevCommand:
         assert _resolve_nodejs_dev_command(str(tmp_path)) == (
             "npm run dev -- --port 3000"
         )
+
+
+class TestNodejsScriptHasOwnHotReload:
+    """Whether the resolved Node.js dev script self-reloads on file
+    change — decides whether the container needs the inotifywait restart
+    loop wrapped around it (see _nodejs_script_has_own_hot_reload)."""
+
+    @pytest.mark.parametrize(
+        "script",
+        [
+            "vite",
+            "vite --host 0.0.0.0",
+            "webpack-dev-server",
+            "webpack serve",
+            "next dev",
+            "nodemon server.js",
+            "ts-node-dev src/index.ts",
+            "parcel index.html",
+        ],
+    )
+    def test_true_for_known_hot_reload_tools(self, tmp_path: Path, script) -> None:
+        (tmp_path / "package.json").write_text(
+            json.dumps({"scripts": {"dev": script}})
+        )
+        assert _nodejs_script_has_own_hot_reload(str(tmp_path)) is True
+
+    def test_false_for_custom_launcher_script(self, tmp_path: Path) -> None:
+        """Regression: a project's own launcher script (confirmed live:
+        `sh bin/dev.sh`) has no watcher of its own — must not be assumed
+        to self-reload just because it's a Node.js project."""
+        (tmp_path / "package.json").write_text(
+            json.dumps({"scripts": {"dev": "sh bin/dev.sh --port 3000"}})
+        )
+        assert _nodejs_script_has_own_hot_reload(str(tmp_path)) is False
+
+    def test_false_for_plain_node_invocation(self, tmp_path: Path) -> None:
+        (tmp_path / "package.json").write_text(
+            json.dumps({"scripts": {"start": "node server.js"}})
+        )
+        assert _nodejs_script_has_own_hot_reload(str(tmp_path)) is False
+
+    def test_false_when_package_json_missing(self, tmp_path: Path) -> None:
+        assert _nodejs_script_has_own_hot_reload(str(tmp_path)) is False
+
+    def test_false_on_invalid_json(self, tmp_path: Path) -> None:
+        (tmp_path / "package.json").write_text("{not valid json")
+        assert _nodejs_script_has_own_hot_reload(str(tmp_path)) is False
+
+    def test_checks_the_resolved_scripts_own_value_not_just_its_name(
+        self, tmp_path: Path
+    ) -> None:
+        """"dev" resolves first per _NODEJS_SCRIPT_PRIORITY — a
+        hot-reload tool sitting under "start" instead must not count."""
+        (tmp_path / "package.json").write_text(
+            json.dumps(
+                {"scripts": {"dev": "sh bin/dev.sh", "start": "vite"}}
+            )
+        )
+        assert _nodejs_script_has_own_hot_reload(str(tmp_path)) is False
 
     def test_defaults_to_dev_when_scripts_key_missing(
         self, tmp_path: Path
@@ -761,6 +841,42 @@ class TestStartDockerRefinesNodejsCommand:
             await manager.start("T-21", "kanboard", "ticket/kanboard/t-21")
         cmd = mock_run.call_args[0][0]
         assert any("npm run dev -- --port 3000" in str(c) for c in cmd)
+
+    @pytest.mark.asyncio
+    async def test_vite_script_is_not_wrapped_in_restart_loop(
+        self, manager, tmp_path
+    ):
+        """Vite watches /app itself — no need for (and no regression
+        introduced by) the inotifywait restart loop."""
+        (tmp_path / "package.json").write_text('{"scripts": {"dev": "vite"}}')
+        with patch(
+            "subprocess.run", return_value=MagicMock(returncode=0, stderr="")
+        ) as mock_run:
+            await manager.start("T-22", "kanboard", "ticket/kanboard/t-22")
+        cmd = mock_run.call_args[0][0]
+        assert not any("inotifywait" in str(c) for c in cmd)
+
+    @pytest.mark.asyncio
+    async def test_custom_launcher_script_is_wrapped_in_restart_loop(
+        self, manager, tmp_path
+    ):
+        """Regression: a project whose "dev" script shells out to its own
+        custom launcher (confirmed live: `npm run dev` running
+        `sh bin/dev.sh`) has no file watcher of its own — Marcus used to
+        assume every Node.js dev command self-reloads and never wrapped
+        it in the restart loop, so a `git reset --hard` from refresh()
+        (e.g. after a ticket merges to main) silently never showed up in
+        the running preview. It must fall back to the inotifywait
+        restart loop instead."""
+        (tmp_path / "package.json").write_text(
+            '{"scripts": {"dev": "sh bin/dev.sh"}}'
+        )
+        with patch(
+            "subprocess.run", return_value=MagicMock(returncode=0, stderr="")
+        ) as mock_run:
+            await manager.start("T-23", "kanboard", "ticket/kanboard/t-23")
+        cmd = mock_run.call_args[0][0]
+        assert any("inotifywait" in str(c) for c in cmd)
 
 
 # ---------------------------------------------------------------------------

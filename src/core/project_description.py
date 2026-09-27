@@ -131,7 +131,10 @@ class ProjectStack:
         if lang == "python":
             base = ["python3", "python3-pip", "python3-venv"]
         elif lang in ("nodejs", "node", "javascript", "typescript"):
-            base = ["nodejs", "npm"]
+            # python3: node-gyp (native npm addons) and some projects' own
+            # dev-server scripts shell out to a "python" on PATH even
+            # though the project is pure Node.js — see apk_packages below.
+            base = ["nodejs", "npm", "python3"]
         elif lang == "go":
             base = ["golang"]
         elif lang == "rust":
@@ -160,7 +163,15 @@ class ProjectStack:
         if lang == "python":
             base = ["python3", "py3-pip"]
         elif lang in ("nodejs", "node", "javascript", "typescript"):
-            base = ["nodejs", "npm"]
+            # python3/py3-pip: many npm packages (native addons built via
+            # node-gyp — canvas, sharp, sqlite3, bcrypt — and some
+            # projects' own dev-server scripts) shell out to a "python" on
+            # PATH even though the project is pure Node.js. Missing it
+            # doesn't fail npm install, it fails LATER at the dev-server
+            # start with a message pointing straight at this gap
+            # (confirmed live: "no Python interpreter found on PATH ...
+            # apk add --no-cache python3 py3-pip").
+            base = ["nodejs", "npm", "python3", "py3-pip"]
         elif lang == "go":
             base = ["go"]
         elif lang == "rust":
