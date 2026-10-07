@@ -223,6 +223,63 @@ class TestMemory:
         assert "agent_1" not in memory.working["active_tasks"]
 
     @pytest.mark.asyncio
+    async def test_concurrent_completion_reports_do_not_double_record(
+        self, memory, sample_task
+    ):
+        """Regression: the active-task entry was only removed at the END
+        of record_task_completion, after several `await` points
+        (_update_agent_profile, _learn_task_patterns, persistence.store).
+        Two concurrent completion reports for the same agent/task (a
+        duplicate report, or a race between a normal report and a
+        retry/recovery path) both passed the "still active" check and
+        both ran the full body — double-incrementing the agent's
+        profile stats and persisting two separate outcome records. The
+        active-task entry must be claimed (removed) before any of that
+        async work runs, so a second concurrent call sees it already
+        gone and is rejected."""
+        await memory.record_task_start("agent_1", sample_task)
+
+        release = asyncio.Event()
+        real_update_profile = memory._update_agent_profile
+
+        async def slow_update_profile(*args, **kwargs):
+            await release.wait()
+            return await real_update_profile(*args, **kwargs)
+
+        memory._update_agent_profile = slow_update_profile
+
+        first = asyncio.ensure_future(
+            memory.record_task_completion("agent_1", "task_1", True, 1.0)
+        )
+        await asyncio.sleep(0)  # let the first call reach and block inside
+        # _update_agent_profile — if the active-task entry isn't removed
+        # until the END of the function (the bug), it's still present now.
+
+        second = await asyncio.wait_for(
+            memory.record_task_completion("agent_1", "task_1", True, 1.0),
+            # A regression here doesn't just double-record — the second
+            # call would ALSO proceed into the (patched, still-blocked)
+            # _update_agent_profile and hang right alongside the first
+            # one, since nothing has set `release` yet. Bound it so a
+            # reintroduced bug fails fast with a clear timeout instead
+            # of hanging the test run.
+            timeout=2.0,
+        )
+        assert second is None, (
+            "a second completion report for the same agent/task while the "
+            "first is still in flight must be rejected, not also recorded"
+        )
+
+        release.set()
+        first_result = await first
+        assert first_result is not None
+
+        profile = memory.semantic["agent_profiles"]["agent_1"]
+        assert profile.total_tasks == 1
+        assert profile.successful_tasks == 1
+        assert len(memory.episodic["outcomes"]) == 1
+
+    @pytest.mark.asyncio
     async def test_agent_profile_learning(self, memory, sample_task):
         """Test that agent profiles learn from outcomes"""
         # Complete multiple tasks

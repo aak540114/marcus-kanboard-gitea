@@ -711,7 +711,7 @@ class KanbanClient:
 
         # If no lists were found or lists_result was empty, return empty list
 
-    async def assign_task(self, task_id: str, agent_id: str) -> None:
+    async def assign_task(self, task_id: str, agent_id: str) -> bool:
         """
         Assign a task to an agent.
 
@@ -725,6 +725,18 @@ class KanbanClient:
             ID of the task to assign
         agent_id : str
             ID of the agent receiving the assignment
+
+        Returns
+        -------
+        bool
+            ``True`` if the task was actually moved to an "In Progress"
+            list. ``False`` if no such list could be found on the board
+            (or the board's list listing came back in an unexpected
+            shape) — the assignment comment was still posted, but the
+            task was NOT moved, so callers have a way to notice instead
+            of this silently no-opping with no signal at all (every
+            sibling provider's assign_task returns bool for exactly this
+            reason — see KanbanInterface.assign_task's contract).
 
         Examples
         --------
@@ -791,6 +803,23 @@ class KanbanClient:
                                 "listId": in_progress_list["id"],
                             },
                         )
+                        return True
+
+                    logger.warning(
+                        "assign_task(%s): no 'In Progress' list found on "
+                        "board %s — comment posted but task was NOT moved",
+                        task_id,
+                        self.board_id,
+                    )
+                    return False
+
+                logger.warning(
+                    "assign_task(%s): could not read board %s's list of "
+                    "lists — comment posted but task was NOT moved",
+                    task_id,
+                    self.board_id,
+                )
+                return False
 
     async def get_board_summary(self) -> Dict[str, Any]:
         """

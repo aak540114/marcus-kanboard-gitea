@@ -90,6 +90,30 @@ class TestACParser:
         assert "<!-- MARCUS_AC_START -->" not in result
         assert "<!-- MARCUS_AC_END -->" not in result
 
+    def test_embed_does_not_crash_on_backslash_digit_in_ac_markdown(self):
+        """Regression (confirmed finding #19): embed() replaces an
+        existing AC block via `_AC_BLOCK_RE.sub(block, description)`. A
+        plain string passed to `re.sub` is a REGEX REPLACEMENT TEMPLATE,
+        not literal text — a backslash followed by a digit (an
+        LLM-generated numbered step like "Step 1\\2 commands", or a
+        Windows path pasted into the AC) is read as a backreference to a
+        capture group _AC_BLOCK_RE doesn't have, raising
+        `re.error: invalid group reference` and crashing the embed."""
+        ac_markdown = r"- [ ] Run step 1\2 before deploying"
+        result = ACParser.embed(_SAMPLE_DESC, ac_markdown)
+        assert "Run step 1\\2 before deploying" in result
+        assert "Deploy the service" not in result
+
+    def test_embed_does_not_crash_on_backslash_digit_when_inserting_fresh(self):
+        """Same hazard on the no-existing-block insert path: embed()
+        formats the new block itself via an f-string (no re.sub
+        involved there), but the regression test above covers the
+        actually-vulnerable replace path — this confirms the insert
+        path was never at risk so the fix doesn't need to touch it."""
+        ac_markdown = r"- [ ] Run step 1\2 before deploying"
+        result = ACParser.embed(_NO_AC_DESC, ac_markdown)
+        assert "Run step 1\\2 before deploying" in result
+
     def test_extract_still_reads_a_legacy_html_comment_block(self):
         """Backward compatibility: a ticket whose AC was embedded before
         the switch to reference-link sentinels must keep parsing

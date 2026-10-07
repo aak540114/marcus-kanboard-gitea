@@ -1098,13 +1098,37 @@ class HumanGatedWorkflow:
         # READY+assigned+unclaimed, i.e. still "available", and the next slot
         # to free re-picks it, dragging the card back out of Done and posting
         # a "Started" comment (AI resurrects a ticket the human closed).
-        if record.state in (TicketState.READY, TicketState.TODO):
+        #
+        # BLOCKED has the same "no branch to merge" problem for ONE of its
+        # two reachable paths: _block_on_dependencies parks a ticket BLOCKED
+        # BEFORE it's ever claimed or branched (the preemptive dependency
+        # gate in _start_ai_work runs before claim_ticket) — closing one of
+        # THOSE has nothing to merge either. signal_blocked's BLOCKED is the
+        # opposite: it only ever fires from IN_PROGRESS (see its own
+        # precondition), so a real branch with real commits exists there,
+        # and closing it SHOULD go through the merge path below. The two
+        # cases share the same TicketState.BLOCKED value, so the only
+        # reliable way to tell them apart is whether this record's history
+        # shows it ever actually reached IN_PROGRESS. Without this check,
+        # a dependency-blocked ticket's close always fell through to
+        # _merge_ticket_to_main, which always failed (nothing to merge) and
+        # silently reverted the human's close action back to READY with a
+        # "merge conflict, needs rebase" comment that doesn't apply at all.
+        never_started = record.state == TicketState.BLOCKED and not any(
+            h.get("to") == TicketState.IN_PROGRESS.value for h in record.history
+        )
+        if record.state in (TicketState.READY, TicketState.TODO) or never_started:
             try:
                 self._lifecycle.human_transition(
                     ticket_id,
                     self._provider,
                     TicketState.DONE,
-                    reason="Human closed ticket before AI work began",
+                    reason=(
+                        "Human closed ticket blocked on dependencies before "
+                        "AI work began"
+                        if never_started
+                        else "Human closed ticket before AI work began"
+                    ),
                 )
             except (InvalidTransitionError, KeyError):
                 pass
@@ -1202,8 +1226,23 @@ class HumanGatedWorkflow:
             except KeyError:
                 pass
 
-            # Stop dev env if running.
-            await self._dev_env.stop(ticket_id, self._provider)
+            # Stop dev env if running. Best-effort: a Docker/subprocess
+            # failure here must not abort completion — the ticket is
+            # already DONE+merged and its slot already released above;
+            # an unhandled exception here would skip clearing the
+            # merge-conflict flag, posting the "Merged" comment,
+            # unblocking dependents, and picking up the next ticket,
+            # leaving a freed slot sitting idle. Mirrors the same
+            # try/except already used for every other _dev_env.stop call
+            # in this file (_on_ticket_deleted, _purge_deleted_tickets).
+            try:
+                await self._dev_env.stop(ticket_id, self._provider)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Could not stop dev environment for merged ticket %s: %s",
+                    ticket_id,
+                    exc,
+                )
 
             # Clear any merge-conflict flag from a previous failed attempt
             # on this same ticket — it's resolved now.
@@ -4042,6 +4081,16 @@ class HumanGatedWorkflow:
         ]
         for record in matches:
             blocked_id = record.ticket_id
+            # Project-access gate: _start_ai_work already re-checks this
+            # internally for the assigned branch below (it must — this
+            # dependent ticket can belong to a DIFFERENT, possibly
+            # disabled, project than the one that just closed), but the
+            # unassigned branch posts a board comment directly with no
+            # equivalent check — "seeing a project must never turn into
+            # touching it" (see _may_touch's own docstring) applies to a
+            # comment exactly as much as a claim.
+            if not await self._may_touch(blocked_id):
+                continue
             logger.info(
                 "Ticket %s completed — unblocking dependent ticket %s "
                 "(was blocked by: %s)",
@@ -6461,7 +6510,17 @@ class HumanGatedWorkflow:
         except KeyError:
             pass
 
-        await self._dev_env.stop(ticket_id, self._provider)
+        # Best-effort: a Docker/subprocess failure here must not abort
+        # completion — see the identical reasoning and try/except in the
+        # human-gate merge-success path (_merge_ticket_to_main).
+        try:
+            await self._dev_env.stop(ticket_id, self._provider)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not stop dev environment for auto-merged ticket %s: %s",
+                ticket_id,
+                exc,
+            )
 
         # Clear any merge-conflict flag from a previous failed attempt on
         # this same ticket — it's resolved now. Mirrors the human-gate

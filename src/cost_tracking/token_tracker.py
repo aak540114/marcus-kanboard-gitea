@@ -11,7 +11,46 @@ import sys
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
+
+#: Approximate (input, output) USD cost per 1,000 tokens, keyed by a
+#: lowercase substring matched against the ``model`` string passed to
+#: :meth:`TokenTracker.track_tokens`. Checked in order — more specific
+#: prefixes (e.g. "gpt-4o", "claude-3-5-sonnet") must come before the
+#: shorter prefixes they contain (e.g. "gpt-4", "claude-3-sonnet") so a
+#: newer model doesn't silently match the wrong, older row.
+#:
+#: These are a best-effort estimate for this tracker's own lightweight,
+#: real-time view — e.g. a 5,000-token Haiku call costs roughly
+#: 5 * $0.00025 ≈ $0.00125, while the same 5,000 tokens on Opus cost
+#: roughly 5 * $0.015 ≈ $0.075, a ~60x difference the old flat rate
+#: could never reflect. The authoritative, versioned source of truth
+#: for real billing is ``model_prices`` in src/cost_tracking/cost_store.py.
+_MODEL_RATES_PER_1K: List[Tuple[str, Tuple[float, float]]] = [
+    ("gpt-4o", (0.0025, 0.01)),
+    ("gpt-4-turbo", (0.01, 0.03)),
+    ("gpt-4", (0.03, 0.06)),
+    ("gpt-3.5", (0.0005, 0.0015)),
+    ("claude-3-5-sonnet", (0.003, 0.015)),
+    ("claude-3-5-haiku", (0.0008, 0.004)),
+    ("claude-3-opus", (0.015, 0.075)),
+    ("claude-3-sonnet", (0.003, 0.015)),
+    ("claude-3-haiku", (0.00025, 0.00125)),
+]
+
+
+def _rate_for_model(model: str, default_rate: float) -> Tuple[float, float]:
+    """Return the (input, output) per-1K-token rate for *model*.
+
+    Falls back to ``(default_rate, default_rate)`` for an unrecognized
+    model string, matching the previous flat-rate behavior exactly for
+    anything not in :data:`_MODEL_RATES_PER_1K`.
+    """
+    lowered = model.lower()
+    for prefix, rates in _MODEL_RATES_PER_1K:
+        if prefix in lowered:
+            return rates
+    return (default_rate, default_rate)
 
 
 class TokenTracker:
@@ -119,7 +158,8 @@ class TokenTracker:
 
         # Update totals
         self.project_tokens[project_id] += total_tokens
-        cost = (total_tokens / 1000) * self.cost_per_1k_tokens
+        input_rate, output_rate = _rate_for_model(model, self.cost_per_1k_tokens)
+        cost = (input_tokens / 1000) * input_rate + (output_tokens / 1000) * output_rate
         self.project_costs[project_id] += cost
 
         # Track for rate calculation

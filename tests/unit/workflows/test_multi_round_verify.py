@@ -383,6 +383,36 @@ class TestFinalRoundPassComment:
         assert "Merging now" in round_comments[0]
 
 
+class TestDevEnvStopFailureDoesNotAbortAutoMerge:
+    """Regression: the AI-gate auto-merge path's _dev_env.stop() call had
+    no try/except around it, unlike the human-gate merge-success path's
+    equivalent call and every OTHER _dev_env.stop call in this file. A
+    Docker/subprocess failure there aborted completion right after the
+    ticket was already marked DONE+merged+released, skipping the
+    merge-conflict-flag clear and leaving the freed slot's
+    _pickup_next_ticket() call never reached."""
+
+    @pytest.mark.asyncio
+    async def test_dev_env_stop_failure_does_not_abort_completion(self, workflow):
+        workflow._gate.set_project_gate(1, "ai")
+        workflow._dev_env = MagicMock()
+        workflow._dev_env.stop = AsyncMock(
+            side_effect=RuntimeError("docker daemon unreachable")
+        )
+
+        record = _make_record()
+        workflow._lifecycle.get_or_create("42", "kanboard")
+        workflow._lifecycle._records[("42", "kanboard")] = record
+
+        result = await workflow._autocomplete_ticket("42", record)  # must not raise
+
+        assert result is True
+        assert workflow._lifecycle.get("42", "kanboard").state == TicketState.DONE
+        workflow._kanban.set_merge_conflict_flag.assert_awaited_once_with(
+            "42", present=False
+        )
+
+
 class TestMergeFailureClearsCounter:
     """A failed merge leaves no stale round counter behind."""
 

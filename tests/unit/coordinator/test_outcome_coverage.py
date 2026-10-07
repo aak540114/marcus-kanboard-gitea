@@ -27,6 +27,7 @@ from src.marcus_mcp.coordinator.outcome_coverage import (
     OutcomeCoverageResult,
     _build_recoverage_description,
     _enrich_acceptance_criteria_with_signals,
+    _gap_contract_round_trip,
     _normalize_gap_task_name,
     apply_outcome_coverage,
     compute_coverage,
@@ -1709,3 +1710,55 @@ class TestEnrichAcceptanceCriteriaWithSignals:
 # longer materializes real ``gap_fill_<uuid>`` tasks. Stub→anchor
 # routing for criterion + signal placement is tested directly in
 # ``tests/unit/coordinator/test_gap_fill_criteria_rollup.py``.
+
+
+class TestGapContractRoundTrip:
+    """Regression (confirmed finding #11): the description marker
+    ``_gap_contract_round_trip`` writes must actually be parseable by
+    ``_parse_contract_metadata`` in ``marcus_mcp/tools/task.py`` — that
+    is the whole point of embedding it. The two must agree on format."""
+
+    def test_marker_round_trips_through_the_real_parser(self):
+        """The marker this function writes into a task's description
+        must be read back correctly by the actual consumer,
+        ``_parse_contract_metadata``, not just by eye."""
+        from src.marcus_mcp.tools.task import _parse_contract_metadata
+
+        gap = {
+            "responsibility": "owns the payment webhook contract",
+            "contract_file": "contracts/payments.yaml",
+        }
+        description, source_context = _gap_contract_round_trip(gap, "Do the thing")
+
+        task = _task("gap_fill_1", "Do the thing", description)
+        task.source_context = source_context
+        parsed = _parse_contract_metadata(task)
+
+        assert parsed["responsibility"] == "owns the payment webhook contract"
+        assert parsed["contract_file"] == "contracts/payments.yaml"
+
+    def test_marker_round_trips_when_source_context_is_dropped(self):
+        """Simulates a provider (e.g. Planka) that drops source_context
+        entirely on its round-trip — the description marker must still
+        carry the metadata as the last-resort fallback."""
+        from src.marcus_mcp.tools.task import _parse_contract_metadata
+
+        gap = {
+            "responsibility": "owns the payment webhook contract",
+            "contract_file": "contracts/payments.yaml",
+        }
+        description, _source_context = _gap_contract_round_trip(gap, "Do the thing")
+
+        task = _task("gap_fill_1", "Do the thing", description)
+        task.source_context = {}  # provider dropped it; description survives
+        parsed = _parse_contract_metadata(task)
+
+        assert parsed["responsibility"] == "owns the payment webhook contract"
+        assert parsed["contract_file"] == "contracts/payments.yaml"
+
+    def test_no_responsibility_returns_description_and_context_unchanged(self):
+        description, source_context = _gap_contract_round_trip(
+            {"name": "unrelated gap"}, "Do the thing"
+        )
+        assert description == "Do the thing"
+        assert source_context == {}

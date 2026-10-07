@@ -441,6 +441,30 @@ class TestGetAllTasks:
         assert "MARC" in body.get("jql", "")
 
     @pytest.mark.asyncio
+    async def test_project_key_is_quoted_and_escaped_as_a_jql_literal(
+        self, config
+    ):
+        """Regression: jira_project_key was interpolated into the JQL
+        string with no quoting or escaping at all — a key containing a
+        space, a JQL keyword, or (in a deployment where this value is
+        less trusted, e.g. populated per-tenant) an attacker-controlled
+        quote could break out of the intended `project = <key>` clause
+        and inject arbitrary JQL. It must be wrapped as a quoted JQL
+        string literal with any embedded quote escaped."""
+        config["jira_project_key"] = 'MARC" OR project = "SECRET'
+        k = JiraKanban(config)
+        k._client = AsyncMock()
+        k._client.post = AsyncMock(return_value=self._mock_search_response([]))
+
+        await k.get_all_tasks()
+
+        body = k._client.post.call_args[1].get("json", {})
+        jql = body.get("jql", "")
+        assert jql == (
+            'project = "MARC\\" OR project = \\"SECRET" ORDER BY created DESC'
+        )
+
+    @pytest.mark.asyncio
     async def test_no_project_key_omits_project_filter(self, config):
         """When no project_key is set, JQL falls back to ORDER BY created DESC."""
         config.pop("jira_project_key", None)

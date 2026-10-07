@@ -2366,6 +2366,63 @@ class TestSetMergeConflictFlag:
 
 
 # ---------------------------------------------------------------------------
+# upload_attachment tests
+# ---------------------------------------------------------------------------
+
+
+class TestUploadAttachment:
+    """Regression (confirmed finding #29): upload_attachment called
+    createTaskFile with project_id=self._project_id unconditionally —
+    but a ticket can belong to any project, not just this client's
+    configured default (the same pattern already handled correctly by
+    get_task_by_id, set_merge_conflict_flag, etc., which all re-fetch
+    the task and use ITS OWN project_id). A task from a different
+    project got the wrong project_id sent to createTaskFile."""
+
+    @pytest.mark.asyncio
+    async def test_uses_the_tasks_own_project_id_not_the_configured_default(
+        self, kanban
+    ):
+        """kanban's configured project_id is 1 (see the `config`
+        fixture); the task itself belongs to project 7 — createTaskFile
+        must be called with 7, not 1."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response({"id": 10, "project_id": 7}),  # getTask
+                _rpc_response(99),  # createTaskFile -> new file id
+            ]
+        )
+
+        result = await kanban.upload_attachment("10", "notes.txt", b"hello")
+
+        assert result["success"] is True
+        create_call = kanban._client.post.await_args_list[1]
+        assert create_call.kwargs["json"]["params"]["project_id"] == 7
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_configured_project_id_when_get_task_fails(
+        self, kanban
+    ):
+        """If getTask itself returns nothing (e.g. a transient RPC
+        hiccup), fall back to the configured default rather than
+        crashing or sending project_id=None."""
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response(None),  # getTask found nothing
+                _rpc_response(99),  # createTaskFile -> new file id
+            ]
+        )
+
+        result = await kanban.upload_attachment("10", "notes.txt", b"hello")
+
+        assert result["success"] is True
+        create_call = kanban._client.post.await_args_list[1]
+        assert create_call.kwargs["json"]["params"]["project_id"] == 1
+
+
+# ---------------------------------------------------------------------------
 # set_verify_round_tag tests
 # ---------------------------------------------------------------------------
 
@@ -2556,6 +2613,100 @@ class TestTagWriteConcurrency:
         assert call_order == [
             "getTask", "setTaskTags", "getTask", "setTaskTags"
         ]
+
+
+class TestTagLockCleanup:
+    """Regression: _tag_locks (and its companion _tag_lock_refs) grew by
+    one entry per DISTINCT ticket id ever tagged, for the lifetime of the
+    process — nothing ever removed an entry. _tag_lock_for must clean up
+    once nobody holds a reference anymore, without reintroducing the
+    unserialized-write race the lock exists to prevent."""
+
+    @pytest.mark.asyncio
+    async def test_lock_entry_is_removed_after_use(self, kanban):
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response({"id": 10, "project_id": 1, "tags": []}),
+                _rpc_response(True),
+            ]
+        )
+
+        await kanban.set_merge_conflict_flag("10", present=True)
+
+        assert "10" not in kanban._tag_locks
+        assert "10" not in kanban._tag_lock_refs
+
+    @pytest.mark.asyncio
+    async def test_lock_entries_for_different_tickets_do_not_interfere(
+        self, kanban
+    ):
+        kanban._client = AsyncMock()
+        kanban._client.post = AsyncMock(
+            side_effect=[
+                _rpc_response({"id": 10, "project_id": 1, "tags": []}),
+                _rpc_response(True),
+                _rpc_response({"id": 20, "project_id": 1, "tags": []}),
+                _rpc_response(True),
+            ]
+        )
+
+        await kanban.set_merge_conflict_flag("10", present=True)
+        await kanban.set_merge_conflict_flag("20", present=True)
+
+        assert kanban._tag_locks == {}
+        assert kanban._tag_lock_refs == {}
+
+    @pytest.mark.asyncio
+    async def test_overlapping_calls_do_not_delete_the_lock_mid_use(
+        self, kanban
+    ):
+        """Regression guard for the cleanup fix ITSELF: if releasing the
+        lock also deleted its dict entry unconditionally (e.g. checking
+        lock.locked() instead of a refcount), a THIRD concurrent caller
+        could create a brand new, unrelated lock for the same ticket
+        while a second (still-in-progress) caller thinks it's using the
+        shared one — reintroducing the exact unserialized-write race
+        this lock exists to prevent. Refcounting must keep the entry
+        alive until every overlapping caller is done with it. Drives
+        _tag_lock_for directly (not through the full RPC-mocked methods
+        above) so each coroutine's progress is precisely controlled via
+        its own event, instead of depending on asyncio's scheduling
+        order between two overlapping real calls."""
+        release_holder = asyncio.Event()
+        entered_waiter = asyncio.Event()
+        release_waiter = asyncio.Event()
+
+        async def holder():
+            async with kanban._tag_lock_for("10"):
+                await release_holder.wait()
+
+        async def waiter():
+            async with kanban._tag_lock_for("10"):
+                entered_waiter.set()
+                await release_waiter.wait()
+
+        holder_task = asyncio.ensure_future(holder())
+        await asyncio.sleep(0)  # let holder acquire the lock
+
+        waiter_task = asyncio.ensure_future(waiter())
+        await asyncio.sleep(0)  # let waiter register (increment refcount)
+        assert kanban._tag_lock_refs.get("10") == 2
+        lock_while_both_pending = kanban._tag_locks["10"]
+
+        release_holder.set()
+        await holder_task
+        # Holder is done and decremented its refcount, but the waiter is
+        # still mid-critical-section (blocked on release_waiter) — the
+        # entry must survive, unchanged, for the waiter to keep using.
+        await entered_waiter.wait()
+        assert kanban._tag_locks.get("10") is lock_while_both_pending
+        assert kanban._tag_lock_refs.get("10") == 1
+
+        release_waiter.set()
+        await waiter_task
+        assert "10" not in kanban._tag_locks
+        assert "10" not in kanban._tag_lock_refs
 
     @pytest.mark.asyncio
     async def test_concurrent_calls_for_different_tickets_do_not_block(

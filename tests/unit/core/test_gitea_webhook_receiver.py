@@ -114,6 +114,24 @@ class TestMalformedPayload:
         assert result is False
         mock_dev_env.refresh_by_branch.assert_not_called()
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "body",
+        [b"null", b"[]", b'"just a string"', b"42", b"true"],
+    )
+    async def test_valid_json_non_object_payload_rejected_not_crashed(
+        self, receiver, mock_dev_env, body
+    ):
+        """Regression (confirmed finding #31): json.loads() happily
+        parses valid JSON that isn't an object at all (null, an array,
+        a bare string/number) — none of those raise JSONDecodeError.
+        Without an explicit isinstance check, `payload.get("ref", "")`
+        crashed with an unhandled AttributeError instead of rejecting
+        the delivery like any other malformed one."""
+        result = await receiver.handle_request(body)
+        assert result is False
+        mock_dev_env.refresh_by_branch.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Branch parsing + refresh triggering

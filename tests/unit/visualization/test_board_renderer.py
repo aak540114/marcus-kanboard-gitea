@@ -63,6 +63,14 @@ def _capture_output(renderer: BoardRenderer, tasks: List[Task]) -> str:
     return buf.getvalue()
 
 
+def _capture_renderable_output(renderer: BoardRenderer, tasks: List[Task]) -> str:
+    """Build via build_renderable() and print to a string buffer."""
+    buf = StringIO()
+    console = Console(file=buf, width=120, force_terminal=True)
+    console.print(renderer.build_renderable(tasks))
+    return buf.getvalue()
+
+
 # ============================================================
 # Rendering Tests
 # ============================================================
@@ -111,6 +119,70 @@ class TestBoardRendererColumns:
         output = _capture_output(BoardRenderer(), tasks)
         # Should show count of 2 for backlog
         assert "2" in output
+
+    def test_ready_task_appears_on_the_board(self) -> None:
+        """Regression (confirmed finding #39): _COLUMNS only covers
+        TODO/IN_PROGRESS/BLOCKED/DONE. A READY task (unblocked, not yet
+        started — the TODO -> READY -> IN_PROGRESS pipeline) matched
+        none of them and was silently dropped from the board entirely —
+        shown in no column at all."""
+        tasks = [
+            _make_task(name="Ready Task", status=TaskStatus.READY, task_id="t1"),
+        ]
+        output = _capture_output(BoardRenderer(), tasks)
+        assert "Ready Task" in output
+
+    def test_waiting_for_human_task_appears_on_the_board(self) -> None:
+        """Regression (confirmed finding #39): a WAITING_FOR_HUMAN task
+        (paused mid-work for a human review) also matched none of the
+        four columns and vanished from the board the same way."""
+        tasks = [
+            _make_task(
+                name="Paused For Review",
+                status=TaskStatus.WAITING_FOR_HUMAN,
+                task_id="t1",
+            ),
+        ]
+        output = _capture_output(BoardRenderer(), tasks)
+        assert "Paused For Review" in output
+
+    def test_ready_task_counted_in_backlog_column(self) -> None:
+        """A READY task displays under Backlog (TODO's column) — it is
+        not yet started, same as a plain TODO task."""
+        tasks = [
+            _make_task(name="T1", status=TaskStatus.TODO, task_id="t1"),
+            _make_task(name="T2", status=TaskStatus.READY, task_id="t2"),
+        ]
+        output = _capture_output(BoardRenderer(), tasks)
+        # Backlog's count must include both the TODO and READY task.
+        assert "Backlog (2)" in output
+
+    def test_waiting_for_human_task_counted_in_blocked_column(self) -> None:
+        """A WAITING_FOR_HUMAN task displays under Blocked — paused,
+        not actively progressing."""
+        tasks = [
+            _make_task(name="T1", status=TaskStatus.BLOCKED, task_id="t1"),
+            _make_task(
+                name="T2", status=TaskStatus.WAITING_FOR_HUMAN, task_id="t2"
+            ),
+        ]
+        output = _capture_output(BoardRenderer(), tasks)
+        assert "Blocked (2)" in output
+
+    def test_build_renderable_also_shows_ready_and_waiting_for_human(self) -> None:
+        """build_renderable() (the Live-update path) duplicates render()'s
+        grouping logic — must get the same fix, not just render()."""
+        tasks = [
+            _make_task(name="Ready Task", status=TaskStatus.READY, task_id="t1"),
+            _make_task(
+                name="Paused For Review",
+                status=TaskStatus.WAITING_FOR_HUMAN,
+                task_id="t2",
+            ),
+        ]
+        output = _capture_renderable_output(BoardRenderer(), tasks)
+        assert "Ready Task" in output
+        assert "Paused For Review" in output
 
 
 class TestBoardRendererCards:

@@ -72,9 +72,9 @@ class LiveBoardWatcher:
 
         When ``stop_when_complete`` is set, the loop also exits
         automatically once the board has tasks and none remain in an
-        active state (``TODO`` or ``IN_PROGRESS``).  This matches the
-        behaviour of the ``marcus-mini watch`` command so that a
-        supervised run does not require manual interruption.
+        active state (``TODO``, ``READY``, or ``IN_PROGRESS``).  This
+        matches the behaviour of the ``marcus-mini watch`` command so
+        that a supervised run does not require manual interruption.
 
         Parameters
         ----------
@@ -110,9 +110,16 @@ class LiveBoardWatcher:
         """Return True when the run has finished and watching can stop.
 
         A run is considered complete when the board is non-empty and no
-        task is still in an active state (``TODO`` or ``IN_PROGRESS``).
-        Blocked tasks count as terminal for this purpose — they will not
-        advance without human intervention.
+        task is still in an active state (``TODO``, ``READY``, or
+        ``IN_PROGRESS``). ``READY`` means a human has already moved the
+        ticket to the ready column specifically to signal "the AI agent
+        should begin work" (see TaskStatus.READY's own docstring) — it
+        will progress on its own without any further human action, so
+        it belongs with TODO/IN_PROGRESS, not with the terminal
+        statuses below. Blocked and WAITING_FOR_HUMAN tasks DO count as
+        terminal for this purpose — both require a human to act before
+        anything more happens automatically, so there is nothing further
+        for the watcher to wait on.
 
         Parameters
         ----------
@@ -126,7 +133,7 @@ class LiveBoardWatcher:
         """
         if not tasks:
             return False
-        active = {TaskStatus.TODO, TaskStatus.IN_PROGRESS}
+        active = {TaskStatus.TODO, TaskStatus.READY, TaskStatus.IN_PROGRESS}
         return not any(t.status in active for t in tasks)
 
     async def _fetch_tasks(self) -> List[Task]:

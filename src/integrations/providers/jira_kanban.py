@@ -194,11 +194,25 @@ class JiraKanban(KanbanInterface):
         if self._client is None:
             raise RuntimeError("Call connect() before get_all_tasks()")
 
-        jql = (
-            f"project = {self._project_key} ORDER BY created DESC"
-            if self._project_key
-            else "ORDER BY created DESC"
-        )
+        # jira_project_key is operator-configured, not end-user input in
+        # the normal flow — but interpolating it unescaped into JQL still
+        # breaks (or, in a deployment where this value is less trusted,
+        # e.g. populated per-tenant, injects) the query the instant the
+        # key contains a space, quote, or JQL keyword. Quote it as a JQL
+        # string literal and escape any embedded quote, matching how
+        # every other JQL value in this file should be built.
+        # jira_project_key is operator-configured, not end-user input in
+        # the normal flow — but interpolating it unescaped into JQL still
+        # breaks (or, in a deployment where this value is less trusted,
+        # e.g. populated per-tenant, injects) the query the instant the
+        # key contains a space, quote, or JQL keyword. Quote it as a JQL
+        # string literal and escape any embedded quote, matching how
+        # every other JQL value in this file should be built.
+        if self._project_key:
+            escaped_key = self._project_key.replace("\\", "\\\\").replace('"', '\\"')
+            jql = f'project = "{escaped_key}" ORDER BY created DESC'
+        else:
+            jql = "ORDER BY created DESC"
         tasks: List[Task] = []
         # POST /rest/api/3/search/jql uses cursor-based pagination via
         # nextPageToken, not the offset-based startAt used by the retired

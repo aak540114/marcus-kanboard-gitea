@@ -135,6 +135,31 @@ class TestParseStackFromText:
         assert stack is not None
         assert stack.framework == ""
 
+    def test_gin_keyword_does_not_match_as_a_substring(self):
+        """Regression (confirmed finding #20): the framework map matched
+        keywords with a bare `in` substring check. "gin" (the Go web
+        framework) is a substring of ordinary English words — "engine",
+        "login", "plugin", "beginning" — any of which would otherwise
+        mis-detect the framework as Gin. The language detector already
+        applies word-boundary matching to the identically-prone "go"
+        keyword for the same reason; the framework map must match it."""
+        stack = parse_stack_from_text(
+            "Language: Python\n"
+            "Description: rebuilding the login and plugin engine, "
+            "beginning with the auth flow.\n"
+            "Dev server command: python main.py"
+        )
+        assert stack is not None
+        assert stack.framework == ""
+
+    def test_gin_keyword_still_matches_as_a_whole_word(self):
+        """The word-boundary fix must not stop real Gin detection."""
+        stack = parse_stack_from_text(
+            "Language: Go\nFramework: Gin\nDev server command: go run main.go"
+        )
+        assert stack is not None
+        assert stack.framework == "gin"
+
     # ── Explicit field extraction ───────────────────────────────────────
 
     def test_extracts_explicit_dev_command(self):

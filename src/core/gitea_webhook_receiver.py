@@ -34,7 +34,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -132,9 +132,24 @@ class GiteaWebhookReceiver:
             return False
 
         try:
-            payload: Dict[str, Any] = json.loads(body)
+            payload: Any = json.loads(body)
         except json.JSONDecodeError as exc:
             logger.warning("Gitea webhook: malformed JSON — %s", exc)
+            return False
+
+        # json.loads happily parses valid JSON that isn't an object at
+        # all — `null`, `[]`, `"a string"`, `42` — none of which raise
+        # JSONDecodeError. The `Dict[str, Any]` annotation is only a
+        # type hint; it does not actually guarantee payload.get() exists
+        # at runtime. Without this check, a webhook delivery with a
+        # non-object body crashed this handler with an unhandled
+        # AttributeError instead of being rejected like any other
+        # malformed delivery.
+        if not isinstance(payload, dict):
+            logger.warning(
+                "Gitea webhook: payload is not a JSON object (got %s) — rejecting",
+                type(payload).__name__,
+            )
             return False
 
         ref = payload.get("ref", "")

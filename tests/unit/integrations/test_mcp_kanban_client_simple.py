@@ -436,7 +436,8 @@ class TestKanbanClient:
             client = KanbanClient()
             client.board_id = "test-board-456"
 
-            await client.assign_task("card-1", "agent-001")
+            result = await client.assign_task("card-1", "agent-001")
+            assert result is True
 
             # Verify correct tool calls were made
             assert mock_client_session.call_tool.call_count == 3
@@ -459,7 +460,13 @@ class TestKanbanClient:
     async def test_assign_task_no_progress_list(
         self, mock_stdio_client, mock_client_session_context, mock_client_session
     ):
-        """Test task assignment when no In Progress list exists."""
+        """Test task assignment when no In Progress list exists.
+
+        Regression (confirmed finding #35): this used to silently return
+        None (no exception, no False, no log) even though the task was
+        NEVER actually moved — the only working signal was the comment.
+        Every sibling kanban provider's assign_task returns bool so a
+        caller can tell success from failure; this must too."""
         # Setup mock responses
         comment_response = Mock()
         comment_response.content = [Mock(text='{"id": "comment-1"}')]
@@ -484,11 +491,44 @@ class TestKanbanClient:
             client = KanbanClient()
             client.board_id = "test-board-456"
 
-            # Should complete without error (just adds comment, no move)
-            await client.assign_task("card-1", "agent-001")
+            # Should complete without error (just adds comment, no move),
+            # but must clearly report failure via its return value.
+            result = await client.assign_task("card-1", "agent-001")
+            assert result is False
 
             # Only comment call should be made
             assert mock_client_session.call_tool.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_assign_task_malformed_lists_result(
+        self, mock_stdio_client, mock_client_session_context, mock_client_session
+    ):
+        """Regression (confirmed finding #35): an unexpected lists_result
+        shape (no usable `.content`) must also report failure via the
+        return value, not silently succeed with nothing moved."""
+        comment_response = Mock()
+        comment_response.content = [Mock(text='{"id": "comment-1"}')]
+
+        lists_response = Mock(content=None)  # falsy -> hasattr check fails below
+        del lists_response.content  # no `.content` attribute at all
+
+        mock_client_session.call_tool.side_effect = [comment_response, lists_response]
+
+        with (
+            patch("src.integrations.kanban_client.stdio_client", mock_stdio_client),
+            patch(
+                "src.integrations.kanban_client.ClientSession",
+                mock_client_session_context,
+            ),
+            patch("src.integrations.kanban_client.os.path.exists", return_value=False),
+            patch("src.integrations.kanban_client.os.environ", {}),
+            patch("sys.stderr"),
+        ):
+            client = KanbanClient()
+            client.board_id = "test-board-456"
+
+            result = await client.assign_task("card-1", "agent-001")
+            assert result is False
 
     @pytest.mark.asyncio
     async def test_get_board_summary_success(

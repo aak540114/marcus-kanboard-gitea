@@ -75,6 +75,30 @@ class TestAIVerifierParse:
         assert result.passed is False
         assert result.findings == ["Missing error handler", "Test not found"]
 
+    def test_parse_string_false_is_not_truthy(self):
+        """Regression: a type-mismatched but syntactically valid JSON
+        value — the STRING "false" instead of the boolean false — must
+        not flip a failed review into a passed one. bare bool("false")
+        is True (any non-empty string is truthy), which would silently
+        break verification integrity."""
+        result = AIVerifier._parse('{"passed": "false", "findings": ["bug"]}')
+        assert result.passed is False
+
+    def test_parse_string_true_is_still_passed(self):
+        result = AIVerifier._parse('{"passed": "true", "findings": []}')
+        assert result.passed is True
+
+    def test_parse_string_false_case_insensitive(self):
+        result = AIVerifier._parse('{"passed": "FALSE", "findings": ["bug"]}')
+        assert result.passed is False
+
+    def test_parse_unrecognized_string_value_defaults_to_not_passed(self):
+        """An unrecognized string (not "true"/"false"/etc.) must fail
+        closed, not fail open — same safety-first reasoning as every
+        other ambiguous case in this parser."""
+        result = AIVerifier._parse('{"passed": "maybe", "findings": []}')
+        assert result.passed is False
+
     def test_parse_strips_markdown_fence(self):
         """JSON wrapped in ```json ... ``` is still parsed."""
         raw = "```json\n" + _json_response(True) + "\n```"

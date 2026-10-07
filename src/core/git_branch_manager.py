@@ -462,25 +462,35 @@ class BranchManager:
             ``False`` if the remote fetch failed (e.g. the branch isn't on
             the remote yet).
         """
-        rc, _, stderr = await self._git("fetch", self.config.remote, branch_name)
-        if rc != 0:
-            logger.warning(
-                "Could not fetch %s from %s: %s",
-                branch_name,
-                self.config.remote,
-                stderr,
+        # Acquires self._lock: this fetches into FETCH_HEAD and then
+        # consumes it a moment later. Without the lock, a concurrent
+        # create_branch/merge_to_main/rebase_on_main call (which also
+        # fetch-then-consume FETCH_HEAD in this same shared clone) can
+        # overwrite FETCH_HEAD between our fetch and our read of it,
+        # silently pointing the local branch at the WRONG commit.
+        async with self._lock:
+            rc, _, stderr = await self._git(
+                "fetch", self.config.remote, branch_name
             )
-            return False
-        # Point the local branch at what we just fetched (FETCH_HEAD), without
-        # checking it out. `branch -f` is refused if the branch is currently
-        # checked out — Marcus's working clone normally sits on main, so this
-        # succeeds; on the rare exception we fall back to update-ref.
-        rc, _, _ = await self._git("branch", "-f", branch_name, "FETCH_HEAD")
-        if rc != 0:
-            await self._git(
-                "update-ref", f"refs/heads/{branch_name}", "FETCH_HEAD"
-            )
-        return True
+            if rc != 0:
+                logger.warning(
+                    "Could not fetch %s from %s: %s",
+                    branch_name,
+                    self.config.remote,
+                    stderr,
+                )
+                return False
+            # Point the local branch at what we just fetched (FETCH_HEAD),
+            # without checking it out. `branch -f` is refused if the branch
+            # is currently checked out — Marcus's working clone normally
+            # sits on main, so this succeeds; on the rare exception we fall
+            # back to update-ref.
+            rc, _, _ = await self._git("branch", "-f", branch_name, "FETCH_HEAD")
+            if rc != 0:
+                await self._git(
+                    "update-ref", f"refs/heads/{branch_name}", "FETCH_HEAD"
+                )
+            return True
 
     async def push(self, branch_name: str, *, force: bool = False) -> bool:
         """Push *branch_name* to the configured remote.
@@ -617,13 +627,33 @@ class BranchManager:
         rc, _, err = await self._git("fetch", self.config.remote, branch_name)
         if rc == 0:
             merge_ref = "FETCH_HEAD"
-        else:
+        elif "couldn't find remote ref" in err.lower():
+            # The remote genuinely has no such branch (offline test flow,
+            # or a local-only ticket) — merging the local ref is correct
+            # here, same as _create_branch_unlocked's identical check.
             logger.warning(
-                "Could not fetch %s/%s before merge; merging local ref: %s",
+                "%s/%s has no remote ref (genuinely absent); merging "
+                "local ref: %s",
                 self.config.remote,
                 branch_name,
                 err,
             )
+        else:
+            # Any OTHER fetch failure (network blip, auth hiccup, timeout)
+            # is not proof the remote branch is absent — it just means we
+            # couldn't check. Falling through to merge the local ref here
+            # would silently merge Marcus's own empty/stale branch (see the
+            # comment above on merge_ref) and report success even though
+            # none of the agent's real work landed on main.
+            logger.error(
+                "Could not fetch %s/%s before merging %s — aborting "
+                "rather than merging a possibly-stale local ref: %s",
+                self.config.remote,
+                branch_name,
+                branch_name,
+                err,
+            )
+            return False
 
         # Merge. On failure, ALWAYS abort: a conflicted merge leaves
         # MERGE_HEAD and a conflicted index in this shared working tree,
@@ -683,16 +713,38 @@ class BranchManager:
         # Checkout the ticket branch.
         rc, _, err = await self._checkout_with_conflict_recovery(branch_name)
         if rc != 0:
-            # Branch may have been deleted after merge — recreate it. Calls
-            # the UNLOCKED body directly: this method already holds
+            lower = err.lower()
+            if "did not match any file" not in lower and "pathspec" not in lower:
+                # Some OTHER failure (permissions, a corrupt object, etc.)
+                # is not proof the branch was safely deleted after a merge
+                # — treating it as such and recreating with force=True
+                # would force-push a branch freshly cut from main over
+                # whatever the remote actually has, discarding real work
+                # we never even checked for. Surface the real error.
+                logger.error(
+                    "Checkout of %s failed for a reason other than a "
+                    "missing branch — not attempting recovery: %s",
+                    branch_name,
+                    err,
+                )
+                return False
+            # Branch not found locally. It may have been deleted after a
+            # merge, but it could equally still exist on the remote (e.g.
+            # this clone was recreated since). Resume from the remote first
+            # — force=False here, NOT force=True — so a branch that is
+            # still on the remote is reset to match it instead of being
+            # force-pushed over with a fresh, empty one cut from main.
+            # Calls the UNLOCKED body directly: this method already holds
             # self._lock, and it is not re-entrant.
             logger.info(
-                "Branch %s not found locally, recreating from %s/%s",
+                "Branch %s not found locally, checking %s/%s before "
+                "recreating from %s",
                 branch_name,
                 remote,
+                branch_name,
                 main,
             )
-            ok = await self._create_branch_unlocked(branch_name, force=True)
+            ok = await self._create_branch_unlocked(branch_name)
             if not ok:
                 return False
             await self._git("checkout", branch_name)
@@ -742,17 +794,25 @@ class BranchManager:
             Unified diff text.  Empty string when there are no changes.
         """
         base = base_branch or self.config.main_branch
-        await self._git("fetch", self.config.remote, base)
-        # Also fetch the ticket branch: the agent's commits live on the
-        # REMOTE branch (it self-clones), not this clone's stale local branch.
-        # Diff the fetched remote tip so AI Verify sees the agent's real work.
-        branch_ref = branch_name
-        rc, _, _ = await self._git("fetch", self.config.remote, branch_name)
-        if rc == 0:
-            branch_ref = "FETCH_HEAD"
-        remote_base = f"{self.config.remote}/{base}"
-        _, stdout, _ = await self._git("diff", f"{remote_base}...{branch_ref}")
-        return stdout
+        # Acquires self._lock: see sync_branch's identical reasoning — this
+        # fetches the ticket branch into FETCH_HEAD and consumes it a few
+        # lines later, which races against any concurrent
+        # create_branch/merge_to_main/rebase_on_main in this shared clone.
+        async with self._lock:
+            await self._git("fetch", self.config.remote, base)
+            # Also fetch the ticket branch: the agent's commits live on the
+            # REMOTE branch (it self-clones), not this clone's stale local
+            # branch. Diff the fetched remote tip so AI Verify sees the
+            # agent's real work.
+            branch_ref = branch_name
+            rc, _, _ = await self._git("fetch", self.config.remote, branch_name)
+            if rc == 0:
+                branch_ref = "FETCH_HEAD"
+            remote_base = f"{self.config.remote}/{base}"
+            _, stdout, _ = await self._git(
+                "diff", f"{remote_base}...{branch_ref}"
+            )
+            return stdout
 
     async def get_branch_commits(
         self, branch_name: str, *, base_branch: Optional[str] = None
@@ -772,15 +832,21 @@ class BranchManager:
             List of commit summary strings (``{hash} {message}``).
         """
         base = base_branch or self.config.main_branch
-        # Fetch the ticket branch so the commit list reflects the agent's
-        # pushed work (its commits are on the remote, not this local clone).
-        branch_ref = branch_name
-        rc, _, _ = await self._git("fetch", self.config.remote, branch_name)
-        if rc == 0:
-            branch_ref = "FETCH_HEAD"
-        _, stdout, _ = await self._git("log", "--oneline", f"{base}..{branch_ref}")
-        lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
-        return lines
+        # Acquires self._lock — see sync_branch's identical fetch-then-
+        # consume-FETCH_HEAD race reasoning.
+        async with self._lock:
+            # Fetch the ticket branch so the commit list reflects the
+            # agent's pushed work (its commits are on the remote, not this
+            # local clone).
+            branch_ref = branch_name
+            rc, _, _ = await self._git("fetch", self.config.remote, branch_name)
+            if rc == 0:
+                branch_ref = "FETCH_HEAD"
+            _, stdout, _ = await self._git(
+                "log", "--oneline", f"{base}..{branch_ref}"
+            )
+            lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
+            return lines
 
     async def merge_base_with_main(
         self, branch_name: str, *, base_branch: Optional[str] = None
@@ -806,25 +872,29 @@ class BranchManager:
             determined (branch not found, git error).
         """
         base = base_branch or self.config.main_branch
-        # Fetch base fresh and diff against the REMOTE-tracking ref, not
-        # this shared clone's local branch — same reasoning as
-        # get_branch_diff/get_branch_commits above. This clone's local
-        # `main` only advances when ITS OWN merge_to_main() runs; a
-        # direct push or a merge done through Gitea's own UI never
-        # touches it, so the local ref can be stale by the time an audit
-        # ticket (created independently of any merge) asks for its
-        # branch's fork point.
-        await self._git("fetch", self.config.remote, base)
-        remote_base = f"{self.config.remote}/{base}"
-        branch_ref = branch_name
-        rc, _, _ = await self._git("fetch", self.config.remote, branch_name)
-        if rc == 0:
-            branch_ref = "FETCH_HEAD"
-        rc, stdout, _ = await self._git("merge-base", remote_base, branch_ref)
-        if rc != 0:
-            return None
-        sha = stdout.strip()
-        return sha or None
+        # Acquires self._lock — see get_branch_diff/get_branch_commits'
+        # identical fetch-then-consume-FETCH_HEAD race reasoning.
+        async with self._lock:
+            # Fetch base fresh and diff against the REMOTE-tracking ref, not
+            # this shared clone's local branch. This clone's local `main`
+            # only advances when ITS OWN merge_to_main() runs; a direct push
+            # or a merge done through Gitea's own UI never touches it, so
+            # the local ref can be stale by the time an audit ticket
+            # (created independently of any merge) asks for its branch's
+            # fork point.
+            await self._git("fetch", self.config.remote, base)
+            remote_base = f"{self.config.remote}/{base}"
+            branch_ref = branch_name
+            rc, _, _ = await self._git("fetch", self.config.remote, branch_name)
+            if rc == 0:
+                branch_ref = "FETCH_HEAD"
+            rc, stdout, _ = await self._git(
+                "merge-base", remote_base, branch_ref
+            )
+            if rc != 0:
+                return None
+            sha = stdout.strip()
+            return sha or None
 
     async def ticket_ids_merged_since(
         self, since_commit: str, *, base_branch: Optional[str] = None

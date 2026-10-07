@@ -8,6 +8,7 @@ transport where each request might have its own event loop.
 
 import asyncio
 import threading
+from typing import Any
 from weakref import WeakKeyDictionary
 
 
@@ -51,6 +52,70 @@ class EventLoopLockManager:
         """Clear all locks (useful for testing)."""
         with self._thread_lock:
             self._locks.clear()
+
+
+class CrossLoopLock:
+    """Async context manager providing mutual exclusion across BOTH
+    event loops and threads, backed by a process-wide ``threading.Lock``.
+
+    :class:`EventLoopLockManager` above only serializes callers on the
+    SAME event loop — each loop gets its OWN ``asyncio.Lock`` instance
+    (keyed by loop in a ``WeakKeyDictionary``), so two concurrent
+    callers on DIFFERENT loops (e.g. multiple uvicorn workers in the
+    same process under HTTP transport, each running its own asyncio
+    loop) see no contention at all and race straight through a critical
+    section meant to be exclusive — confirmed as a real bug and fixed
+    this same way for ``create_project``'s own serialization lock (see
+    ``src/marcus_mcp/tools/nlp.py``'s ``_create_project_serialization_lock``,
+    Codex P1 on PR #613); this generalizes that fix for reuse (see
+    ``MarcusServer.assignment_lock``, the same race class for task
+    double-assignment).
+
+    Acquisition polls ``threading.Lock.acquire(blocking=False)`` and
+    yields to the event loop between attempts — a real blocking
+    ``acquire()`` would freeze the whole event loop while waiting.
+    """
+
+    def __init__(self, poll_interval: float = 0.05) -> None:
+        """Initialize with a fresh, unlocked ``threading.Lock``.
+
+        Parameters
+        ----------
+        poll_interval : float
+            Seconds to sleep between non-blocking acquire attempts.
+        """
+        self._lock = threading.Lock()
+        self._poll_interval = poll_interval
+
+    async def acquire(self) -> bool:
+        """Acquire the lock, yielding to the event loop while waiting.
+
+        Exposed as a direct method (not just ``async with``) so code
+        written against ``asyncio.Lock``'s interface — e.g. anything
+        that checks ``hasattr(lock, "acquire")`` — still works.
+
+        Returns
+        -------
+        bool
+            Always ``True`` once acquired (matches ``asyncio.Lock
+            .acquire()``'s return contract).
+        """
+        while not self._lock.acquire(blocking=False):
+            await asyncio.sleep(self._poll_interval)
+        return True
+
+    def release(self) -> None:
+        """Release the lock."""
+        self._lock.release()
+
+    async def __aenter__(self) -> "CrossLoopLock":
+        """Acquire the lock, yielding to the event loop while waiting."""
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        """Release the lock."""
+        self.release()
 
 
 class ThreadLocalLockManager:

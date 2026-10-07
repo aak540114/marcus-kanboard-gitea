@@ -33,6 +33,26 @@ _COLUMNS = [
     ("Done", TaskStatus.DONE, "green"),
 ]
 
+#: Maps a status with no dedicated column onto the existing column that
+#: best represents it, for DISPLAY purposes only — the task's own
+#: TaskStatus is never modified. Without this, a task sitting in READY
+#: or WAITING_FOR_HUMAN matched none of _COLUMNS' four statuses and was
+#: silently dropped from the board entirely (shown in no column, and
+#: undercounted in the summary bar's totals) instead of appearing
+#: somewhere sensible. READY (unblocked, not yet started — the
+#: TODO → READY → IN_PROGRESS pipeline) maps to Backlog; WAITING_FOR_
+#: HUMAN (paused mid-work for a human review, not actively progressing)
+#: maps to Blocked.
+_STATUS_DISPLAY_ALIAS = {
+    TaskStatus.READY: TaskStatus.TODO,
+    TaskStatus.WAITING_FOR_HUMAN: TaskStatus.BLOCKED,
+}
+
+
+def _display_status(status: TaskStatus) -> TaskStatus:
+    """Return the column status to display *status* under."""
+    return _STATUS_DISPLAY_ALIAS.get(status, status)
+
 
 class _ResponsiveGrid:
     """Width-aware Rich renderable for the 4-column kanban grid.
@@ -112,8 +132,9 @@ class BoardRenderer:
             status: [] for _, status, _ in _COLUMNS
         }
         for task in tasks:
-            if task.status in grouped:
-                grouped[task.status].append(task)
+            display_status = _display_status(task.status)
+            if display_status in grouped:
+                grouped[display_status].append(task)
 
         panels: list[Panel] = []
         for label, status, color in _COLUMNS:
@@ -163,8 +184,9 @@ class BoardRenderer:
             status: [] for _, status, _ in _COLUMNS
         }
         for task in tasks:
-            if task.status in grouped:
-                grouped[task.status].append(task)
+            display_status = _display_status(task.status)
+            if display_status in grouped:
+                grouped[display_status].append(task)
 
         # Build column panels
         panels: list[Panel] = []

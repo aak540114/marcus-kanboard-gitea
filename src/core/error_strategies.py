@@ -179,13 +179,24 @@ class CircuitBreaker:
                 self.state.failure_history.clear()
                 logger.info(f"Circuit breaker {self.name} transitioning to CLOSED")
 
-        # Clean old failures from history
+        # Clean old failures from history. `failure_count` must be
+        # resynced to the trimmed history's length, not just the history
+        # itself — otherwise failures that have aged out of
+        # monitor_window keep contributing to the CLOSED→OPEN threshold
+        # check in _record_failure forever (failure_count only ever grew,
+        # trimming failure_history had no effect on the actual
+        # open-the-circuit decision), defeating the sliding window
+        # monitor_window is meant to provide: slow, infrequent failures
+        # spread out over a long time could still trip the circuit as if
+        # they'd all happened within the configured window.
         cutoff_time = now - timedelta(seconds=self.config.monitor_window)
         self.state.failure_history = [
             failure_time
             for failure_time in self.state.failure_history
             if failure_time > cutoff_time
         ]
+        if self.state.state == CircuitBreakerState.CLOSED:
+            self.state.failure_count = len(self.state.failure_history)
 
     async def _record_success(self) -> None:
         """Record a successful operation."""
@@ -297,16 +308,31 @@ class RetryHandler:
             service_name = last_exception.service_name
             operation = last_exception.operation
 
-        raise IntegrationError(
-            service_name=service_name,
-            operation=operation,
-            context=context,
-            remediation={
+        wrap_kwargs: Dict[str, Any] = {
+            "context": context,
+            "remediation": {
                 "immediate_action": "Check service availability",
                 "long_term_solution": "Implement better error handling",
                 "retry_strategy": f"Already retried {self.config.max_attempts} times",
             },
-            cause=last_exception,
+            "cause": last_exception,
+        }
+        # IntegrationError defaults severity/retryable to MEDIUM/True when
+        # neither is passed explicitly — losing whatever the ORIGINAL
+        # exception actually reported. A CRITICAL, non-retryable
+        # MarcusBaseError that stopped the retry loop early (via
+        # _should_stop_retry) would otherwise be reported to callers and
+        # monitoring as a generic MEDIUM/retryable failure, masking a
+        # critical error as routine and marking as retryable something
+        # that explicitly said it wasn't.
+        if isinstance(last_exception, MarcusBaseError):
+            wrap_kwargs["severity"] = last_exception.severity
+            wrap_kwargs["retryable"] = last_exception.retryable
+
+        raise IntegrationError(
+            service_name=service_name,
+            operation=operation,
+            **wrap_kwargs,
         )
 
     def _should_retry(self, exception: Exception) -> bool:
@@ -627,17 +653,28 @@ def with_fallback(
     """Add fallback functions."""
 
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        # Created ONCE at decoration time, not per-call: execute_with_
+        # fallback's "cached result" tier is the LAST resort when the
+        # primary AND every fallback fail — it only has something to
+        # offer if a PRIOR successful call already populated
+        # fallback_handler.cache. A fresh FallbackHandler() built inside
+        # async_wrapper on every invocation starts with an empty cache
+        # every time, so that tier could never return anything: no call
+        # can ever read back a cache entry written by an earlier call
+        # that no longer exists.
+        fallback_handler = FallbackHandler(func.__name__)
+        for i, fallback_func in enumerate(fallback_functions):
+            fallback_handler.add_fallback(fallback_func, priority=i)
+
         @wraps(func)
         async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-            fallback_handler = FallbackHandler(func.__name__)
-
-            # Add fallback functions
-            for i, fallback_func in enumerate(fallback_functions):
-                fallback_handler.add_fallback(fallback_func, priority=i)
-
             context = ErrorContext(operation=func.__name__)
+            # A generic per-arguments cache key so the cache tier above
+            # has something to key on without requiring callers of this
+            # decorator to manage cache keys themselves.
+            cache_key = repr((args, sorted(kwargs.items())))
             return await fallback_handler.execute_with_fallback(
-                func, *args, context=context, **kwargs
+                func, *args, cache_key=cache_key, context=context, **kwargs
             )
 
         @wraps(func)

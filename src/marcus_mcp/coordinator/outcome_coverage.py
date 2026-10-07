@@ -1389,11 +1389,19 @@ def _gap_contract_round_trip(
     ``_parse_contract_metadata`` in ``marcus_mcp/tools/task.py`` reads
     contract metadata from three sources in priority order: the native
     attribute, ``source_context["responsibility"]``, then the
-    ``<!-- MARCUS_CONTRACT_FIRST: responsibility | contract_file -->``
-    description marker. We populate sources 2 and 3 here so the metadata
-    round-trips through every provider (source_context for JSON-capable
-    providers, the marker as the universal fallback for ones like Planka
-    that drop arbitrary fields).
+    ``MARCUS_CONTRACT_FIRST`` description marker. We populate sources 2
+    and 3 here so the metadata round-trips through every provider
+    (source_context for JSON-capable providers, the marker as the
+    universal fallback for ones like Planka that drop arbitrary fields).
+
+    The marker MUST use the same multi-line ``key: value`` format
+    ``advanced_parser.py`` writes and ``_parse_contract_metadata`` parses
+    (one ``responsibility:``/``contract_file:`` line each, inside a
+    ``<!-- MARCUS_CONTRACT_FIRST`` / ``-->`` block) — a single-line
+    ``<!-- MARCUS_CONTRACT_FIRST: X | Y -->`` variant parses as an empty
+    marker on the reader side (none of its lines start with
+    ``"responsibility:"``), silently dropping contract ownership for
+    every gap-fill task that relies on this fallback.
 
     Returns ``(description_with_marker, source_context)``. When the gap
     has no ``responsibility`` both are returned unchanged/empty.
@@ -1405,7 +1413,13 @@ def _gap_contract_round_trip(
     source_context: Dict[str, Any] = {"responsibility": responsibility}
     if contract_file:
         source_context["contract_file"] = contract_file
-    marker = f"<!-- MARCUS_CONTRACT_FIRST: {responsibility} | {contract_file} -->"
+    marker_lines = [
+        "<!-- MARCUS_CONTRACT_FIRST",
+        f"responsibility: {responsibility}",
+        f"contract_file: {contract_file}",
+        "-->",
+    ]
+    marker = "\n".join(marker_lines)
     description = f"{description}\n\n{marker}" if description else marker
     return description, source_context
 

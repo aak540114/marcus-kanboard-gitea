@@ -484,6 +484,54 @@ class TestRelearnStackAfterTicketDone:
         server.events.publish.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_does_not_clobber_a_human_edit_saved_during_the_llm_call(
+        self, tmp_path
+    ):
+        """Regression: can_auto_update() was only checked ONCE, before
+        the (multi-second, real network/LLM) infer_stack_with_ai call —
+        a human saving an edit (which stamps SOURCE_HUMAN, locking the
+        description) WHILE that call is in flight must not be silently
+        overwritten once it resolves. Simulates the race by having the
+        mocked AI call itself perform the human's save mid-flight,
+        exactly where the real await would yield control."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        mgr = _mgr(tmp_path)
+        _persist_detected_stack(
+            mgr, 7,
+            ProjectStack(language="nodejs", framework="Express",
+                         install_cmd="npm install", dev_cmd="npm run dev"),
+        )
+        before_text = mgr.get_description(7)
+        ai_engine = SimpleNamespace(generate_text=AsyncMock(return_value="{}"))
+        server = self._server_with_desc_mgr(
+            tmp_path, mgr, ai_engine=ai_engine,
+            kanban_client=MagicMock(add_comment=AsyncMock(return_value=True)),
+            events=MagicMock(publish=AsyncMock()),
+            provider="kanboard",
+        )
+
+        async def _ai_call_races_a_human_save(*_args, **_kwargs):
+            from src.core.project_description import SOURCE_HUMAN
+
+            mgr.update_description(7, "# Project\n## Tech Stack\nHuman-edited.\n", source=SOURCE_HUMAN)
+            return ProjectStack(
+                language="nodejs", framework="Express + Django",
+                install_cmd="npm install && pip install -r requirements.txt",
+                dev_cmd="npm run dev",
+            )
+
+        with patch(
+            "src.core.repo_stack_inference.infer_stack_with_ai",
+            new=AsyncMock(side_effect=_ai_call_races_a_human_save),
+        ):
+            await _relearn_stack_after_ticket_done(server, 7, str(repo), "129")
+
+        assert mgr.get_description(7) == "# Project\n## Tech Stack\nHuman-edited.\n"
+        assert mgr.get_description(7) != before_text  # the human's own edit DID land
+        server.kanban_client.add_comment.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_caches_the_fresh_ai_stack_even_when_unchanged(self, tmp_path):
         """The cache benefits the NEXT preview-start regardless of
         whether this particular merge changed anything worth notifying
@@ -862,6 +910,31 @@ class TestEnsurePipBreakSystemPackages:
         assert changed is False
         assert stack.install_cmd == (
             "pip install --break-system-packages -r requirements.txt"
+        )
+
+    def test_heals_the_unflagged_half_of_a_partially_healed_chain(self):
+        """Regression: the early-return guard used to check "is the flag
+        present ANYWHERE in install_cmd" — the instant ONE `pip install`
+        in a chained command had the flag (e.g. a prior partial fix, or a
+        human editing only the backend line), the WHOLE command was
+        treated as already healed and returned unchanged, leaving the
+        second, still-unflagged `pip install` to keep failing PEP 668
+        forever."""
+        stack = ProjectStack(
+            language="python", framework="Django",
+            install_cmd=(
+                "pip install --break-system-packages -r backend/requirements.txt "
+                "&& pip install -r frontend/requirements.txt"
+            ),
+            dev_cmd="python manage.py runserver 0.0.0.0:3000",
+        )
+
+        changed = _ensure_pip_break_system_packages(stack)
+
+        assert changed is True
+        assert stack.install_cmd == (
+            "pip install --break-system-packages -r backend/requirements.txt "
+            "&& pip install --break-system-packages -r frontend/requirements.txt"
         )
 
     def test_leaves_non_python_stacks_untouched(self):

@@ -48,7 +48,7 @@ from src.core.assignment_lease import (  # noqa: E402
 from src.core.assignment_persistence import AssignmentPersistence  # noqa: E402
 from src.core.code_analyzer import CodeAnalyzer  # noqa: E402
 from src.core.context import Context, sweep_context_retention  # noqa: E402
-from src.core.event_loop_utils import EventLoopLockManager  # noqa: E402
+from src.core.event_loop_utils import CrossLoopLock  # noqa: E402
 from src.core.events import Events  # noqa: E402
 from src.core.models import (  # noqa: E402
     ProjectState,
@@ -203,9 +203,17 @@ class MarcusServer:
         self.project_state: Optional[ProjectState] = None
         self.project_tasks: List[Any] = []
 
-        # Assignment persistence and locking
+        # Assignment persistence and locking. CrossLoopLock (not
+        # EventLoopLockManager): assignment_lock guards against two
+        # agents being handed the same task, including under HTTP
+        # transport with multiple uvicorn workers in this one process —
+        # EventLoopLockManager hands out a SEPARATE asyncio.Lock per
+        # event loop, so two concurrent request_next_task calls on
+        # different loops would see no contention at all and could both
+        # pass. Same race class already identified and fixed this way
+        # for create_project's own lock (Codex P1 on PR #613).
         self.assignment_persistence = AssignmentPersistence()
-        self._lock_manager = EventLoopLockManager()
+        self._assignment_lock = CrossLoopLock()
         self.tasks_being_assigned: set[str] = set()
 
         # File-level write-lock registry (#206 MVP, v0.3.9).
@@ -345,9 +353,16 @@ class MarcusServer:
         self._endpoint_apps: Dict[str, FastMCP] = {}
 
     @property
-    def assignment_lock(self) -> asyncio.Lock:
-        """Get assignment lock for the current event loop."""
-        return self._lock_manager.get_lock()
+    def assignment_lock(self) -> CrossLoopLock:
+        """Get the process-wide task-assignment lock.
+
+        Backed by :class:`CrossLoopLock`, not a plain
+        ``EventLoopLockManager``-vended ``asyncio.Lock`` — see this
+        attribute's construction in ``__init__`` for why: a per-event-
+        loop lock lets two concurrent callers on different loops (e.g.
+        separate uvicorn workers) both pass through unserialized.
+        """
+        return self._assignment_lock
 
     @property
     def current_project_id(self) -> Optional[str]:
@@ -607,6 +622,9 @@ class MarcusServer:
 
         # CRITICAL: Force creation of all locks in the current event loop
         # This prevents "lock is bound to a different event loop" errors
+        # (assignment_lock itself no longer needs this — CrossLoopLock is
+        # never loop-bound — kept only to also force assignment_persistence
+        # and project_manager's own per-loop locks below).
         _ = self.assignment_lock  # Force lock creation
         if self.assignment_persistence:
             _ = self.assignment_persistence.lock  # Force lock creation
@@ -4680,6 +4698,17 @@ async def _relearn_stack_after_ticket_done(
     # module does (see _persist_corrected_stack's own text-equality
     # check) — reusing that comparison keeps this consistent instead of
     # re-deriving a second, less reliable one.
+    # Re-check can_auto_update right before the write, not just before the
+    # expensive LLM call above. infer_stack_with_ai is a real network/LLM
+    # round trip with genuine latency; a human can lock the description
+    # (save an edit via project_description_api, which stamps
+    # SOURCE_HUMAN) at any point while that await is in flight. Without
+    # this second check, _persist_detected_stack below would still fire
+    # unconditionally once the await resolves, clobbering the human's
+    # just-saved edit AND silently flipping its source back to
+    # SOURCE_INFERRED — un-locking what the human just locked.
+    if not desc_mgr.can_auto_update(project_id):
+        return
     _persist_detected_stack(desc_mgr, project_id, new_stack)
     after_text = desc_mgr.get_description(project_id)
     if after_text == before_text:
@@ -4840,8 +4869,24 @@ def _ensure_pip_break_system_packages(stack: Any) -> bool:
     if (
         (getattr(stack, "language", "") or "").lower() != "python"
         or "pip install" not in install_cmd
-        or "--break-system-packages" in install_cmd
     ):
+        return False
+    # Heal every occurrence that doesn't already have the flag — checking
+    # for the flag's presence ANYWHERE in the whole string before healing
+    # (the previous approach here) treated a chained install_cmd as fully
+    # healed the instant ONE `pip install` invocation had the flag, even
+    # when another `pip install` in the same chain (e.g. a monorepo's
+    # "pip install --break-system-packages -r backend/requirements.txt
+    # && pip install -r frontend/requirements.txt") still didn't — that
+    # second invocation then kept failing PEP 668 forever, exactly the
+    # failure mode the comment below already describes and this function
+    # exists to close.
+    healed_cmd = re.sub(
+        r"pip install(?!\s+--break-system-packages)",
+        "pip install --break-system-packages",
+        install_cmd,
+    )
+    if healed_cmd == install_cmd:
         return False
     # Every occurrence, not just the first: a chained install_cmd (e.g. a
     # monorepo's "pip install -r backend/requirements.txt && pip install
@@ -4849,9 +4894,7 @@ def _ensure_pip_break_system_packages(stack: Any) -> bool:
     # invocation, and each one independently hits the same PEP 668 error
     # without the flag — healing only the first would still leave the
     # install step (and therefore the whole preview) failing.
-    stack.install_cmd = install_cmd.replace(
-        "pip install", "pip install --break-system-packages"
-    )
+    stack.install_cmd = healed_cmd
     return True
 
 
@@ -6934,7 +6977,16 @@ setInterval(refresh, 30000);
                     pid = body.get("project_id")
                     gate = body.get("gate")
                     verify_count = body.get("verify_count")  # optional int ≥ 0
-                    if not isinstance(pid, int) or gate not in ("human", "ai"):
+                    # bool is an int subclass — exclude it explicitly so a
+                    # body like {"project_id": true, ...} isn't silently
+                    # accepted as project_id=1 (mirrors the same bool/int
+                    # guard already applied to verify_count a few lines
+                    # below, and in decompose_setting_api/project_enabled_api).
+                    if (
+                        isinstance(pid, bool)
+                        or not isinstance(pid, int)
+                        or gate not in ("human", "ai")
+                    ):
                         r = JSONResponse(
                             {"error": "project_id (int) and gate ('human'|'ai') required"},
                             status_code=400,
@@ -6946,13 +6998,31 @@ setInterval(refresh, 30000);
                     if "verify_count" not in body and isinstance(body.get("verify"), bool):
                         verify_count = 1 if body["verify"] else 0
                         gate_mgr.set_project_verify_count(pid, verify_count)
-                    elif (
-                        "verify_count" in body
-                        and isinstance(verify_count, int)
-                        and not isinstance(verify_count, bool)
-                        and verify_count >= 0
-                    ):
-                        gate_mgr.set_project_verify_count(pid, verify_count)
+                    elif "verify_count" in body:
+                        if (
+                            isinstance(verify_count, int)
+                            and not isinstance(verify_count, bool)
+                            and verify_count >= 0
+                        ):
+                            gate_mgr.set_project_verify_count(pid, verify_count)
+                        else:
+                            # Invalid verify_count must not be silently
+                            # dropped while the response still claims
+                            # "saved": true for the whole request — the
+                            # gate half of the write already happened
+                            # above, so this is a partial-failure, not a
+                            # full 400.
+                            r = JSONResponse(
+                                {
+                                    "saved": False,
+                                    "error": "verify_count must be an int >= 0",
+                                    "project_id": pid,
+                                    "gate": gate,
+                                },
+                                status_code=400,
+                            )
+                            r.headers["Access-Control-Allow-Origin"] = "*"
+                            return r
                     r = JSONResponse({"saved": True, "project_id": pid, "gate": gate,
                                       "verify_count": gate_mgr.get_project_verify_count(pid)})
 
@@ -6976,15 +7046,28 @@ setInterval(refresh, 30000);
                     if "verify_count" not in body and isinstance(body.get("verify"), bool):
                         vc_compat: Optional[int] = 1 if body["verify"] else 0
                         gate_mgr.set_ticket_verify_count(str(tid), vc_compat)
-                    elif "verify_count" in body and (
-                        verify_count is None
-                        or (
+                    elif "verify_count" in body:
+                        if verify_count is None or (
                             isinstance(verify_count, int)
                             and not isinstance(verify_count, bool)
                             and verify_count >= 0
-                        )
-                    ):
-                        gate_mgr.set_ticket_verify_count(str(tid), verify_count)
+                        ):
+                            gate_mgr.set_ticket_verify_count(str(tid), verify_count)
+                        else:
+                            # Same partial-failure reasoning as the
+                            # /project branch above — the gate half may
+                            # already be saved.
+                            r = JSONResponse(
+                                {
+                                    "saved": False,
+                                    "error": "verify_count must be an int >= 0 or null",
+                                    "ticket_id": tid,
+                                    "gate": gate,
+                                },
+                                status_code=400,
+                            )
+                            r.headers["Access-Control-Allow-Origin"] = "*"
+                            return r
                     r = JSONResponse({"saved": True, "ticket_id": tid, "gate": gate,
                                       "verify_count": gate_mgr.get_ticket_verify_count(str(tid))})
 
@@ -6997,10 +7080,17 @@ setInterval(refresh, 30000);
             # GET: return current settings + effective gate
             pid_str = request.query_params.get("project_id", "")
             tid_str = request.query_params.get("ticket_id", "") or None
-            try:
-                pid = int(pid_str) if pid_str else None
-            except ValueError:
-                pid = None
+            pid = None
+            if pid_str:
+                try:
+                    pid = int(pid_str)
+                except ValueError:
+                    r = JSONResponse(
+                        {"error": "project_id must be a numeric Kanboard id"},
+                        status_code=400,
+                    )
+                    r.headers["Access-Control-Allow-Origin"] = "*"
+                    return r
 
             project_gate = gate_mgr.get_project_gate(pid) if pid is not None else None
             ticket_gate = gate_mgr.get_ticket_gate(tid_str) if tid_str else None
@@ -7171,7 +7261,12 @@ setInterval(refresh, 30000);
         async def dev_env_stop(request: Request) -> JSONResponse:
             """Stop a running dev environment and tear down its Docker container.
 
-            Accepts GET or POST so the sidebar button can use a simple fetch.
+            POST only — this tears down a running container, and a
+            state-changing GET is trivially triggerable cross-site (an
+            auto-loading <img> tag, no script needed) by any page the
+            developer's browser visits while Marcus is reachable with no
+            auth (the documented open/localhost mode). Both real callers
+            (board header.php, task sidebar.php) already POST via fetch().
 
             Query params:
                 ticket_id  (required)
@@ -8498,13 +8593,13 @@ setInterval(refresh, 30000);
                 Route("/webhooks/kanboard", kanboard_webhook, methods=["POST"]),
                 Route("/webhooks/gitea", gitea_webhook, methods=["POST"]),
                 Route("/dev-env/view", dev_env_view, methods=["GET"]),
-                Route("/dev-env/stop", dev_env_stop, methods=["GET", "POST"]),
+                Route("/dev-env/stop", dev_env_stop, methods=["POST"]),
                 Route("/api/dev-env/status", dev_env_status, methods=["GET"]),
                 Route("/api/dev-env/logs", dev_env_logs_api, methods=["GET"]),
                 Route("/dev-env/logs", dev_env_logs_view, methods=["GET"]),
                 Route("/dev-env/main/view", dev_env_main_view, methods=["GET"]),
                 Route(
-                    "/dev-env/main/stop", dev_env_main_stop, methods=["GET", "POST"]
+                    "/dev-env/main/stop", dev_env_main_stop, methods=["POST"]
                 ),
                 Route(
                     "/api/dev-env/main/status", dev_env_main_status, methods=["GET"]

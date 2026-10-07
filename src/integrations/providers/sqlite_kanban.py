@@ -529,19 +529,30 @@ class SQLiteKanban(KanbanInterface):
     # ----------------------------------------------------------
 
     async def get_available_tasks(self) -> List[Task]:
-        """Get unassigned TODO tasks.
+        """Get unassigned tasks in a TODO or READY column.
+
+        Matches the kanban interface's own contract ("unassigned tasks
+        from backlog/ready columns" — see KanbanInterface.
+        get_available_tasks) and the primary production provider,
+        KanboardKanban.get_available_tasks: a TODO-only filter silently
+        excluded READY tasks (e.g. ones released from BLOCKED, or
+        produced straight into READY by decomposition) from ever being
+        claimable by an agent when running against this backend.
 
         Returns
         -------
         List[Task]
-            Tasks with status=TODO and no assignment.
+            Tasks with status TODO or READY and no assignment.
         """
         if not self.connected:
             await self.connect()
 
         def _query(conn: sqlite3.Connection) -> List[sqlite3.Row]:
-            sql = "SELECT * FROM tasks " "WHERE status = ? AND assigned_to IS NULL"
-            params: list[Any] = [TaskStatus.TODO.value]
+            sql = (
+                "SELECT * FROM tasks "
+                "WHERE status IN (?, ?) AND assigned_to IS NULL"
+            )
+            params: list[Any] = [TaskStatus.TODO.value, TaskStatus.READY.value]
             if self.project_id:
                 sql += " AND project_id = ?"
                 params.append(self.project_id)

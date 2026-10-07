@@ -175,6 +175,46 @@ class TestRetryHandler:
         # Should stop on non-retryable error
         assert self.handler._should_stop_retry(auth_error, 0) is True
 
+    @pytest.mark.asyncio
+    async def test_wrapped_error_preserves_original_severity_and_retryable(self):
+        """Regression (confirmed finding #22): when retries are exhausted
+        (or stopped early for a non-retryable MarcusBaseError), the
+        original exception is wrapped in a fresh IntegrationError.
+        IntegrationError defaults severity to MEDIUM and retryable to
+        True whenever neither is passed explicitly — silently losing
+        whatever the ORIGINAL exception actually reported. A CRITICAL,
+        non-retryable failure must not be reported to callers/monitoring
+        as a routine, retryable MEDIUM error."""
+        original = TransientError(
+            "disk full",
+            retryable=False,
+            severity=ErrorSeverity.CRITICAL,
+        )
+        mock_func = AsyncMock(side_effect=original)
+
+        with pytest.raises(IntegrationError) as exc_info:
+            await self.handler.execute(mock_func)
+
+        assert exc_info.value.severity == ErrorSeverity.CRITICAL
+        assert exc_info.value.retryable is False
+        # Stopped on attempt 1 (non-retryable), not all 3 configured attempts.
+        assert mock_func.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_wrapped_error_keeps_default_severity_when_retries_exhausted(self):
+        """A retryable TransientError (MEDIUM/retryable=True, the
+        IntegrationError defaults too) that exhausts all retry attempts
+        must still wrap cleanly — the fix must not change behavior for
+        the already-matching default case."""
+        mock_func = AsyncMock(side_effect=TransientError("still failing"))
+
+        with pytest.raises(IntegrationError) as exc_info:
+            await self.handler.execute(mock_func)
+
+        assert exc_info.value.severity == ErrorSeverity.MEDIUM
+        assert exc_info.value.retryable is True
+        assert mock_func.call_count == 3
+
 
 class TestCircuitBreakerConfig:
     """Test suite for CircuitBreakerConfig"""
@@ -287,6 +327,46 @@ class TestCircuitBreaker:
         result = await self.circuit_breaker.call(mock_func)
 
         assert result == "sync_result"
+
+    @pytest.mark.asyncio
+    async def test_failures_outside_monitor_window_do_not_open_the_circuit(self):
+        """Regression (confirmed finding #23): _update_state() trims
+        failure_history to only entries within monitor_window, but never
+        used to resync failure_count to match — failure_count only ever
+        grew, so slow, infrequent failures spread out over a long time
+        could still trip the circuit as if they'd all happened within
+        the window, defeating the whole point of monitor_window."""
+        config = CircuitBreakerConfig(
+            failure_threshold=3, success_threshold=2, timeout=60.0,
+            monitor_window=0.2,
+        )
+        cb = CircuitBreaker("slow_failures", config)
+        mock_func = AsyncMock(side_effect=Exception("boom"))
+
+        # Two failures, below the threshold of 3.
+        for _ in range(2):
+            with pytest.raises(Exception):
+                await cb.call(mock_func)
+        assert cb.state.state == CircuitBreakerState.CLOSED
+        assert cb.state.failure_count == 2
+
+        # Let both failures age out of the monitor window.
+        await asyncio.sleep(0.25)
+
+        # A call (even a successful one) runs _update_state(), which must
+        # decay failure_count back down since those failures are now
+        # stale — not just trim failure_history for show.
+        ok_func = AsyncMock(return_value="ok")
+        await cb.call(ok_func)
+        assert cb.state.failure_count == 0
+
+        # One more real failure must NOT immediately open the circuit:
+        # without the fix, the stale failure_count (2) + 1 == 3 would
+        # hit failure_threshold on a single fresh failure.
+        with pytest.raises(Exception):
+            await cb.call(mock_func)
+        assert cb.state.state == CircuitBreakerState.CLOSED
+        assert cb.state.failure_count == 1
 
 
 class TestFallbackHandler:
@@ -539,6 +619,43 @@ class TestDecorators:
 
         result = await primary_func()
         assert result == "fallback_result"
+
+    @pytest.mark.asyncio
+    async def test_with_fallback_decorator_uses_cache_from_a_prior_call(self):
+        """Regression (confirmed finding #24): execute_with_fallback's
+        documented "cached result" tier only has something to offer if a
+        PRIOR successful call already populated the SAME FallbackHandler
+        instance's cache. The old with_fallback built a fresh
+        FallbackHandler() inside async_wrapper on every single
+        invocation, so that cache started empty every time — no call
+        could ever read back a cache entry written by an earlier call,
+        making the documented cache tier permanently dead."""
+        call_count = 0
+
+        async def flaky_primary(x):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return "live_result"
+            raise Exception("now failing")
+
+        async def failing_fallback(x):
+            raise Exception("fallback also failing")
+
+        @with_fallback(failing_fallback)
+        async def wrapped(x):
+            return await flaky_primary(x)
+
+        # First call succeeds and should populate the persistent cache.
+        first = await wrapped("same-args")
+        assert first == "live_result"
+
+        # Second call with the SAME arguments: primary now fails, the
+        # only fallback fails too — the cached result from the first
+        # call (same cache_key, since args are identical) must be
+        # returned instead of raising.
+        second = await wrapped("same-args")
+        assert second == "live_result"
 
 
 class TestErrorStrategyRegistry:

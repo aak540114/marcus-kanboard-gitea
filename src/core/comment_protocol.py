@@ -54,6 +54,19 @@ from typing import Any, Dict, List, Optional
 # match a human reply that merely opens with a heading addressed TO
 # Marcus (e.g. "# Marcus, please also fix X"), which would otherwise be
 # mistaken for Marcus's own comment and silently dropped.
+#
+# The title is always the very FIRST thing in a comment Marcus actually
+# generates (every CommentFormatter method returns an f-string starting
+# with "### Marcus …"). Callers below must match with `.match()`
+# (anchored to the start of the whole text), never `.search()`: with
+# re.MULTILINE, `^` matches the start of EVERY line, not just the start
+# of the text, so `.search()` would also match a heading that merely
+# APPEARS somewhere inside a human's own multi-paragraph comment — e.g.
+# a human venting "### Marcus Agent keeps assigning this wrong, please
+# stop" a few lines into their reply — misclassifying real human
+# feedback as Marcus's own and silently dropping it. MULTILINE is still
+# needed so `$` matches end-of-line rather than end-of-string, since the
+# title line is always followed by more text.
 _TITLE_RE = re.compile(r"^\s*#{1,6}\s+Marcus\s+(?:Agent|AI)\b.*$", re.MULTILINE)
 
 # Not every Marcus comment comes from CommentFormatter. The provider layer
@@ -822,7 +835,7 @@ class CommentParser:
         comment mistaken for human input drags the card back out of the
         column Marcus just moved it to.
         """
-        return bool(_TITLE_RE.search(text) or _PREFIX_RE.match(text))
+        return bool(_TITLE_RE.match(text) or _PREFIX_RE.match(text))
 
     @staticmethod
     def parse(text: str) -> Optional[ParsedComment]:
@@ -842,7 +855,7 @@ class CommentParser:
         Optional[ParsedComment]
             Parsed comment, or ``None`` if the comment is not from Marcus.
         """
-        title_match = _TITLE_RE.search(text)
+        title_match = _TITLE_RE.match(text)
         if not title_match:
             return None
         title = title_match.group(0)

@@ -751,3 +751,51 @@ class TestRunGitTimeout:
     async def test_still_raises_on_nonzero_exit_not_timeout(self, tmp_path):
         with pytest.raises(RuntimeError, match="git command failed"):
             await _run_git(["false"], cwd=str(tmp_path), timeout=5.0)
+
+
+class TestRunGitCredentialRedaction:
+    """Regression: the exception message redacted an embedded PAT
+    (http://user:TOKEN@host) from the COMMAND LINE it echoes back, but
+    not from git's own stdout/stderr — despite a comment claiming
+    otherwise. Git itself frequently echoes the URL it tried to reach
+    into its own error text (e.g. "fatal: unable to access
+    'https://user:TOKEN@host/repo.git/'"), so a failed authenticated
+    push/clone leaked the real token through this exception's message —
+    anywhere that message reaches a log, a UI, or a comment."""
+
+    @pytest.mark.asyncio
+    async def test_redacts_a_credential_echoed_back_in_stderr(self, tmp_path):
+        with pytest.raises(RuntimeError) as exc_info:
+            await _run_git(
+                [
+                    "sh", "-c",
+                    "echo \"fatal: unable to access "
+                    "'https://real-user:ghp_SuperSecretToken123@gitea.example.com/repo.git/'\" "
+                    ">&2; exit 1",
+                ],
+                cwd=str(tmp_path),
+                timeout=5.0,
+            )
+
+        message = str(exc_info.value)
+        assert "ghp_SuperSecretToken123" not in message
+        assert "real-user" not in message
+        assert "://***:***@gitea.example.com" in message
+
+    @pytest.mark.asyncio
+    async def test_redacts_a_credential_echoed_back_in_stdout(self, tmp_path):
+        with pytest.raises(RuntimeError) as exc_info:
+            await _run_git(
+                [
+                    "sh", "-c",
+                    "echo 'cloning https://real-user:ghp_SuperSecretToken123@gitea.example.com/repo.git'; "
+                    "exit 1",
+                ],
+                cwd=str(tmp_path),
+                timeout=5.0,
+            )
+
+        message = str(exc_info.value)
+        assert "ghp_SuperSecretToken123" not in message
+        assert "real-user" not in message
+        assert "://***:***@gitea.example.com" in message

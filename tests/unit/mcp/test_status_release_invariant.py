@@ -91,6 +91,9 @@ def _make_state(task: Task) -> Any:
     state.code_analyzer = None
     state.provider = "sqlite"
 
+    state.file_lock_registry = AsyncMock()
+    state.file_lock_registry.release = AsyncMock(return_value=0)
+
     return state
 
 
@@ -197,6 +200,63 @@ class TestReportBlockerReleasesCoordination:
         assert update_call is not None
         update_payload = update_call[0][1]
         assert update_payload["status"] == TaskStatus.BLOCKED
+
+    @pytest.mark.asyncio
+    async def test_report_blocker_releases_file_locks(self) -> None:
+        """Regression (#206): report_blocker released agent_tasks, the
+        assignment-persistence record, and the lease, but never called
+        file_lock_registry.release — unlike report_task_progress's own
+        _release_locks_on_exit, whose docstring explicitly says it
+        covers BOTH terminal states this task can reach (DONE or
+        BLOCKED). A blocked task kept holding every file lock it had
+        declared until Marcus restarts, blocking every other agent that
+        needed those same files."""
+        from src.marcus_mcp.tools.task import report_blocker
+
+        task = _make_task()
+        state = _make_state(task)
+
+        with patch(
+            "src.experiments.live_experiment_monitor.get_active_monitor",
+            return_value=None,
+        ):
+            await report_blocker(
+                agent_id="agent-1",
+                task_id=task.id,
+                blocker_description="Stuck on dep",
+                severity="medium",
+                state=state,
+            )
+
+        state.file_lock_registry.release.assert_awaited_once_with(task.id)
+
+    @pytest.mark.asyncio
+    async def test_report_blocker_lock_release_failure_does_not_break_reporting(
+        self,
+    ) -> None:
+        """A release failure must not break blocker reporting — same
+        resilience as report_task_progress's own release call."""
+        from src.marcus_mcp.tools.task import report_blocker
+
+        task = _make_task()
+        state = _make_state(task)
+        state.file_lock_registry.release = AsyncMock(
+            side_effect=RuntimeError("registry unavailable")
+        )
+
+        with patch(
+            "src.experiments.live_experiment_monitor.get_active_monitor",
+            return_value=None,
+        ):
+            result = await report_blocker(
+                agent_id="agent-1",
+                task_id=task.id,
+                blocker_description="Stuck on dep",
+                severity="medium",
+                state=state,
+            )
+
+        assert result.get("success") is True
 
 
 class TestCompletionReleasesLeaseEvenOnMergeFailure:

@@ -579,11 +579,28 @@ Focus on logical dependencies based on:
 
         cleaned_inferred = self._clean_dependencies(inferred_deps)
 
+        # Look up each original HybridDependency by its (dependent,
+        # dependency) task-id pair — NOT by list position.
+        # _clean_dependencies (_remove_circular_dependencies,
+        # _remove_transitive_dependencies) can drop and reorder entries,
+        # so cleaned_inferred[i] is not guaranteed to be the same
+        # dependency as final_deps_list[i]. Indexing by position
+        # silently reattached one dependency's inference_method/
+        # pattern_confidence/ai_confidence/ai_reasoning metadata onto a
+        # completely unrelated task pair the moment any dependency
+        # earlier in the list was removed.
+        hybrid_by_pair = {
+            (dep.dependent_task_id, dep.dependency_task_id): dep
+            for dep in final_deps_list
+        }
+
         # Convert back to HybridDependency, preserving additional fields
         final_deps = []
-        for i, cleaned_dep in enumerate(cleaned_inferred):
-            if i < len(final_deps_list):
-                original_hybrid = final_deps_list[i]
+        for cleaned_dep in cleaned_inferred:
+            original_hybrid = hybrid_by_pair.get(
+                (cleaned_dep.dependent_task_id, cleaned_dep.dependency_task_id)
+            )
+            if original_hybrid is not None:
                 final_deps.append(
                     HybridDependency(
                         dependent_task_id=cleaned_dep.dependent_task_id,

@@ -198,7 +198,15 @@ class ACParser:
         """
         block = f"{_AC_START}\n{_AC_HEADER}\n\n{ac_markdown.strip()}\n{_AC_END}"
         if _AC_BLOCK_RE.search(description):
-            return _AC_BLOCK_RE.sub(block, description)
+            # A string replacement is interpreted as a regex template —
+            # a literal backslash-digit in ac_markdown (an LLM-generated
+            # numbered step like "Step 1\2 commands", or a Windows path)
+            # would be read as a backreference to a capture group
+            # _AC_BLOCK_RE doesn't have, raising `re.error: invalid
+            # group reference` and crashing the embed. A replacement
+            # FUNCTION returns its result literally, with no template
+            # interpretation.
+            return _AC_BLOCK_RE.sub(lambda _m: block, description)
         return f"{description.rstrip()}\n\n{block}"
 
     @staticmethod

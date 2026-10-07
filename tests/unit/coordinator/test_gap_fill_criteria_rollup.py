@@ -889,9 +889,15 @@ class TestSynthesizedTaskContractRoundTrip:
             == "implements GameEngine from engine.ts"
         )
         assert task.source_context["contract_file"] == "docs/engine.ts"
-        # Description marker (universal fallback, e.g. Planka)
-        assert "<!-- MARCUS_CONTRACT_FIRST:" in task.description
-        assert "implements GameEngine from engine.ts" in task.description
+        # Description marker (universal fallback, e.g. Planka) — must use
+        # the same multi-line format _parse_contract_metadata actually
+        # parses (see finding #11: a single-line `MARCUS_CONTRACT_FIRST:
+        # X | Y` variant parses as empty on the reader side).
+        assert "<!-- MARCUS_CONTRACT_FIRST" in task.description
+        assert "responsibility: implements GameEngine from engine.ts" in (
+            task.description
+        )
+        assert "contract_file: docs/engine.ts" in task.description
 
     def test_non_contract_gap_has_no_marker_or_source_context(self) -> None:
         from src.marcus_mcp.coordinator.outcome_coverage import (

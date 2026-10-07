@@ -1155,10 +1155,42 @@ class AssignmentLeaseManager:
                 logger.warning(f"Failed to write recovery comment to Kanban: {e}")
                 # Continue - task model update is what matters
 
-            # Remove from active leases
+            # Remove from active leases — but only if the lease object
+            # CURRENTLY stored for this task_id is still THIS exact
+            # lease. This coroutine already did a lot of async work
+            # above (telemetry, the Kanban recovery-handoff comment)
+            # since whatever caller decided this lease was expired —
+            # long enough for a concurrent request_next_task to have
+            # created a FRESH AssignmentLease for the same task_id (same
+            # key, different object) in the meantime, e.g. if a
+            # different code path already recovered/reassigned it.
+            # Checking key membership alone (the previous check here)
+            # would delete that brand-new, valid lease instead of the
+            # stale one actually being recovered — and everything below
+            # (clearing the board's assigned_to, removing the
+            # persistence record, firing the recovery callback) would
+            # then incorrectly apply to an agent who just started
+            # legitimate work. A MISSING entry (never tracked, or
+            # already removed by unrelated bookkeeping) is NOT this
+            # race — there's no newer valid lease to protect — so only
+            # a DIFFERENT lease object occupying the slot aborts the
+            # rest of recovery; an absent or matching entry proceeds
+            # exactly as before.
             async with self.lease_lock:
-                if lease.task_id in self.active_leases:
+                current_lease = self.active_leases.get(lease.task_id)
+                superseded_by_newer_lease = (
+                    current_lease is not None and current_lease is not lease
+                )
+                if current_lease is lease:
                     del self.active_leases[lease.task_id]
+
+            if superseded_by_newer_lease:
+                logger.info(
+                    f"Skipping recovery for task {lease.task_id}: its "
+                    f"lease was already superseded by a newer one "
+                    f"before this stale recovery decision took effect."
+                )
+                return False
 
             # Remove assignment from persistence
             await self.assignment_persistence.remove_assignment(lease.agent_id)
@@ -1259,6 +1291,26 @@ class AssignmentLeaseManager:
             # renewal_count, progress_percentage, and every other field
             # just set above.
             await self.assignment_persistence.flush()
+        else:
+            # No persisted assignment record for this agent — every
+            # caller (renew_lease, update_progress, etc.) already
+            # updated the IN-MEMORY lease object before calling this,
+            # so the lease itself is correct; only the ON-DISK copy
+            # misses this update. That matters: if Marcus restarts
+            # before the next successful persist, load_active_leases()
+            # reconstructs leases from whatever is on disk, so a
+            # restart right after a silently-dropped update would
+            # resurrect a lease with stale lease_expires/renewal_count/
+            # progress_percentage. Previously this was dropped with
+            # zero signal — not even a log line — making it impossible
+            # to notice without reading the code.
+            logger.warning(
+                f"Could not persist lease update for agent "
+                f"{lease.agent_id} (task {lease.task_id}): no assignment "
+                f"record found in persistence. The in-memory lease is "
+                f"still up to date, but this update won't survive a "
+                f"restart."
+            )
 
     async def load_active_leases(self) -> None:
         """Load active leases from persistence on startup."""

@@ -5,10 +5,15 @@ Gate mode controls whether human approval is required at key workflow
 checkpoints (``human``) or whether the AI works autonomously from ready to
 done without pausing for review (``ai``).
 
-AI-verify count (only applies when gate is ``ai``) controls how many
-sequential LLM review rounds run before the branch is allowed to merge.
-When set to N, the workflow runs N verification rounds with agent fix
-cycles between them.  A count of 0 disables verification entirely.
+AI-verify count controls how many sequential LLM review rounds run
+before the branch is allowed to merge (gate ``ai``) or be handed off to
+a human for review (gate ``human``) — it applies under BOTH gate modes,
+not just ``ai``. See :meth:`~src.workflows.human_gated_workflow.
+HumanGatedWorkflow._run_verify_gate`, which both gates share: a human
+reviewer only ever sees a ticket after its configured verify_count
+rounds have passed, same as the AI-gate auto-merge path. When set to N,
+the workflow runs N verification rounds with agent fix cycles between
+them.  A count of 0 disables verification entirely.
 
 Decompose-enabled (project-level only — see :meth:`GateSettingManager.
 get_effective_decompose_enabled`) controls whether Marcus is allowed to

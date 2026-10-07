@@ -654,8 +654,21 @@ async def _run_git(
             f"git command timed out after {timeout}s: {' '.join(safe_args)}"
         )
     if proc.returncode != 0:
-        # Redact any embedded credentials (http://user:TOKEN@host) before logging.
+        # Redact any embedded credentials (http://user:TOKEN@host) from the
+        # command line AND from git's own stdout/stderr — git frequently
+        # echoes the URL it tried to reach back in its own error text (e.g.
+        # "fatal: unable to access 'https://user:TOKEN@host/repo.git/'"),
+        # so redacting only `safe_args` (as this used to do, despite this
+        # comment already claiming otherwise) still leaked the real PAT
+        # through the exception message whenever a push/clone against an
+        # authenticated URL failed.
+        stdout_text = re.sub(
+            r"://[^:@/]+:[^@]*@", "://***:***@", stdout_bytes.decode()
+        )
+        stderr_text = re.sub(
+            r"://[^:@/]+:[^@]*@", "://***:***@", stderr_bytes.decode()
+        )
         raise RuntimeError(
             f"git command failed: {' '.join(safe_args)}\n"
-            f"stdout: {stdout_bytes.decode()}\nstderr: {stderr_bytes.decode()}"
+            f"stdout: {stdout_text}\nstderr: {stderr_text}"
         )

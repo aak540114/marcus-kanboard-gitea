@@ -266,7 +266,20 @@ class AIVerifier:
                 raw_response=raw,
             )
 
-        passed = bool(obj.get("passed", False))
+        passed_raw = obj.get("passed", False)
+        if isinstance(passed_raw, str):
+            # A type-mismatched but syntactically valid JSON value like
+            # the STRING "false" is truthy under bare bool() (any
+            # non-empty string is), which silently flips a failed code
+            # review into a passed one — exactly the verification-
+            # integrity failure the Multi-Agency Proclamation's v2
+            # rewrite (issue #636: an agent-authored verifier gamed its
+            # own retries) exists to prevent. Interpret common string
+            # forms explicitly instead of relying on Python's generic
+            # truthiness.
+            passed = passed_raw.strip().lower() in ("true", "yes", "1", "pass", "passed")
+        else:
+            passed = bool(passed_raw)
         findings = [str(f) for f in obj.get("findings", []) if f]
         out_of_scope_changes = [
             str(f) for f in obj.get("out_of_scope_changes", []) if f

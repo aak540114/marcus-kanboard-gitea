@@ -10,6 +10,7 @@ every subsequent git operation for every other ticket fails with
 "you have not concluded your merge".
 """
 
+import asyncio
 import subprocess
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -214,6 +215,34 @@ class TestMergeFetchesAgentBranch:
         assert any(
             c[0] == "merge" and "ticket/kanboard/3" in c
             for c in _calls(mgr._git)
+        )
+
+    @pytest.mark.asyncio
+    async def test_aborts_on_a_transient_fetch_failure_instead_of_merging_stale_local(
+        self,
+    ):
+        """Regression (confirmed finding #16): a fetch failure that is NOT
+        "the remote genuinely has no such branch" (a network blip, an auth
+        hiccup, a timeout) is not proof the remote branch is absent — it
+        just means the check couldn't be made. Falling back to merge the
+        local ref in that case would merge Marcus's own empty/stale ticket
+        branch and report success even though none of the agent's real
+        work (which only lives on the remote) ever landed on main."""
+        mgr = _mgr()
+
+        async def fake_git(*args):
+            if args[0] == "fetch" and args[-1] == "ticket/kanboard/3":
+                return (1, "", "fatal: unable to access remote: timed out")
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+
+        ok = await mgr.merge_to_main("ticket/kanboard/3", delete_after=False)
+
+        assert ok is False
+        # The ticket merge itself must never have been attempted.
+        assert not any(
+            c[0] == "merge" and "ticket/kanboard/3" in c for c in _calls(mgr._git)
         )
 
 
@@ -502,22 +531,37 @@ class TestCreateBranchResumesFromRemote:
 
 
 class TestRebaseOnMainRecreatesWithForce:
-    """When a ticket is reopened after its branch was already merged (and
-    thus deleted locally), rebase_on_main must recreate it with
-    force=True — create_branch's own docstring names exactly this caller
-    as the intended use case for that flag, since the point is to start
-    fresh rather than resume whatever the remote might still have under
-    the old branch name."""
+    """When a ticket is reopened and its branch is missing from this
+    shared clone, rebase_on_main must recover carefully rather than
+    blindly force-pushing over the remote.
+
+    Regression (confirmed finding #17): the old code treated ANY local
+    checkout failure as proof the branch was "safely deleted after a
+    merge" and recovered via force=True, which (a) skips the
+    remote-resume safety check create_branch otherwise does first and
+    (b) force-pushes a branch freshly cut from main over whatever is
+    already on the remote — even when the remote still has real,
+    unmerged work under that branch name (e.g. a reopened ticket whose
+    agent already pushed new commits, or a checkout failure unrelated
+    to the branch being gone at all)."""
 
     @pytest.mark.asyncio
-    async def test_recreate_passes_force_true(self):
+    async def test_recreates_fresh_when_remote_branch_genuinely_absent(self):
+        """Local checkout fails AND the remote has no such branch either
+        — only then is cutting a fresh branch from main correct, and a
+        normal (non-force) push suffices since there is nothing on the
+        remote to overwrite."""
         mgr = _mgr()
         calls_seen = []
 
         async def fake_git(*args):
             calls_seen.append(args)
             if args[0] == "checkout" and args[1] == "ticket/kanboard/9":
-                return (1, "", "error: pathspec did not match")  # deleted locally
+                return (1, "", "error: pathspec did not match any file(s)")
+            if args[0] == "fetch" and args[-1] == "ticket/kanboard/9":
+                return (1, "", "couldn't find remote ref ticket/kanboard/9")
+            if args[0] == "show-ref":
+                return (1, "", "")
             if args[0] == "rebase":
                 return (0, "", "")
             if args[0] == "push":
@@ -529,19 +573,73 @@ class TestRebaseOnMainRecreatesWithForce:
         ok = await mgr.rebase_on_main("ticket/kanboard/9")
 
         assert ok is True
-        # force=True cuts fresh from origin/main — it must NOT take the
-        # non-force resume path (checkout -B branch_name FETCH_HEAD),
-        # which would silently keep whatever old history the remote might
-        # still have under this branch name instead of starting over.
+        assert ("checkout", "-b", "ticket/kanboard/9", "origin/main") in calls_seen
+        assert not any(
+            c[0] == "checkout" and c[-1] == "FETCH_HEAD" for c in calls_seen
+        )
+
+    @pytest.mark.asyncio
+    async def test_resumes_from_remote_instead_of_overwriting_it(self):
+        """Local checkout fails (branch missing from THIS clone) but the
+        remote still has the branch — rebase_on_main must resume that
+        remote work, not force-push a fresh-from-main branch over it."""
+        mgr = _mgr()
+        calls_seen = []
+
+        async def fake_git(*args):
+            calls_seen.append(args)
+            if args[0] == "checkout" and args[1] == "ticket/kanboard/9":
+                return (1, "", "error: pathspec did not match any file(s)")
+            if args[0] == "fetch" and args[-1] == "ticket/kanboard/9":
+                return (0, "", "")  # remote still has it
+            if args[0] == "rebase":
+                return (0, "", "")
+            if args[0] == "push":
+                return (0, "", "")
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+
+        ok = await mgr.rebase_on_main("ticket/kanboard/9")
+
+        assert ok is True
+        # Resumed from the remote tip instead of blowing it away.
         assert (
             "checkout",
             "-B",
             "ticket/kanboard/9",
-            "origin/main",
+            "FETCH_HEAD",
         ) in calls_seen
         assert not any(
-            c[0] == "checkout" and c[-1] == "FETCH_HEAD" for c in calls_seen
+            c[0] == "checkout" and c[-1] == "origin/main" for c in calls_seen
         )
+
+    @pytest.mark.asyncio
+    async def test_does_not_recover_on_unrelated_checkout_failure(self):
+        """A checkout failure that is NOT "branch doesn't exist" (e.g. a
+        corrupt object, a permissions error) must not be treated as proof
+        the branch was deleted after a merge — recovering by recreating
+        and force-pushing in that case would risk destroying real work
+        for an unrelated reason. rebase_on_main must fail instead."""
+        mgr = _mgr()
+        calls_seen = []
+
+        async def fake_git(*args):
+            calls_seen.append(args)
+            if args[0] == "checkout" and args[1] == "ticket/kanboard/9":
+                return (1, "", "fatal: unable to read tree (abc123)")
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+
+        ok = await mgr.rebase_on_main("ticket/kanboard/9")
+
+        assert ok is False
+        # No recovery attempt was made: no recreate-fetch, no checkout
+        # -b/-B, no push.
+        assert not any(c[0] == "fetch" and c[-1] == "ticket/kanboard/9" for c in calls_seen)
+        assert not any(c[0] == "checkout" and c[1] in ("-b", "-B") for c in calls_seen)
+        assert not any(c[0] == "push" for c in calls_seen)
 
 
 class TestSyncBranch:
@@ -587,6 +685,105 @@ class TestSyncBranch:
         assert ok is True
         calls = _calls(mgr._git)
         assert ("update-ref", "refs/heads/ticket/kanboard/7", "FETCH_HEAD") in calls
+
+
+async def _assert_holds_shared_lock(mgr: BranchManager, call) -> None:
+    """Run *call* (a coroutine factory taking mgr) and assert self._lock
+    was observed held during at least one of its git invocations."""
+    saw_locked = False
+    real_git = mgr._git
+
+    async def spying_git(*args):
+        nonlocal saw_locked
+        if mgr._lock.locked():
+            saw_locked = True
+        return await real_git(*args)
+
+    mgr._git = AsyncMock(side_effect=spying_git)
+    await call(mgr)
+    assert saw_locked, "expected self._lock to be held during the git call(s)"
+
+
+class TestFetchHeadMethodsSerializeOnSharedLock:
+    """Regression (confirmed finding #15): get_branch_diff,
+    get_branch_commits, merge_base_with_main, and sync_branch each fetch
+    into FETCH_HEAD and then consume it a few lines later.
+    create_branch/merge_to_main/rebase_on_main do that same fetch-then-
+    consume dance while holding self._lock; without these four also
+    holding it, a concurrent call to one of those three can overwrite
+    FETCH_HEAD in between a read method's own fetch and its consumption of
+    it, silently producing a result for the WRONG commit."""
+
+    @pytest.mark.asyncio
+    async def test_sync_branch_holds_the_lock(self):
+        mgr = _mgr()
+        mgr._git = AsyncMock(return_value=(0, "", ""))
+        await _assert_holds_shared_lock(
+            mgr, lambda m: m.sync_branch("ticket/kanboard/7")
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_branch_diff_holds_the_lock(self):
+        mgr = _mgr()
+        mgr._git = AsyncMock(return_value=(0, "", ""))
+        await _assert_holds_shared_lock(
+            mgr, lambda m: m.get_branch_diff("ticket/kanboard/7")
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_branch_commits_holds_the_lock(self):
+        mgr = _mgr()
+        mgr._git = AsyncMock(return_value=(0, "", ""))
+        await _assert_holds_shared_lock(
+            mgr, lambda m: m.get_branch_commits("ticket/kanboard/7")
+        )
+
+    @pytest.mark.asyncio
+    async def test_merge_base_with_main_holds_the_lock(self):
+        mgr = _mgr()
+        mgr._git = AsyncMock(return_value=(0, "", ""))
+        await _assert_holds_shared_lock(
+            mgr, lambda m: m.merge_base_with_main("ticket/kanboard/7")
+        )
+
+    @pytest.mark.asyncio
+    async def test_create_branch_blocks_until_sync_branch_releases_the_lock(self):
+        """A real-event-loop interleaving check: while sync_branch is
+        mid-fetch (holding the lock), a concurrent create_branch call for
+        a DIFFERENT ticket must block on the lock rather than running its
+        own fetch into FETCH_HEAD at the same time."""
+        mgr = _mgr()
+        sync_mid_fetch = asyncio.Event()
+        release_sync = asyncio.Event()
+
+        async def fake_git(*args):
+            if args[0] == "fetch" and args[-1] == "ticket/kanboard/7":
+                sync_mid_fetch.set()
+                await release_sync.wait()
+            if args[0] == "show-ref":
+                return (1, "", "")
+            return (0, "", "")
+
+        mgr._git = AsyncMock(side_effect=fake_git)
+
+        sync_task = asyncio.create_task(mgr.sync_branch("ticket/kanboard/7"))
+        await asyncio.wait_for(sync_mid_fetch.wait(), timeout=2.0)
+
+        create_task = asyncio.create_task(
+            mgr.create_branch("ticket/kanboard/other")
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        # sync_branch is still parked mid-fetch holding the lock, so
+        # create_branch must not have completed (it would have, almost
+        # instantly, if it raced ahead instead of blocking on the lock).
+        assert mgr._lock.locked()
+        assert not create_task.done()
+
+        release_sync.set()
+        await asyncio.wait_for(sync_task, timeout=2.0)
+        await asyncio.wait_for(create_task, timeout=2.0)
 
 
 class TestCheckoutConflictRecovery:

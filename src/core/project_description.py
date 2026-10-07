@@ -254,7 +254,15 @@ def parse_stack_from_text(text: str) -> Optional[ProjectStack]:
         "axum": "axum",
     }
     for keyword, name in _fw_map.items():
-        if keyword in low:
+        # Word-boundary match, not a bare substring check: "gin" (the Go
+        # web framework) is a substring of ordinary English words —
+        # "engine", "login", "plugin", "beginning", "imagine" — any of
+        # which would otherwise mis-detect the framework as Gin for a
+        # project that never mentioned it. The language detector above
+        # already applies this same discipline to "go" for the identical
+        # reason (see its `(?<![a-z])go(?![a-z])` regex); the framework
+        # map just never got the same treatment.
+        if re.search(rf"\b{re.escape(keyword)}\b", low):
             framework = name
             break
 

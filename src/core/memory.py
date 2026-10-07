@@ -338,6 +338,36 @@ class Memory:
         task = active_task["task"]
         started_at = active_task["started_at"]
 
+        # Clear from working memory IMMEDIATELY, before any `await` below
+        # — not at the end of the function. Two concurrent completion
+        # reports for the same agent/task (a duplicate report, or a race
+        # between a normal report and a retry/recovery path) would
+        # otherwise both pass the "no active task" check above (neither
+        # has removed the entry yet) and both run the full body —
+        # double-incrementing the agent's profile stats (total_tasks,
+        # successful_tasks, the skill-success-rate EMA applied twice)
+        # and persisting two separate outcome records (the persistence
+        # key includes a timestamp, so even storage-layer dedup doesn't
+        # catch it). Removing the claim before doing any further async
+        # work is the standard "claim before processing" pattern — the
+        # second concurrent call then sees the entry already gone and
+        # returns None via the check above.
+        # Clear from working memory IMMEDIATELY, before any `await` below
+        # — not at the end of the function. Two concurrent completion
+        # reports for the same agent/task (a duplicate report, or a race
+        # between a normal report and a retry/recovery path) would
+        # otherwise both pass the "no active task" check above (neither
+        # has removed the entry yet) and both run the full body —
+        # double-incrementing the agent's profile stats (total_tasks,
+        # successful_tasks, the skill-success-rate EMA applied twice)
+        # and persisting two separate outcome records (the persistence
+        # key includes a timestamp, so even storage-layer dedup doesn't
+        # catch it). Removing the claim before doing any further async
+        # work is the standard "claim before processing" pattern — the
+        # second concurrent call then sees the entry already gone and
+        # returns None via the check above.
+        del self.working["active_tasks"][agent_id]
+
         # Create outcome record
         outcome = TaskOutcome(
             task_id=task_id,
@@ -371,9 +401,6 @@ class Memory:
                 outcome_key,
                 outcome.to_dict(),
             )
-
-        # Clear from working memory
-        del self.working["active_tasks"][agent_id]
 
         # Emit event
         if self.events:

@@ -10,9 +10,10 @@ import asyncio
 import json
 import logging
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 import aiofiles
 
@@ -277,9 +278,30 @@ class SQLitePersistence(PersistenceBackend):
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Open a connection for one operation and always close it.
+
+        ``with sqlite3.connect(...) as conn:`` only wraps the
+        TRANSACTION (commit on success, rollback on exception) — unlike
+        a file object, it never closes the connection itself. Every
+        caller below opens a fresh connection per call (correct, since
+        sqlite3 connections aren't safe to share across the executor
+        threads these run on), so without an explicit close() each call
+        leaked one open connection (and its underlying file handle)
+        forever, bounded only by whenever CPython's GC happened to
+        collect it.
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
     def _init_db(self) -> None:
         """Initialize database schema."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS persistence (
                     collection TEXT NOT NULL,
@@ -299,7 +321,7 @@ class SQLitePersistence(PersistenceBackend):
         """Store data in SQLite."""
 
         def _store() -> None:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO persistence (collection, key, data)
@@ -315,7 +337,7 @@ class SQLitePersistence(PersistenceBackend):
         """Retrieve data from SQLite."""
 
         def _retrieve() -> Optional[Dict[str, Any]]:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 cursor = conn.execute(
                     """
                     SELECT data FROM persistence
@@ -334,7 +356,7 @@ class SQLitePersistence(PersistenceBackend):
         """Query data from SQLite."""
 
         def _query() -> List[Dict[str, Any]]:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 cursor = conn.execute(
                     """
                     SELECT key, data FROM persistence
@@ -363,7 +385,7 @@ class SQLitePersistence(PersistenceBackend):
         """Delete data from SQLite."""
 
         def _delete() -> None:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 conn.execute(
                     """
                     DELETE FROM persistence
@@ -380,7 +402,7 @@ class SQLitePersistence(PersistenceBackend):
 
         def _clear() -> int:
             cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 cursor = conn.execute(
                     """
                     DELETE FROM persistence
@@ -407,7 +429,7 @@ class SQLitePersistence(PersistenceBackend):
         """
 
         def _calculate_median() -> float:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 # First, get count of successful tasks
                 count_cursor = conn.execute("""
                     SELECT COUNT(*) FROM persistence

@@ -462,6 +462,26 @@ class TestCommentParser:
         body = "# Marcus, please also fix the logout redirect\n\nDetails below."
         assert CommentParser.is_marcus_comment(body) is False
 
+    def test_is_marcus_comment_false_for_heading_buried_in_human_reply(self):
+        """Regression (confirmed finding #18): _TITLE_RE used `.search()`
+        with re.MULTILINE, which matches `^` at the start of EVERY line,
+        not just the start of the whole comment. A human venting about
+        Marcus a few lines into their own reply — using a Markdown
+        heading for emphasis — must not be misclassified as Marcus's own
+        comment: every comment Marcus actually generates has its title
+        as the very FIRST thing in the body, never buried after other
+        text. Misclassifying this silently drops real human feedback
+        (treated as Marcus's own comment, so _on_comment_added returns
+        early instead of reopening the ticket)."""
+        body = (
+            "I don't think this is done yet.\n\n"
+            "### Marcus Agent keeps assigning this to the wrong person, "
+            "please stop.\n\n"
+            "Can someone look at this manually?"
+        )
+        assert CommentParser.is_marcus_comment(body) is False
+        assert CommentParser.parse(body) is None
+
     def test_parse_ac_generated(self):
         """parse() correctly identifies ac_generated comments."""
         body = CommentFormatter.ac_generated("T-2", "- [ ] test")

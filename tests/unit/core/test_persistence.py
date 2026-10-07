@@ -7,7 +7,7 @@ import json
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -198,6 +198,65 @@ class TestSQLitePersistence:
         # Debug: print the items to see ordering
         print(f"Items received: {[item['value'] for item in items]}")
         assert items[0]["value"] == 19
+
+    @pytest.mark.asyncio
+    async def test_every_operation_closes_its_connection(self, sqlite_persistence):
+        """Regression (confirmed finding #27): every SQLitePersistence
+        method opens a fresh connection per call via
+        `with sqlite3.connect(...) as conn:`. That context manager only
+        wraps the TRANSACTION (commit/rollback) — unlike a file object,
+        it never closes the connection. Without an explicit close(),
+        every store/retrieve/query/delete/clear_old call leaked one open
+        connection (and its file handle) forever, bounded only by
+        whenever CPython's GC happened to collect it."""
+        import sqlite3
+
+        real_connect = sqlite3.connect
+        created = []
+
+        def spy_connect(*args, **kwargs):
+            # check_same_thread=False: these operations run inside
+            # run_in_executor's worker thread, but the assertions below
+            # run on the test's own thread. Without this, EVERY access
+            # from here would raise ProgrammingError for "used from the
+            # wrong thread" regardless of whether close() was ever
+            # called, masking the actual leak this test checks for.
+            kwargs["check_same_thread"] = False
+            conn = real_connect(*args, **kwargs)
+            created.append(conn)
+            return conn
+
+        with patch("src.core.persistence.sqlite3.connect", side_effect=spy_connect):
+            await sqlite_persistence.store("c", "k1", {"v": 1})
+            await sqlite_persistence.retrieve("c", "k1")
+            await sqlite_persistence.query("c")
+            await sqlite_persistence.clear_old("c", days=999)
+            await sqlite_persistence.calculate_median_task_duration()
+            await sqlite_persistence.delete("c", "k1")
+
+        assert len(created) == 6
+        for conn in created:
+            with pytest.raises(sqlite3.ProgrammingError):
+                conn.execute("SELECT 1")
+
+    def test_init_db_closes_its_connection(self, temp_db):
+        """The constructor's own `_init_db()` call must not leak either."""
+        import sqlite3
+
+        real_connect = sqlite3.connect
+        created = []
+
+        def spy_connect(*args, **kwargs):
+            conn = real_connect(*args, **kwargs)
+            created.append(conn)
+            return conn
+
+        with patch("src.core.persistence.sqlite3.connect", side_effect=spy_connect):
+            SQLitePersistence(db_path=temp_db)
+
+        assert len(created) == 1
+        with pytest.raises(sqlite3.ProgrammingError):
+            created[0].execute("SELECT 1")
 
     @pytest.mark.asyncio
     async def test_clear_old_sqlite(self, sqlite_persistence):

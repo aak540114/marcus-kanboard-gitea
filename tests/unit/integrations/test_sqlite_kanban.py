@@ -465,7 +465,7 @@ class TestSQLiteKanbanGetTasks:
     async def test_get_available_tasks_unassigned_todo_only(
         self, connected_kanban: SQLiteKanban
     ) -> None:
-        """Test that only unassigned TODO tasks are returned."""
+        """Test that only unassigned TODO/READY tasks are returned."""
         # Available: TODO + unassigned
         await connected_kanban.create_task(_sample_task_data(name="Available"))
         # Not available: assigned
@@ -479,6 +479,35 @@ class TestSQLiteKanbanGetTasks:
         available = await connected_kanban.get_available_tasks()
         assert len(available) == 1
         assert available[0].name == "Available"
+
+    @pytest.mark.asyncio
+    async def test_get_available_tasks_includes_ready_column(
+        self, connected_kanban: SQLiteKanban
+    ) -> None:
+        """Regression (confirmed finding #33): get_available_tasks
+        hardcoded a TODO-only status filter, silently excluding READY
+        tasks (e.g. ones released from BLOCKED, or produced straight
+        into READY by decomposition) from ever being claimable by an
+        agent — unlike the primary production provider,
+        KanboardKanban.get_available_tasks, and the kanban interface's
+        own documented contract ("unassigned tasks from backlog/ready
+        columns"), both of which include READY."""
+        await connected_kanban.create_task(
+            _sample_task_data(name="Ready Task", status="ready")
+        )
+        # Still excluded: assigned, even if READY.
+        t2 = await connected_kanban.create_task(
+            _sample_task_data(name="Assigned Ready", status="ready")
+        )
+        await connected_kanban.assign_task(t2.id, "agent-1")
+        # Still excluded: an unrelated terminal status.
+        await connected_kanban.create_task(
+            _sample_task_data(name="Blocked", status="blocked")
+        )
+
+        available = await connected_kanban.get_available_tasks()
+        assert len(available) == 1
+        assert available[0].name == "Ready Task"
 
     @pytest.mark.asyncio
     async def test_get_task_by_id_found(self, connected_kanban: SQLiteKanban) -> None:

@@ -749,16 +749,34 @@ class DevEnvironmentManager:
                 url = f"http://{self.config.host}:{port}"
                 effective_repo_path = repo_path or self.config.repo_path
 
-                if self.config.use_docker:
-                    info = await self._start_docker(
-                        ticket_id, provider, branch_name, port, container_name, url,
-                        project_stack=project_stack, repo_path=effective_repo_path,
-                    )
-                else:
-                    info = await self._start_local(
-                        ticket_id, provider, branch_name, port, container_name, url,
-                        repo_path=effective_repo_path,
-                    )
+                try:
+                    if self.config.use_docker:
+                        info = await self._start_docker(
+                            ticket_id, provider, branch_name, port, container_name, url,
+                            project_stack=project_stack, repo_path=effective_repo_path,
+                        )
+                    else:
+                        info = await self._start_local(
+                            ticket_id, provider, branch_name, port, container_name, url,
+                            repo_path=effective_repo_path,
+                        )
+                except Exception:
+                    # Some failure paths inside _start_docker already
+                    # release the port themselves before raising (the
+                    # docker-run timeout/nonzero-exit branches) — this is
+                    # a safety net for every OTHER exception in either
+                    # helper (e.g. a pre-subprocess failure resolving the
+                    # dev command, or `_start_local`'s Popen itself
+                    # failing) that would otherwise leak the allocated
+                    # port forever, since nothing else ever calls
+                    # release() for a port that never made it into
+                    # self._envs. Releasing twice for the already-covered
+                    # paths is harmless — `_in_use.discard()` is
+                    # idempotent, and no other coroutine can race in
+                    # between the inner release and this one since
+                    # nothing here awaits before re-raising.
+                    self._allocator.release(port)
+                    raise
 
                 self._envs[key] = info
                 logger.info("Dev env started for %s at %s", key, url)
@@ -808,7 +826,16 @@ class DevEnvironmentManager:
             )
             return False
 
-        del self._envs[key]
+        # `stop()` takes no per-key lock (unlike `start()`), so two
+        # concurrent calls for the SAME ticket (a double-click retry on
+        # the unauthenticated `/dev-env/stop` route, or two callers in
+        # human_gated_workflow.py racing to tear down the same ticket)
+        # can both pass the `info is None` check above and both reach
+        # here. A bare `del self._envs[key]` would raise KeyError on
+        # whichever call loses the race — crashing that caller instead
+        # of reporting the no-op "already stopped" it actually is.
+        # `.pop(key, None)` tolerates the second, already-gone key.
+        self._envs.pop(key, None)
         self._allocator.release(info.port)
         logger.info("Dev env stopped for %s", key)
         return True

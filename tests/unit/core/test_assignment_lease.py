@@ -262,6 +262,48 @@ class TestAssignmentLeaseManager:
         )
 
     @pytest.mark.asyncio
+    async def test_stale_recovery_does_not_destroy_a_newer_lease(
+        self, lease_manager, mock_kanban_client, mock_persistence
+    ):
+        """Regression: recover_expired_lease deleted active_leases[task_id]
+        based on key presence alone. If a FRESH lease for the same
+        task_id was created (e.g. by a concurrent request_next_task)
+        while this stale recovery's own async work (telemetry, the
+        Kanban handoff comment) was still in flight, the old code would
+        delete that brand-new, valid lease — and go on to reset the
+        board's assigned_to and remove the persistence record for the
+        NEW agent who just legitimately started work. Must detect the
+        lease was superseded and abort the rest of recovery instead."""
+        stale_lease = AssignmentLease(
+            task_id="task-123",
+            agent_id="agent-001",
+            assigned_at=datetime.now(timezone.utc) - timedelta(hours=5),
+            lease_expires=datetime.now(timezone.utc) - timedelta(hours=1),
+            last_renewed=datetime.now(timezone.utc) - timedelta(hours=5),
+            progress_percentage=30,
+        )
+        # A DIFFERENT, fresh lease now occupies the same task_id — as if
+        # a new agent picked up the task while the stale recovery for
+        # `stale_lease` was still running its own async work.
+        fresh_lease = AssignmentLease(
+            task_id="task-123",
+            agent_id="agent-002",
+            assigned_at=datetime.now(timezone.utc),
+            lease_expires=datetime.now(timezone.utc) + timedelta(hours=4),
+            last_renewed=datetime.now(timezone.utc),
+        )
+        lease_manager.active_leases["task-123"] = fresh_lease
+
+        success = await lease_manager.recover_expired_lease(stale_lease)
+
+        assert success is False
+        # The fresh lease must survive untouched.
+        assert lease_manager.active_leases["task-123"] is fresh_lease
+        # Nothing about agent-002's legitimate work gets reset.
+        mock_persistence.remove_assignment.assert_not_called()
+        mock_kanban_client.update_task.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_get_expiring_leases(self, lease_manager):
         """Test getting leases that are expiring soon."""
         now = datetime.now(timezone.utc)
@@ -661,6 +703,47 @@ class TestUpdateTimestampPersistence:
         assert "update_timestamps" in existing_assignment
         assert len(existing_assignment["update_timestamps"]) == 2
         mock_persistence.flush.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_persist_lease_logs_a_warning_when_no_assignment_found(
+        self, caplog
+    ):
+        """Regression: _persist_lease silently no-op'd (no log, no
+        exception) whenever get_assignment returned None — the
+        in-memory lease was already updated by the caller, but the
+        on-disk copy silently missed the update with zero signal,
+        making a restart-time staleness bug impossible to notice
+        without reading the code."""
+        import logging
+
+        from src.core.assignment_persistence import AssignmentPersistence
+
+        now = datetime.now(timezone.utc)
+        mock_persistence = Mock(spec=AssignmentPersistence)
+        mock_persistence.get_assignment = AsyncMock(return_value=None)
+        mock_persistence.flush = AsyncMock()
+
+        lease_manager = AssignmentLeaseManager(
+            kanban_client=Mock(),
+            assignment_persistence=mock_persistence,
+        )
+
+        lease = AssignmentLease(
+            task_id="task-789",
+            agent_id="agent-001",
+            assigned_at=now,
+            lease_expires=now + timedelta(minutes=2),
+            last_renewed=now,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            await lease_manager._persist_lease(lease)
+
+        mock_persistence.flush.assert_not_called()
+        assert any(
+            "agent-001" in record.message and "task-789" in record.message
+            for record in caplog.records
+        ), "Expected a warning naming the agent/task when no assignment was found"
 
     @pytest.mark.asyncio
     async def test_persist_lease_round_trips_through_real_persistence(

@@ -5169,6 +5169,25 @@ async def report_blocker(
                         f"(agent {agent_id})"
                     )
 
+        # Release any file locks this task held (#206) — BLOCKED is one
+        # of the terminal-for-this-agent states report_task_progress's
+        # own _release_locks_on_exit already covers (DONE or BLOCKED),
+        # but report_blocker is a separate code path that never applied
+        # the same release, leaking every file lock a blocked task held
+        # until Marcus restarts. Idempotent (FileLockRegistry.release
+        # returns 0 for a task that held nothing) and wrapped in a
+        # try/except so a release failure can never break blocker
+        # reporting.
+        if hasattr(state, "file_lock_registry"):
+            try:
+                await state.file_lock_registry.release(task_id)
+            except Exception as _release_err:  # noqa: BLE001
+                logger.warning(
+                    "[#206] release failed for blocked task %s: %s",
+                    task_id,
+                    _release_err,
+                )
+
         # Record in active experiment if one is running
         from src.experiments.live_experiment_monitor import get_active_monitor
 

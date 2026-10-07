@@ -374,6 +374,30 @@ class TestRunIsComplete:
         ]
         assert LiveBoardWatcher._run_is_complete(tasks) is False
 
+    def test_returns_false_when_ready_tasks_remain(self) -> None:
+        """Regression (confirmed finding #40): READY means a human
+        already moved the ticket to the ready column specifically to
+        signal "the AI agent should begin work" (TaskStatus.READY's own
+        docstring) — it progresses on its own without further human
+        action, same as TODO/IN_PROGRESS. Treating it as terminal made
+        the watcher exit while a ticket was about to be picked up."""
+        tasks = [_make_task(status=TaskStatus.READY)]
+        assert LiveBoardWatcher._run_is_complete(tasks) is False
+
+    def test_returns_false_when_one_ready_among_done(self) -> None:
+        tasks = [
+            _make_task(status=TaskStatus.DONE, task_id="d1"),
+            _make_task(status=TaskStatus.READY, task_id="r1"),
+        ]
+        assert LiveBoardWatcher._run_is_complete(tasks) is False
+
+    def test_returns_true_when_all_waiting_for_human_no_active(self) -> None:
+        """WAITING_FOR_HUMAN, unlike READY, genuinely requires a human
+        to act before anything more happens automatically — same
+        reasoning as BLOCKED — so it correctly stays terminal."""
+        tasks = [_make_task(status=TaskStatus.WAITING_FOR_HUMAN)]
+        assert LiveBoardWatcher._run_is_complete(tasks) is True
+
 
 class TestWatchAutoExit:
     """Test that watch() exits automatically when the run finishes."""

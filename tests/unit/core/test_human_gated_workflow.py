@@ -4339,6 +4339,63 @@ class TestReviewFixes:
         assert lifecycle.get("50", "kanboard").ai_agent_id is None
 
     @pytest.mark.asyncio
+    async def test_closing_dependency_blocked_ticket_marks_done_no_merge_attempted(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """Regression: _block_on_dependencies parks a ticket BLOCKED
+        BEFORE it's ever claimed or branched (the preemptive dependency
+        gate in _start_ai_work runs before claim_ticket) — it never
+        reaches IN_PROGRESS. Closing one of these used to fall through
+        to _merge_ticket_to_main, which always failed (nothing to merge)
+        and silently reverted the human's close action back to READY
+        with a "merge conflict, needs rebase" comment that doesn't apply
+        to a ticket that was never even started."""
+        lifecycle.get_or_create("51", "kanboard")
+        lifecycle.transition("51", "kanboard", TicketState.READY)
+        lifecycle.set_assignee("51", "kanboard", "alice")
+        lifecycle.human_transition(
+            "51", "kanboard", TicketState.BLOCKED,
+            reason="Waiting on dependencies: #99",
+        )
+        lifecycle.set_blocked_by("51", "kanboard", "#99")
+
+        event = _make_event({"ticket_id": "51", "provider": "kanboard"})
+        await workflow._on_ticket_closed(event)
+
+        rec = lifecycle.get("51", "kanboard")
+        assert rec.state == TicketState.DONE
+        assert rec.ai_agent_id is None
+        mock_branch.merge_to_main.assert_not_called()
+        assert "51" not in {r.ticket_id for r in lifecycle.get_available_tickets()}
+
+    @pytest.mark.asyncio
+    async def test_closing_signal_blocked_ticket_with_real_branch_still_merges(
+        self, workflow, lifecycle, mock_kanban, mock_branch
+    ):
+        """Contrast case: a ticket blocked via signal_blocked (which only
+        ever fires from IN_PROGRESS — see its own precondition) DOES
+        have a real branch with real commits, so closing it must still
+        go through the normal merge path, not be redirected to the
+        "nothing to merge" shortcut above."""
+        mock_branch.merge_to_main = AsyncMock(return_value=True)
+        lifecycle.get_or_create("52", "kanboard")
+        lifecycle.transition("52", "kanboard", TicketState.READY)
+        lifecycle.claim_ticket("52", "kanboard", workflow._agent_id)
+        lifecycle.transition("52", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.set_assignee("52", "kanboard", "alice")
+        lifecycle.human_transition(
+            "52", "kanboard", TicketState.BLOCKED,
+            reason="Blocked by: waiting on external API credentials",
+        )
+        lifecycle.set_blocked_by("52", "kanboard", "waiting on external API credentials")
+
+        event = _make_event({"ticket_id": "52", "provider": "kanboard"})
+        await workflow._on_ticket_closed(event)
+
+        mock_branch.merge_to_main.assert_awaited_once()
+        assert lifecycle.get("52", "kanboard").state == TicketState.DONE
+
+    @pytest.mark.asyncio
     async def test_merge_failure_sends_ticket_back_to_ai_for_rebase(
         self, workflow, lifecycle, mock_kanban, mock_branch
     ):
@@ -4418,6 +4475,37 @@ class TestReviewFixes:
 
         mock_kanban.set_merge_conflict_flag.assert_awaited_once_with(
             "62", present=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_dev_env_stop_failure_does_not_abort_merge_completion(
+        self, workflow, lifecycle, mock_kanban, mock_branch, mock_dev_env
+    ):
+        """Regression: _dev_env.stop() had no try/except around it, unlike
+        every OTHER _dev_env.stop call in this file (_on_ticket_deleted,
+        _purge_deleted_tickets) — a Docker/subprocess failure there
+        aborted _merge_ticket_to_main right after the ticket was already
+        marked DONE+merged+released, skipping the "Merged" comment,
+        clearing the merge-conflict flag, unblocking dependents, and
+        picking up the next ticket. The freed slot from release_ticket
+        then sat idle since _pickup_next_ticket never ran."""
+        mock_branch.merge_to_main = AsyncMock(return_value=True)
+        mock_dev_env.stop = AsyncMock(side_effect=RuntimeError("docker daemon unreachable"))
+        lifecycle.get_or_create("63", "kanboard")
+        lifecycle.transition("63", "kanboard", TicketState.READY)
+        lifecycle.claim_ticket("63", "kanboard", workflow._agent_id)
+        lifecycle.transition("63", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.set_assignee("63", "kanboard", "alice")
+
+        event = _make_event({"ticket_id": "63", "provider": "kanboard"})
+        await workflow._on_ticket_closed(event)  # must not raise
+
+        rec = lifecycle.get("63", "kanboard")
+        assert rec.state == TicketState.DONE
+        posted_bodies = [c.args[-1] for c in mock_kanban.add_comment.call_args_list]
+        assert any("merged" in body.lower() for body in posted_bodies)
+        mock_kanban.set_merge_conflict_flag.assert_awaited_once_with(
+            "63", present=False
         )
 
     @pytest.mark.asyncio
@@ -5985,6 +6073,37 @@ class TestDependencyGate:
 
         resumed = lifecycle.get("51", "kanboard")
         assert resumed.state == TicketState.IN_PROGRESS
+
+    @pytest.mark.asyncio
+    async def test_does_not_touch_an_unassigned_dependent_in_a_disabled_project(
+        self, workflow, lifecycle, mock_kanban, mock_project_access
+    ):
+        """Regression: the unassigned branch posted a board comment with
+        NO project-access check at all, unlike the assigned branch
+        (_start_ai_work re-checks it internally) — "seeing a project
+        must never turn into touching it" (_may_touch's own docstring)
+        was silently violated for a disabled project's unassigned,
+        dependency-blocked tickets."""
+        lifecycle.get_or_create("55", "kanboard")
+        lifecycle.transition("55", "kanboard", TicketState.READY)
+        lifecycle.transition("55", "kanboard", TicketState.IN_PROGRESS)
+        lifecycle.transition("55", "kanboard", TicketState.DONE)
+        # #56 blocked on #50, unassigned, in a project Marcus is NOT
+        # allowed to touch.
+        lifecycle.get_or_create("56", "kanboard")
+        lifecycle.transition("56", "kanboard", TicketState.READY)
+        lifecycle.human_transition("56", "kanboard", TicketState.BLOCKED)
+        lifecycle.set_blocked_by("56", "kanboard", "#55")
+        mock_kanban.get_task_by_id = AsyncMock(
+            return_value=_make_task_mock(labels=[])
+        )
+        mock_project_access.is_enabled = MagicMock(return_value=False)
+
+        await workflow._resume_tickets_blocked_by("55")
+
+        mock_kanban.add_comment.assert_not_awaited()
+        # Still blocked — nothing touched it.
+        assert lifecycle.get("56", "kanboard").state == TicketState.BLOCKED
 
     @pytest.mark.asyncio
     async def test_subticket_not_blocked_on_its_parent(

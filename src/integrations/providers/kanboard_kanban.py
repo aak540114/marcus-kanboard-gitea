@@ -24,8 +24,9 @@ import logging
 import mimetypes
 import re
 import secrets
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Set, Union
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set, Union
 
 import httpx
 
@@ -213,8 +214,15 @@ class KanboardKanban(KanbanInterface):
         self._project_scope: Optional[Callable[[], List[int]]] = None
         # Per-ticket locks serializing set_merge_conflict_flag and
         # set_verify_round_tag — see _tag_lock_for()'s docstring for the
-        # race this closes.
+        # race this closes. _tag_lock_refs tracks how many callers
+        # currently hold a reference to each lock, so _tag_lock_for can
+        # remove a ticket's entry from BOTH dicts once nobody needs it
+        # anymore — without this, a long-running process accumulates one
+        # permanent dict entry (a str key + an asyncio.Lock) for every
+        # distinct ticket id it has EVER tagged, for the rest of its
+        # lifetime.
         self._tag_locks: Dict[str, asyncio.Lock] = {}
+        self._tag_lock_refs: Dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -824,8 +832,9 @@ class KanboardKanban(KanbanInterface):
             logger.warning("set_task_started_if_unset failed for task %s: %s", task_id, exc)
             return False
 
-    def _tag_lock_for(self, task_id: str) -> "asyncio.Lock":
-        """Return (creating on first use) the per-ticket tag lock.
+    @asynccontextmanager
+    async def _tag_lock_for(self, task_id: str) -> AsyncIterator[None]:
+        """Hold the per-ticket tag lock for the duration of the ``with`` block.
 
         :meth:`set_merge_conflict_flag` and :meth:`set_verify_round_tag`
         each independently fetch a task's CURRENT tags (``getTask``) then
@@ -844,12 +853,33 @@ class KanboardKanban(KanbanInterface):
         closes with its own instance-wide lock (see that class's
         ``ensure_repo`` docstring), scoped per-ticket here instead since
         tag writes for DIFFERENT tickets never conflict.
+
+        Reference-counted cleanup: ``_tag_lock_refs[task_id]`` tracks how
+        many callers currently hold a reference to this ticket's lock.
+        Incrementing happens synchronously (no ``await`` in between), so
+        it can't race with another caller's decrement; the entry is only
+        removed from both dicts once the count returns to zero, which is
+        the only point at which it's safe to do so — removing it based on
+        ``lock.locked()`` instead would have a real TOCTOU gap: a waiter
+        asyncio just woke up (because we released) hasn't resumed yet,
+        so the lock would read as unlocked for one scheduling tick even
+        though it's about to be re-acquired, and deleting the entry in
+        that window would let a THIRD caller create a brand new,
+        unrelated lock for the same ticket — exactly the unserialized
+        write race this lock exists to prevent. Without any cleanup at
+        all, this dict grew by one entry per distinct ticket id for the
+        life of the process.
         """
-        lock = self._tag_locks.get(task_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._tag_locks[task_id] = lock
-        return lock
+        self._tag_lock_refs[task_id] = self._tag_lock_refs.get(task_id, 0) + 1
+        lock = self._tag_locks.setdefault(task_id, asyncio.Lock())
+        try:
+            async with lock:
+                yield
+        finally:
+            self._tag_lock_refs[task_id] -= 1
+            if self._tag_lock_refs[task_id] <= 0:
+                self._tag_lock_refs.pop(task_id, None)
+                self._tag_locks.pop(task_id, None)
 
     async def set_merge_conflict_flag(self, task_id: str, present: bool) -> bool:
         """Add or remove a visible ``merge-conflict`` tag on a task's card.
@@ -2031,9 +2061,22 @@ class KanboardKanban(KanbanInterface):
             else:
                 blob = content  # assume already base64
 
+            # A ticket can belong to any project, not just this client's
+            # configured self._project_id (see get_task_by_id,
+            # set_merge_conflict_flag, etc. for the same pattern) — using
+            # self._project_id unconditionally here sent createTaskFile a
+            # project_id that didn't actually own task_id whenever the
+            # two diverged.
+            raw = await self._rpc("getTask", task_id=int(task_id))
+            project_id = (
+                int(raw.get("project_id") or self._project_id)
+                if raw
+                else self._project_id
+            )
+
             file_id = await self._rpc(
                 "createTaskFile",
-                project_id=self._project_id,
+                project_id=project_id,
                 task_id=int(task_id),
                 filename=filename,
                 blob=blob,

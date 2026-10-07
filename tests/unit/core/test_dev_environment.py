@@ -1067,6 +1067,138 @@ class TestStartConcurrencySafety:
         assert info_upper.container_name != info_lower.container_name
 
 
+class TestStopConcurrencySafety:
+    """Regression (confirmed finding #13): stop() takes no per-key lock,
+    so two concurrent calls for the SAME ticket (a double-click retry on
+    the unauthenticated /dev-env/stop route, or two call sites in
+    human_gated_workflow.py racing to tear down the same ticket) can both
+    pass the `info is None` check and both reach the final cleanup. A
+    bare `del self._envs[key]` raised KeyError on whichever call lost the
+    race instead of reporting the no-op "already stopped" it actually
+    is."""
+
+    @pytest.fixture
+    def manager(self, tmp_path):
+        config = DevEnvironmentConfig(
+            repo_path=str(tmp_path),
+            use_docker=False,
+            dev_command="echo dev-server --port {port}",
+            port_range=(20000, 20050),
+        )
+        return DevEnvironmentManager(
+            config=config, settings_manager=DevEnvSettingsManager(data_dir=tmp_path)
+        )
+
+    @pytest.mark.asyncio
+    async def test_concurrent_stops_same_ticket_do_not_raise_keyerror(self, manager):
+        mock_popen = MagicMock(spec=subprocess.Popen)
+        mock_popen.poll.return_value = None
+        with patch("subprocess.Popen", return_value=mock_popen):
+            await manager.start("T-STOP", "kanboard", "b1")
+
+        release = asyncio.Event()
+        entered = asyncio.Event()
+        real_stop_local = manager._stop_local
+
+        async def slow_stop_local(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return await real_stop_local(*args, **kwargs)
+
+        with patch.object(manager, "_stop_local", side_effect=slow_stop_local):
+            task_a = asyncio.create_task(manager.stop("T-STOP", "kanboard"))
+            await entered.wait()
+            task_b = asyncio.create_task(manager.stop("T-STOP", "kanboard"))
+            await asyncio.sleep(0)
+            release.set()
+            results = await asyncio.gather(task_a, task_b, return_exceptions=True)
+
+        assert not any(isinstance(r, Exception) for r in results), results
+        assert "kanboard:T-STOP" not in manager._envs
+
+    @pytest.mark.asyncio
+    async def test_stop_releases_the_port_exactly_once_under_the_race(self, manager):
+        mock_popen = MagicMock(spec=subprocess.Popen)
+        mock_popen.poll.return_value = None
+        with patch("subprocess.Popen", return_value=mock_popen):
+            info = await manager.start("T-STOP2", "kanboard", "b1")
+
+        release = asyncio.Event()
+        entered = asyncio.Event()
+        real_stop_local = manager._stop_local
+
+        async def slow_stop_local(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return await real_stop_local(*args, **kwargs)
+
+        with patch.object(manager, "_stop_local", side_effect=slow_stop_local):
+            task_a = asyncio.create_task(manager.stop("T-STOP2", "kanboard"))
+            await entered.wait()
+            task_b = asyncio.create_task(manager.stop("T-STOP2", "kanboard"))
+            await asyncio.sleep(0)
+            release.set()
+            await asyncio.gather(task_a, task_b, return_exceptions=True)
+
+        assert info.port not in manager._allocator._in_use
+
+
+class TestStartPortReleaseOnFailure:
+    """Regression (confirmed finding #14): _start_docker's own code only
+    releases the allocated port on two specific failure branches (the
+    docker-run timeout and nonzero-exit cases). Any OTHER exception
+    raised inside _start_docker/_start_local — e.g. a pre-subprocess
+    failure resolving the dev command, or Popen itself raising — left
+    the port permanently marked in-use, since nothing else ever calls
+    release() for a port that never made it into self._envs."""
+
+    @pytest.fixture
+    def manager(self, tmp_path):
+        config = DevEnvironmentConfig(
+            repo_path=str(tmp_path),
+            use_docker=False,
+            dev_command="echo dev-server --port {port}",
+            port_range=(20050, 20100),
+        )
+        return DevEnvironmentManager(
+            config=config, settings_manager=DevEnvSettingsManager(data_dir=tmp_path)
+        )
+
+    @pytest.mark.asyncio
+    async def test_port_is_released_when_start_local_raises(self, manager):
+        with patch.object(
+            manager, "_start_local", side_effect=RuntimeError("boom")
+        ):
+            with pytest.raises(RuntimeError):
+                await manager.start("T-FAIL", "kanboard", "b1")
+
+        # The allocated port must not be stuck in-use forever.
+        assert len(manager._allocator._in_use) == 0
+        assert "kanboard:T-FAIL" not in manager._envs
+
+    @pytest.mark.asyncio
+    async def test_a_second_start_can_reuse_the_port_after_the_first_failed(
+        self, manager
+    ):
+        """End-to-end proof: after one failed start(), a fresh start()
+        for a different ticket must still be able to allocate from the
+        now-small range rather than exhausting it on leaked ports."""
+        with patch.object(
+            manager, "_start_local", side_effect=RuntimeError("boom")
+        ):
+            for i in range(5):
+                with pytest.raises(RuntimeError):
+                    await manager.start(f"T-FAIL-{i}", "kanboard", "b1")
+
+        mock_popen = MagicMock(spec=subprocess.Popen)
+        mock_popen.poll.return_value = None
+        with patch("subprocess.Popen", return_value=mock_popen):
+            info = await manager.start("T-OK", "kanboard", "b1")
+
+        assert info.port is not None
+        assert len(manager._allocator._in_use) == 1
+
+
 # ---------------------------------------------------------------------------
 # _wait_until_ready() — guards refresh() against racing the container's
 # own initial `git checkout` (see _build_entrypoint's readiness marker).
